@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 use crate::gateway::{GatewayManager, Route};
-use crate::snell::{SnellPacketSession, SnellSession};
+use crate::snell::{SnellPacketSession, SnellSession, SnellSessionReader, SnellSessionWriter};
 
 const VERSION: u8 = 5;
 const METHOD_NO_AUTH: u8 = 0;
@@ -247,19 +247,21 @@ async fn serve_connect(mut client: TcpStream, route: Route, request: Request) ->
     relay(client, session).await
 }
 
-async fn relay(client: TcpStream, session: SnellSession) -> Result<()> {
+async fn relay(client: TcpStream, mut session: SnellSession) -> Result<()> {
     let started = Instant::now();
     crate::perftrace::event("socks.relay_start", &[]);
     let (client_read, client_write) = client.into_split();
+    let close_timeout = session.close_timeout();
     let (clean, close_write_sent) = {
-        let mut upload = Box::pin(upload(client_read, &session));
-        let mut download = Box::pin(download(client_write, &session));
+        let (remote_read, remote_write) = session.split();
+        let mut upload = Box::pin(upload(client_read, remote_write));
+        let mut download = Box::pin(download(client_write, remote_read));
         let mut close_write_sent = false;
         let clean = tokio::select! {
             upload_result = &mut upload => {
                 close_write_sent = upload_result.is_ok();
                 if upload_result.is_ok() {
-                    timeout(session.close_timeout(), download)
+                    timeout(close_timeout, download)
                         .await
                         .is_ok_and(|result| result.is_ok())
                 } else {
@@ -282,7 +284,7 @@ async fn relay(client: TcpStream, session: SnellSession) -> Result<()> {
     }
 }
 
-async fn upload(mut client: OwnedReadHalf, session: &SnellSession) -> Result<()> {
+async fn upload(mut client: OwnedReadHalf, mut session: SnellSessionWriter<'_>) -> Result<()> {
     let mut buffer = vec![0u8; 32 << 10];
     let mut first_data = true;
     loop {
@@ -299,7 +301,7 @@ async fn upload(mut client: OwnedReadHalf, session: &SnellSession) -> Result<()>
     }
 }
 
-async fn download(mut client: OwnedWriteHalf, session: &SnellSession) -> Result<()> {
+async fn download(mut client: OwnedWriteHalf, mut session: SnellSessionReader<'_>) -> Result<()> {
     let mut buffer = vec![0u8; 32 << 10];
     let mut first_data = true;
     loop {

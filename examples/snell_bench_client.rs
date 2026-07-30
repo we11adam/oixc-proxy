@@ -154,7 +154,7 @@ async fn run_operations(
 }
 
 async fn run_operation(client: &SnellClient, payload: &[u8]) -> Result<()> {
-    let session = client.dial_tcp("echo.bench", 443).await?;
+    let mut session = client.dial_tcp("echo.bench", 443).await?;
     let written = session.write(payload).await?;
     if written != payload.len() {
         bail!("short benchmark write");

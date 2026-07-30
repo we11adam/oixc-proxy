@@ -203,10 +203,9 @@ struct IdleConnection {
     idle_since: Instant,
 }
 
-#[derive(Clone)]
 struct PhysicalConnection {
-    reader: Arc<Mutex<SnellReader>>,
-    writer: Arc<Mutex<RecordWriter<TransportWriteHalf>>>,
+    reader: SnellReader,
+    writer: RecordWriter<TransportWriteHalf>,
     local_addr: SocketAddr,
 }
 
@@ -226,8 +225,19 @@ pub struct SnellSession {
     reusable: bool,
 }
 
+pub struct SnellSessionReader<'a> {
+    reader: &'a mut SnellReader,
+}
+
+pub struct SnellSessionWriter<'a> {
+    writer: &'a mut RecordWriter<TransportWriteHalf>,
+    reusable: bool,
+}
+
 pub struct SnellPacketSession {
-    physical: PhysicalConnection,
+    reader: Mutex<SnellReader>,
+    writer: Mutex<RecordWriter<TransportWriteHalf>>,
+    local_addr: SocketAddr,
 }
 
 impl SnellClient {
@@ -300,7 +310,11 @@ impl SnellClient {
         let physical = self
             .open_command(&build_udp_associate_request(), false)
             .await?;
-        Ok(SnellPacketSession { physical })
+        Ok(SnellPacketSession {
+            reader: Mutex::new(physical.reader),
+            writer: Mutex::new(physical.writer),
+            local_addr: physical.local_addr,
+        })
     }
 
     pub async fn close(&self) {
@@ -364,22 +378,22 @@ impl SnellClient {
             ],
         );
 
-        let physical = PhysicalConnection {
-            reader: Arc::new(Mutex::new(SnellReader {
+        let mut physical = PhysicalConnection {
+            reader: SnellReader {
                 records: RecordReader::new(read_half, self.inner.options.psk.clone()),
                 buffered: Vec::new(),
                 buffered_offset: 0,
                 server_eof: false,
                 reply_pending: true,
                 reply_error: None,
-            })),
-            writer: Arc::new(Mutex::new(writer)),
+            },
+            writer,
             local_addr,
         };
         if !defer_reply {
             timeout(
                 self.inner.options.handshake_timeout,
-                physical.reader.lock().await.ensure_reply(),
+                physical.reader.ensure_reply(),
             )
             .await
             .map_err(|_| anyhow::anyhow!("Snell handshake timed out"))??;
@@ -424,27 +438,21 @@ impl PhysicalConnection {
         operation_timeout: Duration,
     ) -> Result<()> {
         let request = build_connect_request(host, port, true)?;
-        {
-            let mut reader = self.reader.lock().await;
-            if reader.buffered_remaining() != 0 || !reader.server_eof {
-                bail!("Snell connection is not ready for reuse");
-            }
-            reader.server_eof = false;
-            reader.reply_pending = false;
-            reader.reply_error = None;
+        if self.reader.buffered_remaining() != 0 || !self.reader.server_eof {
+            bail!("Snell connection is not ready for reuse");
         }
-        timeout(
-            operation_timeout,
-            self.writer.lock().await.write_frame(&request, 0),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("Snell reused CONNECT timed out"))??;
-        self.reader.lock().await.reply_pending = true;
+        self.reader.server_eof = false;
+        self.reader.reply_pending = false;
+        self.reader.reply_error = None;
+        timeout(operation_timeout, self.writer.write_frame(&request, 0))
+            .await
+            .map_err(|_| anyhow::anyhow!("Snell reused CONNECT timed out"))??;
+        self.reader.reply_pending = true;
         Ok(())
     }
 
-    async fn retire(&self) {
-        let _ = self.writer.lock().await.shutdown().await;
+    async fn retire(mut self) {
+        let _ = self.writer.shutdown().await;
     }
 }
 
@@ -453,51 +461,40 @@ impl SnellSession {
         self.physical.local_addr
     }
 
-    pub async fn read(&self, destination: &mut [u8]) -> Result<usize> {
-        self.physical
-            .reader
-            .lock()
-            .await
-            .read_application(destination)
-            .await
+    pub fn split(&mut self) -> (SnellSessionReader<'_>, SnellSessionWriter<'_>) {
+        (
+            SnellSessionReader {
+                reader: &mut self.physical.reader,
+            },
+            SnellSessionWriter {
+                writer: &mut self.physical.writer,
+                reusable: self.reusable,
+            },
+        )
     }
 
-    pub async fn write(&self, content: &[u8]) -> Result<usize> {
-        write_application(&self.physical.writer, content).await
+    pub async fn read(&mut self, destination: &mut [u8]) -> Result<usize> {
+        self.physical.reader.read_application(destination).await
     }
 
-    pub async fn close_write(&self) -> Result<()> {
-        if self.reusable {
-            self.physical.writer.lock().await.write_frame(&[], 0).await
-        } else {
-            self.physical.writer.lock().await.shutdown().await
-        }
+    pub async fn write(&mut self, content: &[u8]) -> Result<usize> {
+        write_application(&mut self.physical.writer, content).await
     }
 
     pub fn close_timeout(&self) -> Duration {
         self.client.inner.options.close_timeout
     }
 
-    pub async fn finish(self, clean_relay: bool, close_write_sent: bool) {
+    pub async fn finish(mut self, clean_relay: bool, close_write_sent: bool) {
         if !self.reusable || !clean_relay {
             self.physical.retire().await;
             return;
         }
         let close_result = timeout(self.client.inner.options.close_timeout, async {
             if !close_write_sent {
-                self.physical
-                    .writer
-                    .lock()
-                    .await
-                    .write_frame(&[], 0)
-                    .await?;
+                self.physical.writer.write_frame(&[], 0).await?;
             }
-            self.physical
-                .reader
-                .lock()
-                .await
-                .complete_reuse_close()
-                .await
+            self.physical.reader.complete_reuse_close().await
         })
         .await;
         if matches!(close_result, Ok(Ok(()))) {
@@ -508,24 +505,39 @@ impl SnellSession {
     }
 }
 
+impl SnellSessionReader<'_> {
+    pub async fn read(&mut self, destination: &mut [u8]) -> Result<usize> {
+        self.reader.read_application(destination).await
+    }
+}
+
+impl SnellSessionWriter<'_> {
+    pub async fn write(&mut self, content: &[u8]) -> Result<usize> {
+        write_application(self.writer, content).await
+    }
+
+    pub async fn close_write(&mut self) -> Result<()> {
+        if self.reusable {
+            self.writer.write_frame(&[], 0).await
+        } else {
+            self.writer.shutdown().await
+        }
+    }
+}
+
 impl SnellPacketSession {
     pub fn local_addr(&self) -> SocketAddr {
-        self.physical.local_addr
+        self.local_addr
     }
 
     pub async fn write_to_host(&self, payload: &[u8], host: &str, port: u16) -> Result<usize> {
         let frame = encode_udp_request(host, port, payload)?;
-        self.physical
-            .writer
-            .lock()
-            .await
-            .write_frame(&frame, 0)
-            .await?;
+        self.writer.lock().await.write_frame(&frame, 0).await?;
         Ok(payload.len())
     }
 
     pub async fn read_from(&self) -> Result<(SocketAddr, Vec<u8>)> {
-        let mut reader = self.physical.reader.lock().await;
+        let mut reader = self.reader.lock().await;
         reader.ensure_reply().await?;
         let frame = reader.read_frame().await?;
         let (address, payload) = decode_udp_response(&frame)?;
@@ -533,7 +545,7 @@ impl SnellPacketSession {
     }
 
     pub async fn close(self) {
-        self.physical.retire().await;
+        let _ = self.writer.into_inner().shutdown().await;
     }
 }
 
@@ -648,11 +660,10 @@ fn initial_padding_length(payload_length: usize) -> Result<usize> {
 }
 
 async fn write_application(
-    writer: &Arc<Mutex<RecordWriter<TransportWriteHalf>>>,
+    writer: &mut RecordWriter<TransportWriteHalf>,
     content: &[u8],
 ) -> Result<usize> {
     let mut written = 0;
-    let mut writer = writer.lock().await;
     while written < content.len() {
         let end = (written + MAX_RECORD_PAYLOAD_SIZE).min(content.len());
         writer.write_frame(&content[written..end], 0).await?;
