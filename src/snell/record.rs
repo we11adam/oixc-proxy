@@ -1,5 +1,5 @@
-use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes128Gcm, Nonce};
+use aes_gcm::aead::{AeadInPlace, KeyInit};
+use aes_gcm::{Aes128Gcm, Nonce, Tag};
 use anyhow::{Result, bail};
 use argon2::{Algorithm, Argon2, Params, Version};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -37,6 +37,7 @@ pub struct RecordWriter<W> {
     salt: IdentityNonce,
     salt_sent: bool,
     nonce: [u8; RECORD_NONCE_SIZE],
+    scratch: Vec<u8>,
 }
 
 impl<W: AsyncWrite + Unpin> RecordWriter<W> {
@@ -49,6 +50,7 @@ impl<W: AsyncWrite + Unpin> RecordWriter<W> {
             salt,
             salt_sent: false,
             nonce: [0; RECORD_NONCE_SIZE],
+            scratch: Vec::new(),
         })
     }
 
@@ -57,6 +59,17 @@ impl<W: AsyncWrite + Unpin> RecordWriter<W> {
     }
 
     pub fn encode_frame(&mut self, payload: &[u8], padding_length: usize) -> Result<Vec<u8>> {
+        let mut frame = Vec::new();
+        self.encode_frame_into(&mut frame, payload, padding_length)?;
+        Ok(frame)
+    }
+
+    fn encode_frame_into(
+        &mut self,
+        frame: &mut Vec<u8>,
+        payload: &[u8],
+        padding_length: usize,
+    ) -> Result<()> {
         if payload.len() > MAX_RECORD_PAYLOAD_SIZE || padding_length > MAX_RECORD_PAYLOAD_SIZE {
             bail!("Snell record size is invalid");
         }
@@ -64,12 +77,8 @@ impl<W: AsyncWrite + Unpin> RecordWriter<W> {
             bail!("zero-length Snell record cannot contain padding");
         }
 
-        let mut header = [0u8; RECORD_HEADER_PLAIN_SIZE];
-        header[0] = 4;
-        header[3..5].copy_from_slice(&(padding_length as u16).to_be_bytes());
-        header[5..7].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-
-        let mut frame = Vec::with_capacity(
+        frame.clear();
+        frame.reserve(
             (!self.salt_sent as usize) * 16
                 + RECORD_HEADER_CIPHER_SIZE
                 + padding_length
@@ -83,12 +92,18 @@ impl<W: AsyncWrite + Unpin> RecordWriter<W> {
             frame.extend_from_slice(&self.salt);
             self.salt_sent = true;
         }
-        let encrypted_header = self
+        let header_start = frame.len();
+        frame.resize(header_start + RECORD_HEADER_PLAIN_SIZE, 0);
+        let header = &mut frame[header_start..];
+        header[0] = 4;
+        header[3..5].copy_from_slice(&(padding_length as u16).to_be_bytes());
+        header[5..7].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+        let tag = self
             .aead
-            .encrypt(Nonce::from_slice(&self.nonce), header.as_slice())
+            .encrypt_in_place_detached(Nonce::from_slice(&self.nonce), &[], header)
             .map_err(|_| anyhow::anyhow!("encrypt Snell record header"))?;
         increment_nonce(&mut self.nonce);
-        frame.extend_from_slice(&encrypted_header);
+        frame.extend_from_slice(&tag);
 
         let padding_start = frame.len();
         frame.resize(padding_start + padding_length, 0);
@@ -98,24 +113,36 @@ impl<W: AsyncWrite + Unpin> RecordWriter<W> {
         }
         let payload_start = frame.len();
         if !payload.is_empty() {
-            let encrypted_payload = self
+            frame.extend_from_slice(payload);
+            let tag = self
                 .aead
-                .encrypt(Nonce::from_slice(&self.nonce), payload)
+                .encrypt_in_place_detached(
+                    Nonce::from_slice(&self.nonce),
+                    &[],
+                    &mut frame[payload_start..],
+                )
                 .map_err(|_| anyhow::anyhow!("encrypt Snell record payload"))?;
             increment_nonce(&mut self.nonce);
-            frame.extend_from_slice(&encrypted_payload);
+            frame.extend_from_slice(&tag);
         }
         let (before_payload, payload_ciphertext) = frame.split_at_mut(payload_start);
         swap_padding(&mut before_payload[padding_start..], payload_ciphertext);
-        Ok(frame)
+        Ok(())
     }
 
     pub async fn write_frame(&mut self, payload: &[u8], padding_length: usize) -> Result<()> {
-        let frame = self.encode_frame(payload, padding_length)?;
-        self.writer
-            .write_all(&frame)
-            .await
-            .map_err(|error| anyhow::anyhow!("write Snell record: {error}"))
+        let mut frame = std::mem::take(&mut self.scratch);
+        let encoded = self.encode_frame_into(&mut frame, payload, padding_length);
+        let result = match encoded {
+            Ok(()) => self
+                .writer
+                .write_all(&frame)
+                .await
+                .map_err(|error| anyhow::anyhow!("write Snell record: {error}")),
+            Err(error) => Err(error),
+        };
+        self.scratch = frame;
+        result
     }
 
     pub async fn write_raw_all(&mut self, content: &[u8]) -> Result<()> {
@@ -187,11 +214,16 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
             .read_exact(&mut encrypted_header)
             .await
             .map_err(|error| anyhow::anyhow!("read Snell record header: {error}"))?;
-        let header = aead
-            .decrypt(Nonce::from_slice(&self.nonce), encrypted_header.as_slice())
-            .map_err(|_| anyhow::anyhow!("authenticate Snell record header"))?;
+        let (header, header_tag) = encrypted_header.split_at_mut(RECORD_HEADER_PLAIN_SIZE);
+        aead.decrypt_in_place_detached(
+            Nonce::from_slice(&self.nonce),
+            &[],
+            header,
+            Tag::from_slice(header_tag),
+        )
+        .map_err(|_| anyhow::anyhow!("authenticate Snell record header"))?;
         increment_nonce(&mut self.nonce);
-        if header.len() != RECORD_HEADER_PLAIN_SIZE || header[0] != 4 {
+        if header[0] != 4 {
             bail!("Snell record header is invalid");
         }
         let padding_length = u16::from_be_bytes([header[3], header[4]]) as usize;
@@ -213,11 +245,18 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
             .map_err(|error| anyhow::anyhow!("read Snell record payload: {error}"))?;
         let (padding, encrypted_payload) = frame.split_at_mut(padding_length);
         swap_padding(padding, encrypted_payload);
-        let payload = aead
-            .decrypt(Nonce::from_slice(&self.nonce), encrypted_payload.as_ref())
-            .map_err(|_| anyhow::anyhow!("authenticate Snell record payload"))?;
+        let (payload, payload_tag) = encrypted_payload.split_at_mut(payload_length);
+        aead.decrypt_in_place_detached(
+            Nonce::from_slice(&self.nonce),
+            &[],
+            payload,
+            Tag::from_slice(payload_tag),
+        )
+        .map_err(|_| anyhow::anyhow!("authenticate Snell record payload"))?;
         increment_nonce(&mut self.nonce);
-        Ok(payload)
+        frame.truncate(padding_length + payload_length);
+        frame.drain(..padding_length);
+        Ok(frame)
     }
 }
 
