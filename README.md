@@ -21,6 +21,9 @@ cargo build --release
 
 The optimized binary is `target/release/oixc-proxy`. Release builds use
 `opt-level=3`, fat LTO, one codegen unit, symbol stripping and abort-on-panic.
+On aarch64 macOS and Linux, the repository build configuration enables the
+RustCrypto ARMv8 AES and PMULL backends. Those backends still detect CPU
+support at runtime and safely fall back when the extensions are unavailable.
 
 ## Configure and run
 
@@ -238,9 +241,12 @@ scripts/benchmark-go-vs-rust.sh
 
 The script builds optimized clients, starts the server on
 `127.0.0.1:19090`, and compares fresh connections, sequential reuse, parallel
-reuse, and 1 MiB transfer workloads. Set `GO_OIXC_ROOT` if the Go repository is
-not at `/Users/adam/Projects/oixc`, `BENCH_LISTEN` to select another loopback
-port, or `RESULTS_FILE` to retain the raw NDJSON results.
+reuse, a production-like 1 MiB stream split into 32 KiB application writes,
+and a single-write 1 MiB API stress workload. Worker response buffers are
+reused so allocator noise is not charged to each operation. Set
+`GO_OIXC_ROOT` if the Go repository is not at `/Users/adam/Projects/oixc`,
+`BENCH_LISTEN` to select another loopback port, or `RESULTS_FILE` to retain the
+raw NDJSON results.
 
 This benchmark deliberately replaces ECH-TLS with loopback TCP and one static
 exporter value. It isolates Identity v2, Argon2id, Snell v4 framing/encryption,

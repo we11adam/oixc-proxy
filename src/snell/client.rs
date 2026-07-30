@@ -14,13 +14,17 @@ use tokio_rustls::client::TlsStream;
 
 use crate::transport::EchDialer;
 
+use super::record::RecordKind;
 use super::{
-    Exporter, RecordReader, RecordWriter, ZeroRecord, build_connect_request, build_identity_v2,
+    Exporter, RecordReader, RecordWriter, build_connect_request, build_identity_v2,
     build_udp_associate_request, decode_udp_response, encode_udp_request,
 };
 
 const INITIAL_FRAME_BUDGET: usize = 0x491;
-const READ_BUFFER_SIZE: usize = 32 << 10;
+// A full Snell record is slightly larger than 16 KiB. Keep enough buffered
+// input for several records so header and payload reads do not alternate
+// between small transport reads at record boundaries.
+const READ_BUFFER_SIZE: usize = 64 << 10;
 type TransportReadHalf = BufReader<ReadHalf<ClientTransportStream>>;
 type TransportWriteHalf = WriteHalf<ClientTransportStream>;
 
@@ -198,7 +202,7 @@ struct ClientInner {
 }
 
 struct IdleConnection {
-    physical: PhysicalConnection,
+    physical: Box<PhysicalConnection>,
     uses: usize,
     idle_since: Instant,
 }
@@ -219,7 +223,7 @@ struct SnellReader {
 }
 
 pub struct SnellSession {
-    physical: PhysicalConnection,
+    physical: Box<PhysicalConnection>,
     client: SnellClient,
     uses: usize,
     reusable: bool,
@@ -297,7 +301,7 @@ impl SnellClient {
             }
         }
 
-        let physical = self.open_tcp(host, port, self.inner.options.reuse).await?;
+        let physical = Box::new(self.open_tcp(host, port, self.inner.options.reuse).await?);
         Ok(SnellSession {
             physical,
             client: self.clone(),
@@ -414,13 +418,13 @@ impl SnellClient {
         }
     }
 
-    async fn release(&self, physical: PhysicalConnection, uses: usize) {
+    async fn release(&self, physical: Box<PhysicalConnection>, uses: usize) {
         if self.inner.closed.load(Ordering::Acquire) || uses >= self.inner.options.max_uses {
             physical.retire().await;
             return;
         }
         let mut idle = self.inner.idle.lock().await;
-        if idle.len() >= self.inner.options.max_idle {
+        if self.inner.closed.load(Ordering::Acquire) || idle.len() >= self.inner.options.max_idle {
             drop(idle);
             physical.retire().await;
             return;
@@ -454,7 +458,7 @@ impl PhysicalConnection {
         Ok(())
     }
 
-    async fn retire(mut self) {
+    async fn retire(mut self: Box<Self>) {
         let _ = self.writer.shutdown().await;
     }
 }
@@ -563,12 +567,9 @@ impl SnellReader {
             return Ok(0);
         }
         while self.buffered_remaining() == 0 {
-            match self.read_frame().await {
-                Ok(payload) => {
-                    self.buffered = payload;
-                    self.buffered_offset = 0;
-                }
-                Err(error) if error.downcast_ref::<ZeroRecord>().is_some() => {
+            match self.fill_buffer().await {
+                Ok(RecordKind::Payload) => {}
+                Ok(RecordKind::Zero) => {
                     self.server_eof = true;
                     return Ok(0);
                 }
@@ -584,6 +585,11 @@ impl SnellReader {
 
     async fn read_frame(&mut self) -> Result<Vec<u8>> {
         self.records.read_frame().await
+    }
+
+    async fn fill_buffer(&mut self) -> Result<RecordKind> {
+        self.buffered_offset = 0;
+        self.records.read_frame_into(&mut self.buffered).await
     }
 
     async fn ensure_reply(&mut self) -> Result<()> {
@@ -602,34 +608,44 @@ impl SnellReader {
     }
 
     async fn read_reply(&mut self) -> Result<()> {
-        let status = self.read_exact_payload(1).await?[0];
-        match status {
+        let mut status = [0u8; 1];
+        self.read_exact_payload_into(&mut status).await?;
+        match status[0] {
             0 => Ok(()),
             2 => {
-                let detail = self.read_exact_payload(2).await?;
-                let _message = self.read_exact_payload(detail[1] as usize).await?;
+                let mut detail = [0u8; 2];
+                self.read_exact_payload_into(&mut detail).await?;
+                let mut message = vec![0u8; detail[1] as usize];
+                self.read_exact_payload_into(&mut message).await?;
                 bail!("Snell server rejected the request with code {}", detail[0]);
             }
             _ => bail!("Snell server returned an unexpected status"),
         }
     }
 
-    async fn read_exact_payload(&mut self, length: usize) -> Result<Vec<u8>> {
+    async fn read_exact_payload_into(&mut self, destination: &mut [u8]) -> Result<()> {
+        let length = destination.len();
         while self.buffered_remaining() < length {
-            let payload = self
-                .read_frame()
-                .await
-                .map_err(|error| anyhow::anyhow!("read Snell CONNECT response: {error}"))?;
             if self.buffered_remaining() == 0 {
-                self.buffered = payload;
-                self.buffered_offset = 0;
+                let kind = self
+                    .fill_buffer()
+                    .await
+                    .map_err(|error| anyhow::anyhow!("read Snell CONNECT response: {error}"))?;
+                if kind == RecordKind::Zero {
+                    bail!("read Snell CONNECT response: Snell zero-length record");
+                }
             } else {
+                let payload = self
+                    .read_frame()
+                    .await
+                    .map_err(|error| anyhow::anyhow!("read Snell CONNECT response: {error}"))?;
                 self.buffered.extend_from_slice(&payload);
             }
         }
         let start = self.buffered_offset;
         self.buffered_offset += length;
-        Ok(self.buffered[start..start + length].to_vec())
+        destination.copy_from_slice(&self.buffered[start..start + length]);
+        Ok(())
     }
 
     async fn complete_reuse_close(&mut self) -> Result<()> {
@@ -637,11 +653,9 @@ impl SnellReader {
         self.buffered_offset = 0;
         self.ensure_reply().await?;
         while !self.server_eof {
-            match self.read_frame().await {
-                Ok(_) => {}
-                Err(error) if error.downcast_ref::<ZeroRecord>().is_some() => {
-                    self.server_eof = true;
-                }
+            match self.fill_buffer().await {
+                Ok(RecordKind::Payload) => {}
+                Ok(RecordKind::Zero) => self.server_eof = true,
                 Err(error) => return Err(error.context("finish Snell reused session")),
             }
         }

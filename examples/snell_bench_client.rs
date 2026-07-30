@@ -19,6 +19,7 @@ struct Options {
     warmup: usize,
     concurrency: usize,
     payload_bytes: usize,
+    application_chunk_bytes: usize,
     reuse: bool,
 }
 
@@ -31,6 +32,7 @@ struct Summary {
     warmup: usize,
     concurrency: usize,
     payload_bytes: usize,
+    application_chunk_bytes: usize,
     elapsed_ms: f64,
     operations_per_second: f64,
     round_trip_mbps: f64,
@@ -68,6 +70,7 @@ async fn main() -> Result<()> {
         options.warmup,
         options.concurrency,
         options.payload_bytes,
+        options.application_chunk_bytes,
     )
     .await?;
     let started = Instant::now();
@@ -76,6 +79,7 @@ async fn main() -> Result<()> {
         options.requests,
         options.concurrency,
         options.payload_bytes,
+        options.application_chunk_bytes,
     )
     .await?;
     let elapsed = started.elapsed();
@@ -99,6 +103,7 @@ async fn main() -> Result<()> {
         warmup: options.warmup,
         concurrency: options.concurrency,
         payload_bytes: options.payload_bytes,
+        application_chunk_bytes: options.application_chunk_bytes,
         elapsed_ms: elapsed.as_secs_f64() * 1_000.0,
         operations_per_second,
         round_trip_mbps: round_trip_bits / elapsed_seconds / 1_000_000.0,
@@ -117,6 +122,7 @@ async fn run_operations(
     count: usize,
     concurrency: usize,
     payload_bytes: usize,
+    application_chunk_bytes: usize,
 ) -> Result<Vec<u64>> {
     if count == 0 {
         return Ok(Vec::new());
@@ -128,6 +134,7 @@ async fn run_operations(
         let next = next.clone();
         workers.spawn(async move {
             let payload = payload(worker_id, payload_bytes);
+            let mut response = vec![0u8; payload_bytes];
             let mut samples = Vec::new();
             loop {
                 let index = next.fetch_add(1, Ordering::Relaxed);
@@ -135,9 +142,12 @@ async fn run_operations(
                     break;
                 }
                 let started = Instant::now();
-                timeout(Duration::from_secs(15), run_operation(&client, &payload))
-                    .await
-                    .map_err(|_| anyhow::anyhow!("benchmark operation timed out"))??;
+                timeout(
+                    Duration::from_secs(15),
+                    run_operation(&client, &payload, &mut response, application_chunk_bytes),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("benchmark operation timed out"))??;
                 samples.push(started.elapsed().as_micros() as u64);
             }
             Result::<Vec<u64>>::Ok(samples)
@@ -153,13 +163,19 @@ async fn run_operations(
     Ok(samples)
 }
 
-async fn run_operation(client: &SnellClient, payload: &[u8]) -> Result<()> {
+async fn run_operation(
+    client: &SnellClient,
+    payload: &[u8],
+    response: &mut [u8],
+    application_chunk_bytes: usize,
+) -> Result<()> {
     let mut session = client.dial_tcp("echo.bench", 443).await?;
-    let written = session.write(payload).await?;
-    if written != payload.len() {
-        bail!("short benchmark write");
+    for chunk in payload.chunks(application_chunk_bytes) {
+        let written = session.write(chunk).await?;
+        if written != chunk.len() {
+            bail!("short benchmark write");
+        }
     }
-    let mut response = vec![0u8; payload.len()];
     let mut offset = 0;
     while offset < response.len() {
         let read = session.read(&mut response[offset..]).await?;
@@ -195,6 +211,7 @@ fn parse_options() -> Result<Options> {
         warmup: 100,
         concurrency: 1,
         payload_bytes: 1_024,
+        application_chunk_bytes: 0,
         reuse: true,
     };
     let mut arguments = std::env::args().skip(1);
@@ -227,13 +244,21 @@ fn parse_options() -> Result<Options> {
             "--payload-bytes" => {
                 options.payload_bytes = value.parse().context("parse --payload-bytes")?
             }
+            "--application-chunk-bytes" => {
+                options.application_chunk_bytes =
+                    value.parse().context("parse --application-chunk-bytes")?
+            }
             _ => bail!("unknown option: {argument}"),
         }
+    }
+    if options.application_chunk_bytes == 0 {
+        options.application_chunk_bytes = options.payload_bytes;
     }
     if options.psk.is_empty()
         || options.requests == 0
         || options.concurrency == 0
         || options.payload_bytes == 0
+        || options.application_chunk_bytes == 0
     {
         bail!("PSK, requests, concurrency and payload size must be positive");
     }
@@ -259,6 +284,6 @@ fn print_help() {
         "Usage: snell-bench-client [--server 127.0.0.1:19090] \
          [--psk VALUE] [--exporter 64_HEX_CHARS] [--requests N] \
          [--warmup N] [--concurrency N] [--payload-bytes N] \
-         [--reuse true|false]"
+         [--application-chunk-bytes N] [--reuse true|false]"
     );
 }

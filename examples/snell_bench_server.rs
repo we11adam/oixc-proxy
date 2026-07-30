@@ -4,13 +4,14 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use oixc_proxy::snell::{RecordReader, RecordWriter, ZeroRecord, build_identity_v2};
 use subtle::ConstantTimeEq;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:19090";
 const DEFAULT_PSK: &str = "oixc-local-benchmark-only";
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+const READ_BUFFER_SIZE: usize = 64 << 10;
 
 #[derive(Clone)]
 struct Options {
@@ -76,7 +77,11 @@ async fn serve_connection(mut stream: TcpStream, options: &Options) -> Result<()
     }
 
     let (read_half, write_half) = tokio::io::split(stream);
-    let mut reader = RecordReader::with_salt(read_half, options.psk.clone(), nonce)?;
+    let mut reader = RecordReader::with_salt(
+        BufReader::with_capacity(READ_BUFFER_SIZE, read_half),
+        options.psk.clone(),
+        nonce,
+    )?;
     let mut server_salt = [0u8; 16];
     getrandom::fill(&mut server_salt)
         .map_err(|_| anyhow::anyhow!("generate server record salt"))?;

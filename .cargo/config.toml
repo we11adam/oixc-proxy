@@ -1,0 +1,11 @@
+# RustCrypto's AES and GHASH crates require these opt-in cfgs before they
+# compile their ARMv8 crypto backends. On macOS and Linux the resulting code
+# still performs runtime feature detection and falls back safely.
+[target.aarch64-apple-darwin]
+rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]

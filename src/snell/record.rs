@@ -10,11 +10,17 @@ const RECORD_NONCE_SIZE: usize = 12;
 const RECORD_HEADER_PLAIN_SIZE: usize = 7;
 const RECORD_HEADER_CIPHER_SIZE: usize = RECORD_HEADER_PLAIN_SIZE + 16;
 const MAX_RECORD_PAYLOAD_SIZE: usize = (1 << 14) - 1;
-const WRITE_BATCH_LIMIT: usize = 128 << 10;
+const WRITE_BATCH_LIMIT: usize = 64 << 10;
 
 #[derive(Debug, thiserror::Error)]
 #[error("Snell zero-length record")]
 pub struct ZeroRecord;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecordKind {
+    Payload,
+    Zero,
+}
 
 pub fn derive_record_key(psk: &str, salt: &IdentityNonce) -> Result<[u8; 16]> {
     if psk.is_empty() {
@@ -225,6 +231,15 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
     }
 
     pub async fn read_frame(&mut self) -> Result<Vec<u8>> {
+        let mut frame = Vec::new();
+        match self.read_frame_into(&mut frame).await? {
+            RecordKind::Payload => Ok(frame),
+            RecordKind::Zero => Err(ZeroRecord.into()),
+        }
+    }
+
+    pub(crate) async fn read_frame_into(&mut self, frame: &mut Vec<u8>) -> Result<RecordKind> {
+        frame.clear();
         if self.aead.is_none() {
             let mut salt = [0u8; 16];
             self.reader
@@ -264,12 +279,12 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
             if padding_length != 0 {
                 bail!("zero-length Snell record contains padding");
             }
-            return Err(ZeroRecord.into());
+            return Ok(RecordKind::Zero);
         }
 
-        let mut frame = vec![0u8; padding_length + payload_length + 16];
+        frame.resize(padding_length + payload_length + 16, 0);
         self.reader
-            .read_exact(&mut frame)
+            .read_exact(frame)
             .await
             .map_err(|error| anyhow::anyhow!("read Snell record payload: {error}"))?;
         let (padding, encrypted_payload) = frame.split_at_mut(padding_length);
@@ -283,9 +298,11 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
         )
         .map_err(|_| anyhow::anyhow!("authenticate Snell record payload"))?;
         increment_nonce(&mut self.nonce);
-        frame.truncate(padding_length + payload_length);
-        frame.drain(..padding_length);
-        Ok(frame)
+        if padding_length != 0 {
+            frame.copy_within(padding_length..padding_length + payload_length, 0);
+        }
+        frame.truncate(payload_length);
+        Ok(RecordKind::Payload)
     }
 }
 
@@ -330,5 +347,37 @@ mod tests {
         let payload = b"authenticated test payload";
         writer.write_frame(payload, 17).await.unwrap();
         assert_eq!(reader.read_frame().await.unwrap(), payload);
+    }
+
+    #[tokio::test]
+    async fn record_reader_reuses_output_capacity() {
+        let salt = [9u8; 16];
+        let (left, right) = tokio::io::duplex(4096);
+        let mut writer = RecordWriter::new(left, "test-psk-2026", salt).unwrap();
+        let mut reader = RecordReader::new(right, "test-psk-2026");
+        writer.write_frame(b"first payload", 31).await.unwrap();
+        writer.write_frame(b"second payload", 7).await.unwrap();
+
+        let mut output = Vec::new();
+        assert_eq!(
+            reader.read_frame_into(&mut output).await.unwrap(),
+            RecordKind::Payload
+        );
+        assert_eq!(output, b"first payload");
+        let capacity = output.capacity();
+        assert_eq!(
+            reader.read_frame_into(&mut output).await.unwrap(),
+            RecordKind::Payload
+        );
+        assert_eq!(output, b"second payload");
+        assert_eq!(output.capacity(), capacity);
+
+        writer.write_frame(&[], 0).await.unwrap();
+        assert_eq!(
+            reader.read_frame_into(&mut output).await.unwrap(),
+            RecordKind::Zero
+        );
+        assert!(output.is_empty());
+        assert_eq!(output.capacity(), capacity);
     }
 }

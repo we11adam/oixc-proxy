@@ -60,7 +60,8 @@ run_case() {
     warmup=$3
     concurrency=$4
     payload_bytes=$5
-    reuse=$6
+    application_chunk_bytes=$6
+    reuse=$7
 
     "$bench_tmp/go-bench-client" \
         -server "$listen" \
@@ -68,6 +69,7 @@ run_case() {
         -warmup "$warmup" \
         -concurrency "$concurrency" \
         -payload-bytes "$payload_bytes" \
+        -application-chunk-bytes "$application_chunk_bytes" \
         -reuse="$reuse" |
         jq -c --arg scenario "$scenario" '. + {scenario: $scenario}' |
         tee -a "$results_file"
@@ -78,18 +80,20 @@ run_case() {
         --warmup "$warmup" \
         --concurrency "$concurrency" \
         --payload-bytes "$payload_bytes" \
+        --application-chunk-bytes "$application_chunk_bytes" \
         --reuse "$reuse" |
         jq -c --arg scenario "$scenario" '. + {scenario: $scenario}' |
         tee -a "$results_file"
 }
 
-run_case fresh-1k 1000 50 1 1024 false
-run_case reuse-1k 10000 500 1 1024 true
-run_case parallel-reuse-1k 10000 500 16 1024 true
-run_case parallel-reuse-1m 500 20 4 1048576 true
+run_case fresh-1k 1000 50 1 1024 1024 false
+run_case reuse-1k 10000 500 1 1024 1024 true
+run_case parallel-reuse-1k 10000 500 16 1024 1024 true
+run_case parallel-stream-1m 500 20 4 1048576 32768 true
+run_case parallel-single-write-1m 500 20 4 1048576 1048576 true
 
 echo
-printf '%-22s %13s %13s %10s %12s %12s\n' \
+printf '%-26s %13s %13s %10s %12s %12s\n' \
     scenario go_ops_s rust_ops_s rust_go go_p50_us rust_p50_us
 jq -s -r '
     group_by(.scenario)[] |
@@ -106,7 +110,7 @@ jq -s -r '
     @tsv
 ' "$results_file" |
 while IFS='	' read -r scenario go_ops rust_ops ratio go_p50 rust_p50; do
-    printf '%-22s %13.1f %13.1f %9.3fx %12.1f %12.1f\n' \
+    printf '%-26s %13.1f %13.1f %9.3fx %12.1f %12.1f\n' \
         "$scenario" "$go_ops" "$rust_ops" "$ratio" "$go_p50" "$rust_p50"
 done
 
