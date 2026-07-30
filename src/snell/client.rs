@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -213,7 +212,8 @@ struct PhysicalConnection {
 
 struct SnellReader {
     records: RecordReader<TransportReadHalf>,
-    buffered: VecDeque<u8>,
+    buffered: Vec<u8>,
+    buffered_offset: usize,
     server_eof: bool,
     reply_pending: bool,
     reply_error: Option<String>,
@@ -367,7 +367,8 @@ impl SnellClient {
         let physical = PhysicalConnection {
             reader: Arc::new(Mutex::new(SnellReader {
                 records: RecordReader::new(read_half, self.inner.options.psk.clone()),
-                buffered: VecDeque::new(),
+                buffered: Vec::new(),
+                buffered_offset: 0,
                 server_eof: false,
                 reply_pending: true,
                 reply_error: None,
@@ -425,7 +426,7 @@ impl PhysicalConnection {
         let request = build_connect_request(host, port, true)?;
         {
             let mut reader = self.reader.lock().await;
-            if !reader.buffered.is_empty() || !reader.server_eof {
+            if reader.buffered_remaining() != 0 || !reader.server_eof {
                 bail!("Snell connection is not ready for reuse");
             }
             reader.server_eof = false;
@@ -537,14 +538,21 @@ impl SnellPacketSession {
 }
 
 impl SnellReader {
+    fn buffered_remaining(&self) -> usize {
+        self.buffered.len() - self.buffered_offset
+    }
+
     pub async fn read_application(&mut self, destination: &mut [u8]) -> Result<usize> {
         self.ensure_reply().await?;
         if destination.is_empty() {
             return Ok(0);
         }
-        while self.buffered.is_empty() {
+        while self.buffered_remaining() == 0 {
             match self.read_frame().await {
-                Ok(payload) => self.buffered.extend(payload),
+                Ok(payload) => {
+                    self.buffered = payload;
+                    self.buffered_offset = 0;
+                }
                 Err(error) if error.downcast_ref::<ZeroRecord>().is_some() => {
                     self.server_eof = true;
                     return Ok(0);
@@ -552,10 +560,10 @@ impl SnellReader {
                 Err(error) => return Err(error),
             }
         }
-        let length = destination.len().min(self.buffered.len());
-        for slot in &mut destination[..length] {
-            *slot = self.buffered.pop_front().expect("length checked");
-        }
+        let length = destination.len().min(self.buffered_remaining());
+        destination[..length]
+            .copy_from_slice(&self.buffered[self.buffered_offset..self.buffered_offset + length]);
+        self.buffered_offset += length;
         Ok(length)
     }
 
@@ -592,20 +600,26 @@ impl SnellReader {
     }
 
     async fn read_exact_payload(&mut self, length: usize) -> Result<Vec<u8>> {
-        while self.buffered.len() < length {
+        while self.buffered_remaining() < length {
             let payload = self
                 .read_frame()
                 .await
                 .map_err(|error| anyhow::anyhow!("read Snell CONNECT response: {error}"))?;
-            self.buffered.extend(payload);
+            if self.buffered_remaining() == 0 {
+                self.buffered = payload;
+                self.buffered_offset = 0;
+            } else {
+                self.buffered.extend_from_slice(&payload);
+            }
         }
-        Ok((0..length)
-            .map(|_| self.buffered.pop_front().expect("length checked"))
-            .collect())
+        let start = self.buffered_offset;
+        self.buffered_offset += length;
+        Ok(self.buffered[start..start + length].to_vec())
     }
 
     async fn complete_reuse_close(&mut self) -> Result<()> {
         self.buffered.clear();
+        self.buffered_offset = 0;
         self.ensure_reply().await?;
         while !self.server_eof {
             match self.read_frame().await {
