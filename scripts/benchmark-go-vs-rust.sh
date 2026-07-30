@@ -2,7 +2,7 @@
 set -eu
 
 rust_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
-go_root=${GO_OIXC_ROOT:-/Users/adam/Projects/oixc}
+go_root=${GO_OIXC_ROOT:-/Users/adam/Projects/oixc-go}
 listen=${BENCH_LISTEN:-127.0.0.1:19090}
 bench_tmp=$(mktemp -d "${TMPDIR:-/tmp}/oixc-snell-bench.XXXXXX")
 server_pid=

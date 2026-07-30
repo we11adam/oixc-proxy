@@ -2,8 +2,8 @@
 
 `oixc-proxy` is a clean-room Rust client and local named-node proxy for
 oixCloud. It fetches, authenticates and decrypts the managed node catalog, then
-publishes only premium/love Fusion nodes through one SOCKS5 listener and a
-separate HTTP nodelist listener.
+publishes only nodes whose names contain `Fusion` or standalone `CIA`/`IXP`
+markers through one SOCKS5 listener and a separate HTTP nodelist listener.
 
 This repository is the Rust rewrite of the Go implementation in `oixc`. The
 binary name, commands, configuration, HTTP endpoints, Surge provider format,
@@ -61,9 +61,10 @@ reversible URL-safe encoding of the exact managed node name; the password is a
 stable HMAC-derived routing secret. The access token, node address, PSK and ECH
 configuration are never returned by the HTTP endpoint.
 
-Only names containing `Fusion`, case-insensitively, are published. An empty
-filtered catalog is rejected so a control-plane naming change cannot
-accidentally expose ordinary nodes.
+Only names containing `Fusion` or standalone `CIA`/`IXP` tokens,
+case-insensitively, are published. Treating the acronyms as tokens avoids
+admitting ordinary names such as `Special`. An empty filtered catalog is
+rejected so a control-plane naming change cannot expose ordinary nodes.
 
 ## Service configuration
 
@@ -115,9 +116,10 @@ file with mode `0600`. It refuses to replace an existing file.
 the generated provider select different managed nodes on one port. It also
 serves `GET`/`HEAD` for `/surge-proxies.conf` and `/healthz`.
 
-`serve-map` fetches the same Fusion catalog itself, then gives each node one
-loopback SOCKS5 port beginning at 7200 by default. Its default protected token
-file is `token.txt`. It does not provide the HTTP nodelist endpoint.
+`serve-map` fetches the same Fusion/CIA/IXP catalog itself, then gives each
+node one loopback SOCKS5 port beginning at 7200 by default. Its default
+protected token file is `token.txt`. It does not provide the HTTP nodelist
+endpoint.
 
 The removed `serve-provider`, single-node `serve --index`, `dump-*`, `probe-*`,
 `seal-bundle`, `install-bundle` and `inspect-binary` commands remain removed.
@@ -185,7 +187,7 @@ The control plane:
 3. Verifies the HMAC over the exact encrypted response string.
 4. Strictly decodes Base64, ASCII armor and age, with 8 MiB limits.
 5. Strictly parses one YAML document and validates the Snell ECH profile.
-6. Fails closed to the Fusion-only catalog.
+6. Fails closed to the Fusion/CIA/IXP name allowlist.
 
 The data plane:
 
@@ -222,8 +224,9 @@ cargo build --release
 
 Unit tests include fixed Go/Rust compatibility vectors for request HMAC,
 Identity v2, Argon2id record keys, CONNECT encoding and private DNS signatures.
-Live validation should additionally cover `/healthz`, the 74-entry Fusion
-provider, shared-port SOCKS routing, `serve-map` and a real HTTPS request.
+Live validation should additionally cover `/healthz`, a non-empty
+Fusion/CIA/IXP provider, shared-port SOCKS routing, `serve-map` and a real
+HTTPS request.
 
 ## Go/Rust Snell client benchmark
 
@@ -244,7 +247,7 @@ The script builds optimized clients, starts the server on
 reuse, a production-like 1 MiB stream split into 32 KiB application writes,
 and a single-write 1 MiB API stress workload. Worker response buffers are
 reused so allocator noise is not charged to each operation. Set
-`GO_OIXC_ROOT` if the Go repository is not at `/Users/adam/Projects/oixc`,
+`GO_OIXC_ROOT` if the Go repository is not at `/Users/adam/Projects/oixc-go`,
 `BENCH_LISTEN` to select another loopback port, or `RESULTS_FILE` to retain the
 raw NDJSON results.
 

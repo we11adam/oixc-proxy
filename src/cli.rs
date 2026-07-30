@@ -313,7 +313,7 @@ fn build_fixed_route(proxy: &Proxy, runtime: &RuntimeConfig) -> Result<Route> {
 async fn load_managed_nodes(runtime: &RuntimeConfig) -> Result<ManagedConfig> {
     let client = api_client(runtime)?;
     let plaintext = client.dump_managed_config().await?;
-    ManagedConfig::parse(&plaintext)?.filter_premium_love()
+    ManagedConfig::parse(&plaintext)?.filter_allowed_nodes()
 }
 
 fn api_client(runtime: &RuntimeConfig) -> Result<ApiClient> {

@@ -4,7 +4,6 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 const MAX_MANAGED_CONFIG_BYTES: usize = 8 << 20;
-const PREMIUM_LOVE_NODE_MARKER: &str = "fusion";
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -73,14 +72,14 @@ impl ManagedConfig {
         Ok(config)
     }
 
-    pub fn filter_premium_love(self) -> Result<Self> {
+    pub fn filter_allowed_nodes(self) -> Result<Self> {
         let proxies = self
             .proxies
             .into_iter()
-            .filter(|proxy| proxy.name.to_lowercase().contains(PREMIUM_LOVE_NODE_MARKER))
+            .filter(|proxy| is_allowed_node_name(&proxy.name))
             .collect::<Vec<_>>();
         if proxies.is_empty() {
-            bail!("managed config contains no premium/love Fusion proxies");
+            bail!("managed config contains no allowed Fusion/CIA/IXP proxies");
         }
         Ok(Self { proxies })
     }
@@ -100,6 +99,14 @@ impl ManagedConfig {
         }
         Ok(())
     }
+}
+
+fn is_allowed_node_name(name: &str) -> bool {
+    if name.to_lowercase().contains("fusion") {
+        return true;
+    }
+    name.split(|character: char| !character.is_alphanumeric())
+        .any(|token| token.eq_ignore_ascii_case("cia") || token.eq_ignore_ascii_case("ixp"))
 }
 
 impl Proxy {
@@ -161,9 +168,45 @@ proxies:
 "#;
 
     #[test]
-    fn parses_and_filters_fusion_nodes() {
-        let managed = ManagedConfig::parse(YAML.as_bytes()).unwrap();
-        assert_eq!(managed.filter_premium_love().unwrap().proxies.len(), 1);
+    fn filters_allowed_node_names_in_original_order() {
+        let mut managed = ManagedConfig::parse(YAML.as_bytes()).unwrap();
+        let template = managed.proxies.pop().unwrap();
+        managed.proxies = [
+            "Hong Kong 01",
+            "Hong Kong Fusion 01",
+            "United States cia 01",
+            "Japan IxP 01",
+            "United States Special 01",
+            "Singapore 01",
+        ]
+        .into_iter()
+        .map(|name| {
+            let mut proxy = template.clone();
+            proxy.name = name.to_owned();
+            proxy
+        })
+        .collect();
+
+        let filtered = managed.filter_allowed_nodes().unwrap();
+        assert_eq!(
+            filtered
+                .proxies
+                .iter()
+                .map(|proxy| proxy.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Hong Kong Fusion 01",
+                "United States cia 01",
+                "Japan IxP 01"
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_catalog_without_allowed_node_names() {
+        let mut managed = ManagedConfig::parse(YAML.as_bytes()).unwrap();
+        managed.proxies[0].name = "Hong Kong 01".to_owned();
+        assert!(managed.filter_allowed_nodes().is_err());
     }
 
     #[test]
