@@ -1,0 +1,10 @@
+# Keep this file private: chmod 0600 ~/.config/oixc-proxy/oixc-proxy.conf
+token=REPLACE_WITH_OIXC_ACCESS_TOKEN
+socks5-listen=127.0.0.1:6172
+nodelist-listen=127.0.0.1:6173
+node-refresh-interval=1h
+
+# For a trusted LAN host, use wildcard listeners and publish one specific IP:
+# socks5-listen=0.0.0.0:6172
+# nodelist-listen=0.0.0.0:6173
+# outbound-ip=10.0.0.16

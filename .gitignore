@@ -1,0 +1,11 @@
+/target/
+/dist/
+/.idea/
+/*.age
+/*.key
+/config.json
+/oixc-proxy.conf
+/token.txt
+/information*.json
+/managed*.dat
+/surge*.conf
