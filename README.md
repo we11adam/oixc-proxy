@@ -221,3 +221,28 @@ Unit tests include fixed Go/Rust compatibility vectors for request HMAC,
 Identity v2, Argon2id record keys, CONNECT encoding and private DNS signatures.
 Live validation should additionally cover `/healthz`, the 74-entry Fusion
 provider, shared-port SOCKS routing, `serve-map` and a real HTTPS request.
+
+## Go/Rust Snell client benchmark
+
+The repository contains a loopback-only Rust benchmark server and matching
+Go/Rust clients. The server validates the real Identity v2 handshake, decodes
+Snell v4 records, implements the zero-record reuse handshake, and echoes
+application payloads. Both clients exercise their production Snell client and
+pool implementations.
+
+Run the standard comparison matrix:
+
+```sh
+scripts/benchmark-go-vs-rust.sh
+```
+
+The script builds optimized clients, starts the server on
+`127.0.0.1:19090`, and compares fresh connections, sequential reuse, parallel
+reuse, and 1 MiB transfer workloads. Set `GO_OIXC_ROOT` if the Go repository is
+not at `/Users/adam/Projects/oixc`, `BENCH_LISTEN` to select another loopback
+port, or `RESULTS_FILE` to retain the raw NDJSON results.
+
+This benchmark deliberately replaces ECH-TLS with loopback TCP and one static
+exporter value. It isolates Identity v2, Argon2id, Snell v4 framing/encryption,
+application I/O, and connection pooling. It does not measure DNS, TCP network
+RTT, TLS/ECH handshakes, SOCKS5 parsing, or remote-node performance.

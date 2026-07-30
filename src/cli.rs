@@ -302,7 +302,7 @@ fn build_fixed_route(proxy: &Proxy, runtime: &RuntimeConfig) -> Result<Route> {
             idle_timeout: runtime.reuse_idle_timeout,
             handshake_timeout: runtime.request_timeout,
             close_timeout: Duration::from_secs(2),
-            dialer,
+            dialer: dialer.into(),
             dial_limit: None,
             dial_limit_timeout: runtime.request_timeout,
         })?,

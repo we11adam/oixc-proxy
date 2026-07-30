@@ -6,6 +6,10 @@ rust-version = "1.85"
 description = "Named-node SOCKS5 gateway for OIX Cloud managed Snell ECH nodes"
 license = "MIT"
 
+[features]
+default = []
+benchmark = []
+
 [dependencies]
 age = { version = "0.12.1", features = ["armor"] }
 aes-gcm = "0.10.3"
@@ -47,3 +51,12 @@ strip = "symbols"
 
 [profile.dev]
 debug = 1
+
+[[example]]
+name = "snell-bench-server"
+path = "examples/snell_bench_server.rs"
+
+[[example]]
+name = "snell-bench-client"
+path = "examples/snell_bench_client.rs"
+required-features = ["benchmark"]

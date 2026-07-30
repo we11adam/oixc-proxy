@@ -75,7 +75,7 @@ impl Router {
                     idle_timeout: runtime.reuse_idle_timeout,
                     handshake_timeout: runtime.request_timeout,
                     close_timeout: Duration::from_secs(2),
-                    dialer,
+                    dialer: dialer.into(),
                     dial_limit: Some(dial_limit.clone()),
                     dial_limit_timeout: runtime.request_timeout.max(Duration::from_secs(45)),
                 })?;

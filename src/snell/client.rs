@@ -1,11 +1,13 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use tokio::io::{ReadHalf, WriteHalf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::timeout;
@@ -14,14 +16,161 @@ use tokio_rustls::client::TlsStream;
 use crate::transport::EchDialer;
 
 use super::{
-    RecordReader, RecordWriter, ZeroRecord, build_connect_request, build_identity_v2,
+    Exporter, RecordReader, RecordWriter, ZeroRecord, build_connect_request, build_identity_v2,
     build_udp_associate_request, decode_udp_response, encode_udp_request,
 };
 
 const INITIAL_FRAME_BUDGET: usize = 0x491;
 const MAX_RECORD_PAYLOAD_SIZE: usize = (1 << 14) - 1;
-type TlsReadHalf = ReadHalf<TlsStream<TcpStream>>;
-type TlsWriteHalf = WriteHalf<TlsStream<TcpStream>>;
+type TransportReadHalf = ReadHalf<ClientTransportStream>;
+type TransportWriteHalf = WriteHalf<ClientTransportStream>;
+
+#[derive(Clone)]
+pub struct SnellDialer {
+    inner: SnellDialerKind,
+}
+
+#[derive(Clone)]
+enum SnellDialerKind {
+    Ech(EchDialer),
+    #[cfg(feature = "benchmark")]
+    Direct {
+        address: SocketAddr,
+        exporter: Exporter,
+        timeout: Duration,
+    },
+}
+
+struct DialedTransport {
+    stream: ClientTransportStream,
+    exporter: Exporter,
+}
+
+// Keep the production TLS stream inline. Boxing it only to make the
+// benchmark-only TCP variant similarly sized would change the code being
+// measured and add an allocation to every real node connection.
+#[cfg_attr(feature = "benchmark", allow(clippy::large_enum_variant))]
+enum ClientTransportStream {
+    Ech(TlsStream<TcpStream>),
+    #[cfg(feature = "benchmark")]
+    Direct(TcpStream),
+}
+
+impl From<EchDialer> for SnellDialer {
+    fn from(value: EchDialer) -> Self {
+        Self {
+            inner: SnellDialerKind::Ech(value),
+        }
+    }
+}
+
+impl SnellDialer {
+    #[cfg(feature = "benchmark")]
+    pub fn direct_for_benchmark(
+        address: SocketAddr,
+        exporter: Exporter,
+        timeout: Duration,
+    ) -> Result<Self> {
+        if timeout.is_zero() || timeout > Duration::from_secs(120) {
+            bail!("benchmark transport timeout is invalid");
+        }
+        Ok(Self {
+            inner: SnellDialerKind::Direct {
+                address,
+                exporter,
+                timeout,
+            },
+        })
+    }
+
+    async fn dial(&self) -> Result<DialedTransport> {
+        match &self.inner {
+            SnellDialerKind::Ech(dialer) => {
+                let connection = dialer.dial().await?;
+                Ok(DialedTransport {
+                    stream: ClientTransportStream::Ech(connection.stream),
+                    exporter: connection.exporter,
+                })
+            }
+            #[cfg(feature = "benchmark")]
+            SnellDialerKind::Direct {
+                address,
+                exporter,
+                timeout: dial_timeout,
+            } => {
+                let stream = timeout(*dial_timeout, TcpStream::connect(*address))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("benchmark transport timed out"))?
+                    .context("connect benchmark transport")?;
+                stream.set_nodelay(true).ok();
+                Ok(DialedTransport {
+                    stream: ClientTransportStream::Direct(stream),
+                    exporter: *exporter,
+                })
+            }
+        }
+    }
+}
+
+impl ClientTransportStream {
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        match self {
+            Self::Ech(stream) => stream.get_ref().0.local_addr(),
+            #[cfg(feature = "benchmark")]
+            Self::Direct(stream) => stream.local_addr(),
+        }
+    }
+}
+
+impl AsyncRead for ClientTransportStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Ech(stream) => Pin::new(stream).poll_read(context, buffer),
+            #[cfg(feature = "benchmark")]
+            Self::Direct(stream) => Pin::new(stream).poll_read(context, buffer),
+        }
+    }
+}
+
+impl AsyncWrite for ClientTransportStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Ech(stream) => Pin::new(stream).poll_write(context, buffer),
+            #[cfg(feature = "benchmark")]
+            Self::Direct(stream) => Pin::new(stream).poll_write(context, buffer),
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Ech(stream) => Pin::new(stream).poll_flush(context),
+            #[cfg(feature = "benchmark")]
+            Self::Direct(stream) => Pin::new(stream).poll_flush(context),
+        }
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Ech(stream) => Pin::new(stream).poll_shutdown(context),
+            #[cfg(feature = "benchmark")]
+            Self::Direct(stream) => Pin::new(stream).poll_shutdown(context),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct SnellClient {
@@ -38,7 +187,7 @@ pub struct SnellClientOptions {
     pub idle_timeout: Duration,
     pub handshake_timeout: Duration,
     pub close_timeout: Duration,
-    pub dialer: EchDialer,
+    pub dialer: SnellDialer,
     pub dial_limit: Option<Arc<Semaphore>>,
     pub dial_limit_timeout: Duration,
 }
@@ -58,12 +207,12 @@ struct IdleConnection {
 #[derive(Clone)]
 struct PhysicalConnection {
     reader: Arc<Mutex<SnellReader>>,
-    writer: Arc<Mutex<RecordWriter<TlsWriteHalf>>>,
+    writer: Arc<Mutex<RecordWriter<TransportWriteHalf>>>,
     local_addr: SocketAddr,
 }
 
 struct SnellReader {
-    records: RecordReader<TlsReadHalf>,
+    records: RecordReader<TransportReadHalf>,
     buffered: VecDeque<u8>,
     server_eof: bool,
     reply_pending: bool,
@@ -184,8 +333,6 @@ impl SnellClient {
         let open_started = Instant::now();
         let local_addr = connection
             .stream
-            .get_ref()
-            .0
             .local_addr()
             .context("read Snell local address")?;
         let exporter = connection.exporter;
@@ -486,8 +633,8 @@ fn initial_padding_length(payload_length: usize) -> Result<usize> {
     Ok(u16::from_be_bytes(random) as usize % available + 1)
 }
 
-pub async fn write_application(
-    writer: &Arc<Mutex<RecordWriter<TlsWriteHalf>>>,
+async fn write_application(
+    writer: &Arc<Mutex<RecordWriter<TransportWriteHalf>>>,
     content: &[u8],
 ) -> Result<usize> {
     let mut written = 0;
