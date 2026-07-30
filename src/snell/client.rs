@@ -6,7 +6,7 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, ReadHalf, WriteHalf};
+use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadBuf, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::timeout;
@@ -20,8 +20,8 @@ use super::{
 };
 
 const INITIAL_FRAME_BUDGET: usize = 0x491;
-const MAX_RECORD_PAYLOAD_SIZE: usize = (1 << 14) - 1;
-type TransportReadHalf = ReadHalf<ClientTransportStream>;
+const READ_BUFFER_SIZE: usize = 32 << 10;
+type TransportReadHalf = BufReader<ReadHalf<ClientTransportStream>>;
 type TransportWriteHalf = WriteHalf<ClientTransportStream>;
 
 #[derive(Clone)]
@@ -380,7 +380,10 @@ impl SnellClient {
 
         let mut physical = PhysicalConnection {
             reader: SnellReader {
-                records: RecordReader::new(read_half, self.inner.options.psk.clone()),
+                records: RecordReader::new(
+                    BufReader::with_capacity(READ_BUFFER_SIZE, read_half),
+                    self.inner.options.psk.clone(),
+                ),
                 buffered: Vec::new(),
                 buffered_offset: 0,
                 server_eof: false,
@@ -663,11 +666,6 @@ async fn write_application(
     writer: &mut RecordWriter<TransportWriteHalf>,
     content: &[u8],
 ) -> Result<usize> {
-    let mut written = 0;
-    while written < content.len() {
-        let end = (written + MAX_RECORD_PAYLOAD_SIZE).min(content.len());
-        writer.write_frame(&content[written..end], 0).await?;
-        written = end;
-    }
-    Ok(written)
+    writer.write_payload(content).await?;
+    Ok(content.len())
 }

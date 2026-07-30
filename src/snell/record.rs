@@ -10,6 +10,7 @@ const RECORD_NONCE_SIZE: usize = 12;
 const RECORD_HEADER_PLAIN_SIZE: usize = 7;
 const RECORD_HEADER_CIPHER_SIZE: usize = RECORD_HEADER_PLAIN_SIZE + 16;
 const MAX_RECORD_PAYLOAD_SIZE: usize = (1 << 14) - 1;
+const WRITE_BATCH_LIMIT: usize = 128 << 10;
 
 #[derive(Debug, thiserror::Error)]
 #[error("Snell zero-length record")]
@@ -60,11 +61,11 @@ impl<W: AsyncWrite + Unpin> RecordWriter<W> {
 
     pub fn encode_frame(&mut self, payload: &[u8], padding_length: usize) -> Result<Vec<u8>> {
         let mut frame = Vec::new();
-        self.encode_frame_into(&mut frame, payload, padding_length)?;
+        self.encode_frame_append(&mut frame, payload, padding_length)?;
         Ok(frame)
     }
 
-    fn encode_frame_into(
+    fn encode_frame_append(
         &mut self,
         frame: &mut Vec<u8>,
         payload: &[u8],
@@ -77,7 +78,6 @@ impl<W: AsyncWrite + Unpin> RecordWriter<W> {
             bail!("zero-length Snell record cannot contain padding");
         }
 
-        frame.clear();
         frame.reserve(
             (!self.salt_sent as usize) * 16
                 + RECORD_HEADER_CIPHER_SIZE
@@ -132,7 +132,8 @@ impl<W: AsyncWrite + Unpin> RecordWriter<W> {
 
     pub async fn write_frame(&mut self, payload: &[u8], padding_length: usize) -> Result<()> {
         let mut frame = std::mem::take(&mut self.scratch);
-        let encoded = self.encode_frame_into(&mut frame, payload, padding_length);
+        frame.clear();
+        let encoded = self.encode_frame_append(&mut frame, payload, padding_length);
         let result = match encoded {
             Ok(()) => self
                 .writer
@@ -141,6 +142,34 @@ impl<W: AsyncWrite + Unpin> RecordWriter<W> {
                 .map_err(|error| anyhow::anyhow!("write Snell record: {error}")),
             Err(error) => Err(error),
         };
+        self.scratch = frame;
+        result
+    }
+
+    pub async fn write_payload(&mut self, content: &[u8]) -> Result<()> {
+        let mut frame = std::mem::take(&mut self.scratch);
+        frame.clear();
+        let mut result = Ok(());
+        for chunk in content.chunks(MAX_RECORD_PAYLOAD_SIZE) {
+            if let Err(error) = self.encode_frame_append(&mut frame, chunk, 0) {
+                result = Err(error);
+                break;
+            }
+            if frame.len() >= WRITE_BATCH_LIMIT {
+                if let Err(error) = self.writer.write_all(&frame).await {
+                    result = Err(anyhow::anyhow!("write Snell record: {error}"));
+                    break;
+                }
+                frame.clear();
+            }
+        }
+        if result.is_ok() && !frame.is_empty() {
+            result = self
+                .writer
+                .write_all(&frame)
+                .await
+                .map_err(|error| anyhow::anyhow!("write Snell record: {error}"));
+        }
         self.scratch = frame;
         result
     }
