@@ -12,7 +12,9 @@ use tokio::sync::Semaphore;
 
 use crate::api::Client as ApiClient;
 use crate::config::{RuntimeConfig, default_proxy_config_path, load_proxy_config, load_token_file};
-use crate::gateway::{GatewayManager, PROVIDER_PATH, Route, Router, derive_routing_secret};
+use crate::gateway::{
+    CLASH_PROVIDER_PATH, GatewayManager, PROVIDER_PATH, Route, Router, derive_routing_secret,
+};
 use crate::http_server;
 use crate::nodes::{ManagedConfig, Proxy};
 use crate::snell::{SnellClient, SnellClientOptions};
@@ -108,10 +110,12 @@ async fn run_serve(args: &[String]) -> Result<()> {
         .await
         .map_err(|_| anyhow::anyhow!("listen on local nodelist HTTP address"))?;
     println!(
-        "Proxy ready: SOCKS5 {}; nodelist http://{}{}; {} named nodes; refresh {}",
+        "Proxy ready: SOCKS5 {}; nodelist http://{}{}; clash http://{}{}; {} named nodes; refresh {}",
         service.socks5_listen,
         service.nodelist_listen,
         PROVIDER_PATH,
+        service.nodelist_listen,
+        CLASH_PROVIDER_PATH,
         managed.proxies.len(),
         format_duration(service.node_refresh_interval),
     );

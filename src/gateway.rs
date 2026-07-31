@@ -16,6 +16,7 @@ use crate::surge::{node_selector, render_provider};
 use crate::transport::EchDialer;
 
 pub const PROVIDER_PATH: &str = "/surge-proxies.conf";
+pub const CLASH_PROVIDER_PATH: &str = "/clash-proxies.yaml";
 pub const HEALTH_PATH: &str = "/healthz";
 const ROUTING_SECRET_CONTEXT: &[u8] = b"oixc-proxy/provider-routing/v1";
 
@@ -34,6 +35,7 @@ pub struct Router {
     routes: HashMap<String, Route>,
     runtimes: HashMap<String, Arc<NodeRuntime>>,
     provider: Arc<[u8]>,
+    clash_provider: Arc<[u8]>,
     routing_secret: String,
 }
 
@@ -51,6 +53,12 @@ impl Router {
         previous: Option<&Router>,
     ) -> Result<Self> {
         let provider = render_provider(
+            proxies,
+            &outbound_ip.to_string(),
+            runtime.serve_port,
+            routing_secret,
+        )?;
+        let clash_provider = crate::clash::render_provider(
             proxies,
             &outbound_ip.to_string(),
             runtime.serve_port,
@@ -100,12 +108,17 @@ impl Router {
             routes,
             runtimes,
             provider: provider.into(),
+            clash_provider: clash_provider.into(),
             routing_secret: routing_secret.to_owned(),
         })
     }
 
     pub fn provider(&self) -> Arc<[u8]> {
         self.provider.clone()
+    }
+
+    pub fn clash_provider(&self) -> Arc<[u8]> {
+        self.clash_provider.clone()
     }
 
     fn authenticate(&self, selector: &str, secret: &str) -> Result<Route> {
@@ -151,6 +164,15 @@ impl GatewayManager {
             .await
             .as_ref()
             .map(|router| router.provider())
+            .ok_or_else(|| anyhow::anyhow!("gateway unavailable"))
+    }
+
+    pub async fn clash_provider(&self) -> Result<Arc<[u8]>> {
+        self.router
+            .read()
+            .await
+            .as_ref()
+            .map(|router| router.clash_provider())
             .ok_or_else(|| anyhow::anyhow!("gateway unavailable"))
     }
 

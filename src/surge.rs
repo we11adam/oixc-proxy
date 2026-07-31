@@ -94,7 +94,7 @@ fn is_safe_credential(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
-fn sanitize_policy_name(name: &str) -> String {
+pub(crate) fn sanitize_policy_name(name: &str) -> String {
     let replaced = name
         .chars()
         .map(|character| {

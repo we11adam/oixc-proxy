@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
-use crate::gateway::{GatewayManager, HEALTH_PATH, PROVIDER_PATH};
+use crate::gateway::{CLASH_PROVIDER_PATH, GatewayManager, HEALTH_PATH, PROVIDER_PATH};
 
 pub async fn serve(listener: TcpListener, manager: Arc<GatewayManager>) -> Result<()> {
     loop {
@@ -61,7 +61,7 @@ async fn serve_connection(mut connection: TcpStream, manager: Arc<GatewayManager
                 write_response(&mut connection, 204, "No Content", &[], &[], true).await
             }
         }
-        PROVIDER_PATH => {
+        PROVIDER_PATH | CLASH_PROVIDER_PATH => {
             if method != "GET" && method != "HEAD" {
                 return write_response(
                     &mut connection,
@@ -73,14 +73,19 @@ async fn serve_connection(mut connection: TcpStream, manager: Arc<GatewayManager
                 )
                 .await;
             }
-            match manager.provider().await {
+            let (provider, content_type) = if path == CLASH_PROVIDER_PATH {
+                (manager.clash_provider().await, "text/yaml; charset=utf-8")
+            } else {
+                (manager.provider().await, "text/plain; charset=utf-8")
+            };
+            match provider {
                 Ok(provider) => {
                     write_response(
                         &mut connection,
                         200,
                         "OK",
                         &[
-                            ("Content-Type", "text/plain; charset=utf-8"),
+                            ("Content-Type", content_type),
                             ("Cache-Control", "no-store"),
                             ("X-Content-Type-Options", "nosniff"),
                         ],
