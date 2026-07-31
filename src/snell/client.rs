@@ -14,7 +14,7 @@ use tokio_rustls::client::TlsStream;
 
 use crate::transport::EchDialer;
 
-use super::record::RecordKind;
+use super::record::{RecordKind, ZeroRecord};
 use super::{
     Exporter, RecordReader, RecordWriter, build_connect_request, build_identity_v2,
     build_udp_associate_request, decode_udp_response, encode_udp_request,
@@ -240,8 +240,13 @@ pub struct SnellSessionWriter<'a> {
 
 pub struct SnellPacketSession {
     reader: Mutex<SnellReader>,
-    writer: Mutex<RecordWriter<TransportWriteHalf>>,
+    writer: Mutex<PacketWriter>,
     local_addr: SocketAddr,
+}
+
+struct PacketWriter {
+    records: RecordWriter<TransportWriteHalf>,
+    frame: Vec<u8>,
 }
 
 impl SnellClient {
@@ -316,7 +321,10 @@ impl SnellClient {
             .await?;
         Ok(SnellPacketSession {
             reader: Mutex::new(physical.reader),
-            writer: Mutex::new(physical.writer),
+            writer: Mutex::new(PacketWriter {
+                records: physical.writer,
+                frame: Vec::new(),
+            }),
             local_addr: physical.local_addr,
         })
     }
@@ -538,21 +546,28 @@ impl SnellPacketSession {
     }
 
     pub async fn write_to_host(&self, payload: &[u8], host: &str, port: u16) -> Result<usize> {
-        let frame = encode_udp_request(host, port, payload)?;
-        self.writer.lock().await.write_frame(&frame, 0).await?;
+        let mut writer = self.writer.lock().await;
+        let PacketWriter { records, frame } = &mut *writer;
+        encode_udp_request(frame, host, port, payload)?;
+        records.write_frame(frame, 0).await?;
         Ok(payload.len())
     }
 
-    pub async fn read_from(&self) -> Result<(SocketAddr, Vec<u8>)> {
-        let mut reader = self.reader.lock().await;
-        reader.ensure_reply().await?;
-        let frame = reader.read_frame().await?;
-        let (address, payload) = decode_udp_response(&frame)?;
-        Ok((address, payload.to_vec()))
+    /// Reads one datagram into `frame`, reusing its capacity. Returns the
+    /// source address and the offset where the payload starts in `frame`.
+    pub async fn read_from(&self, frame: &mut Vec<u8>) -> Result<(SocketAddr, usize)> {
+        {
+            let mut reader = self.reader.lock().await;
+            reader.ensure_reply().await?;
+            reader.read_packet_frame(frame).await?;
+        }
+        let (address, payload) = decode_udp_response(frame)?;
+        Ok((address, frame.len() - payload.len()))
     }
 
     pub async fn close(self) {
-        let _ = self.writer.into_inner().shutdown().await;
+        let mut writer = self.writer.into_inner();
+        let _ = writer.records.shutdown().await;
     }
 }
 
@@ -585,6 +600,13 @@ impl SnellReader {
 
     async fn read_frame(&mut self) -> Result<Vec<u8>> {
         self.records.read_frame().await
+    }
+
+    async fn read_packet_frame(&mut self, frame: &mut Vec<u8>) -> Result<()> {
+        match self.records.read_frame_into(frame).await? {
+            RecordKind::Payload => Ok(()),
+            RecordKind::Zero => Err(ZeroRecord.into()),
+        }
     }
 
     async fn fill_buffer(&mut self) -> Result<RecordKind> {

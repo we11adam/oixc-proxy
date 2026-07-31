@@ -51,6 +51,7 @@ struct Request {
 
 pub async fn serve_connection(mut client: TcpStream, options: Options) -> Result<()> {
     let session_started = Instant::now();
+    client.set_nodelay(true).ok();
     if options.handshake_timeout.is_zero() || options.handshake_timeout > Duration::from_secs(120) {
         bail!("SOCKS5 handshake timeout is invalid");
     }
@@ -394,12 +395,14 @@ async fn udp_upstream_loop(
     upstream: Arc<SnellPacketSession>,
     client_address: Arc<Mutex<Option<SocketAddr>>>,
 ) -> Result<()> {
+    let mut frame = Vec::new();
+    let mut encoded = Vec::new();
     loop {
-        let (source, payload) = upstream.read_from().await?;
+        let (source, payload_offset) = upstream.read_from(&mut frame).await?;
         let Some(destination) = *client_address.lock().await else {
             continue;
         };
-        let encoded = encode_datagram(source, &payload);
+        encode_datagram(&mut encoded, source, &frame[payload_offset..]);
         local.send_to(&encoded, destination).await?;
     }
 }
@@ -461,8 +464,9 @@ fn decode_datagram(packet: &[u8]) -> Result<(String, u16, &[u8])> {
     Ok((host, port, &packet[offset..]))
 }
 
-fn encode_datagram(address: SocketAddr, payload: &[u8]) -> Vec<u8> {
-    let mut result = vec![0, 0, 0];
+fn encode_datagram(result: &mut Vec<u8>, address: SocketAddr, payload: &[u8]) {
+    result.clear();
+    result.extend_from_slice(&[0, 0, 0]);
     match address.ip() {
         IpAddr::V4(ip) => {
             result.push(1);
@@ -475,7 +479,6 @@ fn encode_datagram(address: SocketAddr, payload: &[u8]) -> Vec<u8> {
     }
     result.extend_from_slice(&address.port().to_be_bytes());
     result.extend_from_slice(payload);
-    result
 }
 
 async fn write_reply(

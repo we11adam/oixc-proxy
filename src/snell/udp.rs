@@ -4,14 +4,20 @@ use anyhow::{Result, bail};
 
 const MAX_RECORD_PAYLOAD_SIZE: usize = (1 << 14) - 1;
 
-pub fn encode_udp_request(host: &str, port: u16, payload: &[u8]) -> Result<Vec<u8>> {
+pub fn encode_udp_request(
+    frame: &mut Vec<u8>,
+    host: &str,
+    port: u16,
+    payload: &[u8],
+) -> Result<()> {
     if host.is_empty() {
         bail!("Snell UDP target host cannot be empty");
     }
     if port == 0 {
         bail!("Snell UDP target port cannot be zero");
     }
-    let mut frame = Vec::with_capacity(5 + host.len() + payload.len());
+    frame.clear();
+    frame.reserve(5 + host.len() + payload.len());
     frame.push(1);
     match host.parse::<IpAddr>() {
         Ok(IpAddr::V4(ip)) => {
@@ -35,7 +41,7 @@ pub fn encode_udp_request(host: &str, port: u16, payload: &[u8]) -> Result<Vec<u
         bail!("Snell UDP datagram is too large");
     }
     frame.extend_from_slice(payload);
-    Ok(frame)
+    Ok(())
 }
 
 pub fn decode_udp_response(frame: &[u8]) -> Result<(SocketAddr, &[u8])> {
