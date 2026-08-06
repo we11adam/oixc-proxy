@@ -25,6 +25,7 @@ const USAGE: &str = "Usage:
   oixc-proxy information [--config PATH] --output PATH
   oixc-proxy serve [--config PATH]
   oixc-proxy serve-map [--token-file PATH] [--listen IP] [--base-port PORT]
+  oixc-proxy version
   oixc-proxy install-launch-agent [--config PATH]
   oixc-proxy install-systemd [--config PATH]
 
@@ -47,6 +48,7 @@ pub async fn run(args: Vec<String>) -> i32 {
         "serve-map" => run_serve_map(&args[1..]).await,
         "install-launch-agent" => run_install_launch_agent(&args[1..]),
         "install-systemd" => run_install_systemd(&args[1..]),
+        "version" | "-V" | "--version" => run_version(&args[1..]),
         "help" | "-h" | "--help" => {
             print!("{USAGE}");
             return 0;
@@ -67,6 +69,23 @@ pub async fn run(args: Vec<String>) -> i32 {
             1
         }
     }
+}
+
+fn run_version(args: &[String]) -> Result<()> {
+    if !args.is_empty() {
+        bail!("version takes no arguments");
+    }
+    println!("{}", version_string());
+    Ok(())
+}
+
+fn version_string() -> String {
+    format!(
+        "oixc-proxy {} (commit {}, built {})",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("OIXC_COMMIT_ID").unwrap_or("unknown"),
+        option_env!("OIXC_BUILD_TIME").unwrap_or("unknown")
+    )
 }
 
 async fn run_information(args: &[String]) -> Result<()> {
@@ -721,5 +740,20 @@ mod tests {
                 .to_string()
                 .contains("flag provided but not defined")
         );
+    }
+
+    #[test]
+    fn version_string_reports_build_metadata() {
+        let version = version_string();
+        assert!(version.starts_with("oixc-proxy "), "{version}");
+        assert!(version.contains("(commit "), "{version}");
+        assert!(version.contains(", built "), "{version}");
+        assert!(version.ends_with(")"), "{version}");
+    }
+
+    #[test]
+    fn version_rejects_arguments() {
+        let error = run_version(&["--help".to_owned()]).unwrap_err();
+        assert!(error.to_string().contains("takes no arguments"));
     }
 }

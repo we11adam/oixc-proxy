@@ -103,8 +103,10 @@ connection pools; changed, added and removed profiles are rotated atomically.
 
 ```text
 oixc-proxy information [--config PATH] --output PATH
+
 oixc-proxy serve [--config PATH]
 oixc-proxy serve-map [--token-file PATH] [--listen IP] [--base-port PORT]
+oixc-proxy version
 oixc-proxy install-launch-agent [--config PATH]
 oixc-proxy install-systemd [--config PATH]
 ```
@@ -120,6 +122,12 @@ serves `GET`/`HEAD` for `/surge-proxies.conf` and `/healthz`.
 node one loopback SOCKS5 port beginning at 7200 by default. Its default
 protected token file is `token.txt`. It does not provide the HTTP nodelist
 endpoint.
+
+`version` prints the package version, the git commit id the binary was built
+from (short hash, suffixed `-dirty` when the working tree had uncommitted
+changes) and the UTC build timestamp. The metadata is captured at compile time
+by `build.rs`; outside a git checkout the commit id is reported as
+`unknown`.
 
 The removed `serve-provider`, single-node `serve --index`, `dump-*`, `probe-*`,
 `seal-bundle`, `install-bundle` and `inspect-binary` commands remain removed.
