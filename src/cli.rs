@@ -23,14 +23,18 @@ use crate::transport::EchDialer;
 
 const USAGE: &str = "Usage:
   oixc-proxy information [--config PATH] --output PATH
-  oixc-proxy serve [--config PATH]
-  oixc-proxy serve-map [--token-file PATH] [--listen IP] [--base-port PORT]
+  oixc-proxy serve [--config PATH] [--disable-node-filter]
+  oixc-proxy serve-map [--token-file PATH] [--listen IP] [--base-port PORT] [--disable-node-filter]
   oixc-proxy version
   oixc-proxy install-launch-agent [--config PATH]
   oixc-proxy install-systemd [--config PATH]
 
 The information command is read-only. Its output file is created with mode
 0600 and must not already exist.
+
+--disable-node-filter publishes all managed nodes instead of only those
+whose names contain Fusion, CIA, or IXP markers. Use this when your
+account does not include any Fusion/CIA/IXP nodes.
 ";
 
 #[derive(Debug, thiserror::Error)]
@@ -107,10 +111,11 @@ async fn run_information(args: &[String]) -> Result<()> {
 
 async fn run_serve(args: &[String]) -> Result<()> {
     let default = default_proxy_config_path()?;
-    let flags = parse_flags(args, &[("config", true)])?;
+    let flags = parse_flags(args, &[("config", true), ("disable-node-filter", false)])?;
     let config_path = flag_path(&flags, "config", &default);
+    let disable_node_filter = flags.contains_key("disable-node-filter");
     let service = load_proxy_config(&config_path)?;
-    let mut managed = load_managed_nodes(&service.runtime).await?;
+    let mut managed = load_managed_nodes(&service.runtime, disable_node_filter).await?;
     let routing_secret = derive_routing_secret(&service.runtime.access_token)?;
     let dial_limit = Arc::new(Semaphore::new(32));
     let router = Router::build(
@@ -161,7 +166,7 @@ async fn run_serve(args: &[String]) -> Result<()> {
                 return result.context("nodelist HTTP task failed")?;
             }
             _ = refresh.tick() => {
-                let refreshed = match load_managed_nodes(&service.runtime).await {
+                let refreshed = match load_managed_nodes(&service.runtime, disable_node_filter).await {
                     Ok(value) => value,
                     Err(error) => {
                         eprintln!("node catalog refresh failed: {error:#}");
@@ -200,8 +205,14 @@ async fn run_serve(args: &[String]) -> Result<()> {
 async fn run_serve_map(args: &[String]) -> Result<()> {
     let flags = parse_flags(
         args,
-        &[("token-file", true), ("listen", true), ("base-port", true)],
+        &[
+            ("token-file", true),
+            ("listen", true),
+            ("base-port", true),
+            ("disable-node-filter", false),
+        ],
     )?;
+    let disable_node_filter = flags.contains_key("disable-node-filter");
     let token_file = flags
         .get("token-file")
         .and_then(|value| value.as_ref())
@@ -233,7 +244,7 @@ async fn run_serve_map(args: &[String]) -> Result<()> {
     } else {
         requested_base_port
     };
-    let managed = load_managed_nodes(&runtime).await?;
+    let managed = load_managed_nodes(&runtime, disable_node_filter).await?;
     if base_port as usize + managed.proxies.len() - 1 > u16::MAX as usize {
         bail!("SOCKS5 map port range exceeds 65535");
     }
@@ -333,10 +344,18 @@ fn build_fixed_route(proxy: &Proxy, runtime: &RuntimeConfig) -> Result<Route> {
     })
 }
 
-async fn load_managed_nodes(runtime: &RuntimeConfig) -> Result<ManagedConfig> {
+async fn load_managed_nodes(
+    runtime: &RuntimeConfig,
+    disable_filter: bool,
+) -> Result<ManagedConfig> {
     let client = api_client(runtime)?;
     let plaintext = client.dump_managed_config().await?;
-    ManagedConfig::parse(&plaintext)?.filter_allowed_nodes()
+    let managed = ManagedConfig::parse(&plaintext)?;
+    if disable_filter {
+        Ok(managed)
+    } else {
+        managed.filter_allowed_nodes()
+    }
 }
 
 fn api_client(runtime: &RuntimeConfig) -> Result<ApiClient> {
