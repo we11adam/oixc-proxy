@@ -241,10 +241,12 @@ curl -x socks5://USERNAME:PASSWORD@127.0.0.1:6172 https://ip.sb
 # 1. 重新构建
 cargo build --release
 
-# 2. 覆盖已安装的二进制（/usr/local/bin 不可写时需要 sudo）
-cp target/release/oixc-proxy /usr/local/bin/oixc-proxy
+# 2. 原子替换已安装的二进制。不要原地 cp 覆写：macOS 内核会缓存代码签名，
+#    被覆写的可执行文件下次启动会被杀（Killed: 9 / OS_REASON_CODESIGNING）
+cp target/release/oixc-proxy /usr/local/bin/oixc-proxy.new
+mv /usr/local/bin/oixc-proxy.new /usr/local/bin/oixc-proxy
 # 若提示权限不足：
-# sudo cp target/release/oixc-proxy /usr/local/bin/oixc-proxy
+# sudo mv /usr/local/bin/oixc-proxy.new /usr/local/bin/oixc-proxy
 
 # 3. 重启服务（kill 并立即重启，KeepAlive 也会兜底）
 launchctl kickstart -k "gui/$(id -u)/io.oixc.proxy"
@@ -278,6 +280,7 @@ rm -f ~/Library/Logs/oixc-proxy.stdout.log ~/Library/Logs/oixc-proxy.stderr.log
 | `do not run install-launch-agent with sudo` | 用 sudo 整体运行了安装器 | 以登录用户身份运行；sudo 只会在复制二进制时按需请求 |
 | 安装报 `service definition already exists` | plist 已存在（服务已装过） | 先 `launchctl bootout "gui/$(id -u)/io.oixc.proxy"`，`rm ~/Library/LaunchAgents/io.oixc.proxy.plist`，再重跑安装器 |
 | `launchctl bootstrap failed: 5: Input/output error` | 服务已在运行，重复注册 | 用 `launchctl kickstart -k "gui/$(id -u)/io.oixc.proxy"` 重启即可 |
+| 更新后启动报 `Killed: 9`（日志含 `OS_REASON_CODESIGNING`） | 用 `cp` 原地覆写了正在运行的签名可执行文件，内核代码签名缓存失效 | 用「临时文件 + `mv`」原子替换二进制（见“更新”一节），再 `launchctl kickstart -k` |
 | 启动报 `permissions` 错误 | 配置文件权限过宽 | `chmod 600 ~/.config/oixc-proxy/oixc-proxy.conf` |
 | 启动报 `outbound-ip is required` | listen 为 `0.0.0.0` 但未设 outbound-ip | 在配置中添加 `outbound-ip=<本机局域网 IP>` |
 | 启动报 TLS / certificate 错误 | 系统时间不正确 | 系统设置 → 通用 → 日期与时间，打开“自动设置时间与日期” |
