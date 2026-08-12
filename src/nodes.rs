@@ -106,7 +106,7 @@ fn is_allowed_node_name(name: &str) -> bool {
         return true;
     }
     name.split(|character: char| !character.is_alphanumeric())
-        .any(|token| token.eq_ignore_ascii_case("cia") || token.eq_ignore_ascii_case("ixp"))
+        .any(|token| token.eq_ignore_ascii_case("cia"))
 }
 
 impl Proxy {
@@ -194,11 +194,7 @@ proxies:
                 .iter()
                 .map(|proxy| proxy.name.as_str())
                 .collect::<Vec<_>>(),
-            [
-                "Hong Kong Fusion 01",
-                "United States cia 01",
-                "Japan IxP 01"
-            ]
+            ["Hong Kong Fusion 01", "United States cia 01"]
         );
     }
 
