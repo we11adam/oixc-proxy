@@ -110,8 +110,8 @@ target/release/oixc-proxy information --output ~/oixc-info.json
 | 端点 | 地址 | 用途 |
 | --- | --- | --- |
 | SOCKS5 | `127.0.0.1:6172` | 用 provider 凭据路由到指定命名节点 |
-| Surge provider | `http://127.0.0.1:6173/surge-proxies.conf` | Surge external-policy list |
-| Clash provider | `http://127.0.0.1:6173/clash-proxies.yaml` | Clash proxy-provider |
+| Surge provider | `http://127.0.0.1:6173/surge-proxies.conf` | Surge external-policy list（`?all=1` 放出全部节点） |
+| Clash provider | `http://127.0.0.1:6173/clash-proxies.yaml` | Clash proxy-provider（`?all=1` 放出全部节点） |
 | 健康检查 | `http://127.0.0.1:6173/healthz` | 就绪探针（204） |
 
 ### 客户端接入

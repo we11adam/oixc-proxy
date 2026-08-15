@@ -32,7 +32,8 @@ async fn serve_connection(mut connection: TcpStream, manager: Arc<GatewayManager
     let first_line = String::from_utf8_lossy(first_line);
     let mut fields = first_line.trim_end_matches('\r').split_whitespace();
     let method = fields.next().unwrap_or("");
-    let path = fields.next().unwrap_or("");
+    let target = fields.next().unwrap_or("");
+    let (path, query) = split_target(target);
     if fields.next().is_none() {
         return write_response(
             &mut connection,
@@ -73,10 +74,17 @@ async fn serve_connection(mut connection: TcpStream, manager: Arc<GatewayManager
                 )
                 .await;
             }
+            let include_all = wants_all_nodes(query);
             let (provider, content_type) = if path == CLASH_PROVIDER_PATH {
-                (manager.clash_provider().await, "text/yaml; charset=utf-8")
+                (
+                    manager.clash_provider(include_all).await,
+                    "text/yaml; charset=utf-8",
+                )
             } else {
-                (manager.provider().await, "text/plain; charset=utf-8")
+                (
+                    manager.provider(include_all).await,
+                    "text/plain; charset=utf-8",
+                )
             };
             match provider {
                 Ok(provider) => {
@@ -119,6 +127,21 @@ async fn serve_connection(mut connection: TcpStream, manager: Arc<GatewayManager
             .await
         }
     }
+}
+
+fn split_target(target: &str) -> (&str, &str) {
+    target.split_once('?').unwrap_or((target, ""))
+}
+
+fn wants_all_nodes(query: &str) -> bool {
+    query
+        .split('&')
+        .filter_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            (key == "all").then_some(value)
+        })
+        .next_back()
+        == Some("1")
 }
 
 async fn read_headers(connection: &mut TcpStream) -> Result<Vec<u8>> {
@@ -164,4 +187,42 @@ async fn write_response(
     }
     connection.shutdown().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_path_from_query() {
+        assert_eq!(
+            split_target("/surge-proxies.conf"),
+            ("/surge-proxies.conf", "")
+        );
+        assert_eq!(
+            split_target("/surge-proxies.conf?all=1"),
+            ("/surge-proxies.conf", "all=1")
+        );
+        assert_eq!(
+            split_target("/clash-proxies.yaml?all=1&x=2"),
+            ("/clash-proxies.yaml", "all=1&x=2")
+        );
+    }
+
+    #[test]
+    fn all_query_accepts_only_all_equals_one() {
+        assert!(!wants_all_nodes(""));
+        assert!(wants_all_nodes("all=1"));
+        assert!(wants_all_nodes("foo=bar&all=1"));
+        assert!(wants_all_nodes("all=1&foo=bar"));
+        assert!(wants_all_nodes("all=0&all=1"));
+        assert!(!wants_all_nodes("all=1&all=0"));
+        assert!(!wants_all_nodes("all=0"));
+        assert!(!wants_all_nodes("all=true"));
+        assert!(!wants_all_nodes("all="));
+        assert!(!wants_all_nodes("all"));
+        assert!(!wants_all_nodes("ALL=1"));
+        assert!(!wants_all_nodes("ball=1"));
+        assert!(!wants_all_nodes("all=11"));
+    }
 }

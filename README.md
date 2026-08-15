@@ -46,7 +46,8 @@ The default endpoints are:
 | Endpoint | Address | Purpose |
 | --- | --- | --- |
 | SOCKS5 | `127.0.0.1:6172` | Routes provider credentials to one named node |
-| Nodelist | `http://127.0.0.1:6173/surge-proxies.conf` | Surge external-policy list |
+| Nodelist | `http://127.0.0.1:6173/surge-proxies.conf` | Surge external-policy list (`?all=1` publishes every node) |
+| Clash | `http://127.0.0.1:6173/clash-proxies.yaml` | Clash proxy-provider (`?all=1` publishes every node) |
 | Health | `http://127.0.0.1:6173/healthz` | Readiness probe |
 
 Example Surge group:
@@ -62,9 +63,12 @@ stable HMAC-derived routing secret. The access token, node address, PSK and ECH
 configuration are never returned by the HTTP endpoint.
 
 Only names containing `Fusion` or standalone `CIA`/`IXP` tokens,
-case-insensitively, are published. Treating the acronyms as tokens avoids
-admitting ordinary names such as `Special`. An empty filtered catalog is
-rejected so a control-plane naming change cannot expose ordinary nodes.
+case-insensitively, are published by default. Treating the acronyms as tokens
+avoids admitting ordinary names such as `Special`. An empty filtered catalog
+is rejected so a control-plane naming change cannot expose ordinary nodes.
+`GET` `/surge-proxies.conf?all=1` and `/clash-proxies.yaml?all=1` publish the
+full catalog; those extra nodes are still routed through the same SOCKS5
+listener.
 
 ## Service configuration
 
@@ -116,7 +120,8 @@ file with mode `0600`. It refuses to replace an existing file.
 
 `serve` is the normal named-node gateway. SOCKS username/password pairs from
 the generated provider select different managed nodes on one port. It also
-serves `GET`/`HEAD` for `/surge-proxies.conf` and `/healthz`.
+serves `GET`/`HEAD` for `/surge-proxies.conf`, `/clash-proxies.yaml` and
+`/healthz`. Append `?all=1` to either provider URL to list every node.
 
 `serve-map` fetches the same Fusion/CIA/IXP catalog itself, then gives each
 node one loopback SOCKS5 port beginning at 7200 by default. Its default

@@ -72,12 +72,16 @@ impl ManagedConfig {
         Ok(config)
     }
 
-    pub fn filter_allowed_nodes(self) -> Result<Self> {
-        let proxies = self
-            .proxies
-            .into_iter()
+    pub fn allowed_proxies(&self) -> Vec<Proxy> {
+        self.proxies
+            .iter()
             .filter(|proxy| is_allowed_node_name(&proxy.name))
-            .collect::<Vec<_>>();
+            .cloned()
+            .collect()
+    }
+
+    pub fn filter_allowed_nodes(self) -> Result<Self> {
+        let proxies = self.allowed_proxies();
         if proxies.is_empty() {
             bail!("managed config contains no allowed Fusion/CIA/IXP proxies");
         }
@@ -186,6 +190,16 @@ proxies:
             proxy
         })
         .collect();
+
+        let allowed = managed.allowed_proxies();
+        assert_eq!(
+            allowed
+                .iter()
+                .map(|proxy| proxy.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Hong Kong Fusion 01", "United States cia 01"]
+        );
+        assert_eq!(managed.proxies.len(), 6);
 
         let filtered = managed.filter_allowed_nodes().unwrap();
         assert_eq!(

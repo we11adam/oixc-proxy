@@ -36,6 +36,8 @@ pub struct Router {
     runtimes: HashMap<String, Arc<NodeRuntime>>,
     provider: Arc<[u8]>,
     clash_provider: Arc<[u8]>,
+    all_provider: Arc<[u8]>,
+    all_clash_provider: Arc<[u8]>,
     routing_secret: String,
 }
 
@@ -46,24 +48,39 @@ pub struct GatewayManager {
 impl Router {
     pub fn build(
         proxies: &[Proxy],
+        published: &[Proxy],
         runtime: &RuntimeConfig,
         outbound_ip: IpAddr,
         routing_secret: &str,
         dial_limit: Arc<Semaphore>,
         previous: Option<&Router>,
     ) -> Result<Self> {
+        let listen_address = outbound_ip.to_string();
         let provider = render_provider(
-            proxies,
-            &outbound_ip.to_string(),
+            published,
+            &listen_address,
             runtime.serve_port,
             routing_secret,
         )?;
         let clash_provider = crate::clash::render_provider(
-            proxies,
-            &outbound_ip.to_string(),
+            published,
+            &listen_address,
             runtime.serve_port,
             routing_secret,
         )?;
+        let (all_provider, all_clash_provider) = if same_proxy_list(proxies, published) {
+            (provider.clone(), clash_provider.clone())
+        } else {
+            (
+                render_provider(proxies, &listen_address, runtime.serve_port, routing_secret)?,
+                crate::clash::render_provider(
+                    proxies,
+                    &listen_address,
+                    runtime.serve_port,
+                    routing_secret,
+                )?,
+            )
+        };
         let mut routes = HashMap::with_capacity(proxies.len());
         let mut runtimes = HashMap::with_capacity(proxies.len());
         for proxy in proxies {
@@ -109,16 +126,26 @@ impl Router {
             runtimes,
             provider: provider.into(),
             clash_provider: clash_provider.into(),
+            all_provider: all_provider.into(),
+            all_clash_provider: all_clash_provider.into(),
             routing_secret: routing_secret.to_owned(),
         })
     }
 
-    pub fn provider(&self) -> Arc<[u8]> {
-        self.provider.clone()
+    pub fn provider(&self, include_all: bool) -> Arc<[u8]> {
+        if include_all {
+            self.all_provider.clone()
+        } else {
+            self.provider.clone()
+        }
     }
 
-    pub fn clash_provider(&self) -> Arc<[u8]> {
-        self.clash_provider.clone()
+    pub fn clash_provider(&self, include_all: bool) -> Arc<[u8]> {
+        if include_all {
+            self.all_clash_provider.clone()
+        } else {
+            self.clash_provider.clone()
+        }
     }
 
     fn authenticate(&self, selector: &str, secret: &str) -> Result<Route> {
@@ -158,21 +185,21 @@ impl GatewayManager {
             .authenticate(selector, secret)
     }
 
-    pub async fn provider(&self) -> Result<Arc<[u8]>> {
+    pub async fn provider(&self, include_all: bool) -> Result<Arc<[u8]>> {
         self.router
             .read()
             .await
             .as_ref()
-            .map(|router| router.provider())
+            .map(|router| router.provider(include_all))
             .ok_or_else(|| anyhow::anyhow!("gateway unavailable"))
     }
 
-    pub async fn clash_provider(&self) -> Result<Arc<[u8]>> {
+    pub async fn clash_provider(&self, include_all: bool) -> Result<Arc<[u8]>> {
         self.router
             .read()
             .await
             .as_ref()
-            .map(|router| router.clash_provider())
+            .map(|router| router.clash_provider(include_all))
             .ok_or_else(|| anyhow::anyhow!("gateway unavailable"))
     }
 
@@ -214,6 +241,10 @@ pub fn derive_routing_secret(key_material: &str) -> Result<String> {
         .expect("HMAC accepts every key length");
     mac.update(ROUTING_SECRET_CONTEXT);
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
+}
+
+fn same_proxy_list(left: &[Proxy], right: &[Proxy]) -> bool {
+    std::ptr::eq(left, right) || left == right
 }
 
 fn constant_time_equal(first: &[u8], second: &[u8]) -> bool {

@@ -20,7 +20,7 @@ async fn socks5_udp_associate_resolves_dns() {
         .text()
         .await
         .unwrap();
-    let first = provider.lines().nth(1).expect("provider contains a node");
+    let first = provider.lines().next().expect("provider contains a node");
     let fields = first.split(", ").collect::<Vec<_>>();
     let username = fields[3].as_bytes();
     let password = fields[4].as_bytes();

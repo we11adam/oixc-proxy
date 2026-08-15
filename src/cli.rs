@@ -35,6 +35,9 @@ The information command is read-only. Its output file is created with mode
 --disable-node-filter publishes all managed nodes instead of only those
 whose names contain Fusion, CIA, or IXP markers. Use this when your
 account does not include any Fusion/CIA/IXP nodes.
+
+GET /surge-proxies.conf?all=1 and /clash-proxies.yaml?all=1 publish the
+full catalog without changing the default filtered listing.
 ";
 
 #[derive(Debug, thiserror::Error)]
@@ -115,11 +118,13 @@ async fn run_serve(args: &[String]) -> Result<()> {
     let config_path = flag_path(&flags, "config", &default);
     let disable_node_filter = flags.contains_key("disable-node-filter");
     let service = load_proxy_config(&config_path)?;
-    let mut managed = load_managed_nodes(&service.runtime, disable_node_filter).await?;
+    let mut managed = load_managed_nodes(&service.runtime, true).await?;
+    let published = published_proxies(&managed, disable_node_filter)?;
     let routing_secret = derive_routing_secret(&service.runtime.access_token)?;
     let dial_limit = Arc::new(Semaphore::new(32));
     let router = Router::build(
         &managed.proxies,
+        &published,
         &service.runtime,
         service.outbound_ip,
         &routing_secret,
@@ -134,13 +139,13 @@ async fn run_serve(args: &[String]) -> Result<()> {
         .await
         .map_err(|_| anyhow::anyhow!("listen on local nodelist HTTP address"))?;
     println!(
-        "Proxy ready: SOCKS5 {}; nodelist http://{}{}; clash http://{}{}; {} named nodes; refresh {}",
+        "Proxy ready: SOCKS5 {}; nodelist http://{}{}; clash http://{}{}; {}; refresh {}",
         service.socks5_listen,
         service.nodelist_listen,
         PROVIDER_PATH,
         service.nodelist_listen,
         CLASH_PROVIDER_PATH,
-        managed.proxies.len(),
+        format_node_count(published.len(), managed.proxies.len()),
         format_duration(service.node_refresh_interval),
     );
 
@@ -166,7 +171,7 @@ async fn run_serve(args: &[String]) -> Result<()> {
                 return result.context("nodelist HTTP task failed")?;
             }
             _ = refresh.tick() => {
-                let refreshed = match load_managed_nodes(&service.runtime, disable_node_filter).await {
+                let refreshed = match load_managed_nodes(&service.runtime, true).await {
                     Ok(value) => value,
                     Err(error) => {
                         eprintln!("node catalog refresh failed: {error:#}");
@@ -176,9 +181,17 @@ async fn run_serve(args: &[String]) -> Result<()> {
                 if refreshed.proxies == managed.proxies {
                     continue;
                 }
+                let published = match published_proxies(&refreshed, disable_node_filter) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        eprintln!("node catalog refresh failed: {error:#}");
+                        continue;
+                    }
+                };
                 let previous = manager.current().await?;
                 let replacement = match Router::build(
                     &refreshed.proxies,
+                    &published,
                     &service.runtime,
                     service.outbound_ip,
                     &routing_secret,
@@ -195,8 +208,13 @@ async fn run_serve(args: &[String]) -> Result<()> {
                     eprintln!("retire previous node catalog: {error:#}");
                     continue;
                 }
+                let published_count = published.len();
+                let total_count = refreshed.proxies.len();
                 managed = refreshed;
-                println!("Refreshed node catalog ({} named nodes)", managed.proxies.len());
+                println!(
+                    "Refreshed node catalog ({})",
+                    format_node_count(published_count, total_count)
+                );
             }
         }
     }
@@ -342,6 +360,25 @@ fn build_fixed_route(proxy: &Proxy, runtime: &RuntimeConfig) -> Result<Route> {
         })?,
         udp: proxy.udp,
     })
+}
+
+fn published_proxies(managed: &ManagedConfig, include_all: bool) -> Result<Vec<Proxy>> {
+    if include_all {
+        return Ok(managed.proxies.clone());
+    }
+    let proxies = managed.allowed_proxies();
+    if proxies.is_empty() {
+        bail!("managed config contains no allowed Fusion/CIA/IXP proxies");
+    }
+    Ok(proxies)
+}
+
+fn format_node_count(published: usize, total: usize) -> String {
+    if published == total {
+        format!("{published} named nodes")
+    } else {
+        format!("{published} named nodes ({total} total)")
+    }
 }
 
 async fn load_managed_nodes(
@@ -774,5 +811,11 @@ mod tests {
     fn version_rejects_arguments() {
         let error = run_version(&["--help".to_owned()]).unwrap_err();
         assert!(error.to_string().contains("takes no arguments"));
+    }
+
+    #[test]
+    fn format_node_count_mentions_total_when_filtered() {
+        assert_eq!(format_node_count(12, 12), "12 named nodes");
+        assert_eq!(format_node_count(12, 40), "12 named nodes (40 total)");
     }
 }
