@@ -6,6 +6,7 @@ pub mod gateway;
 pub mod http_server;
 pub mod nodes;
 pub mod perftrace;
+pub mod rlimit;
 pub mod snell;
 pub mod socks5;
 pub mod surge;

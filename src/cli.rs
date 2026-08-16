@@ -17,6 +17,7 @@ use crate::gateway::{
 };
 use crate::http_server;
 use crate::nodes::{ManagedConfig, Proxy};
+use crate::rlimit;
 use crate::snell::{SnellClient, SnellClientOptions};
 use crate::socks5::{self, Credentials, Mode};
 use crate::transport::EchDialer;
@@ -113,6 +114,7 @@ async fn run_information(args: &[String]) -> Result<()> {
 }
 
 async fn run_serve(args: &[String]) -> Result<()> {
+    rlimit::raise_nofile_limit();
     let default = default_proxy_config_path()?;
     let flags = parse_flags(args, &[("config", true), ("disable-node-filter", false)])?;
     let config_path = flag_path(&flags, "config", &default);
@@ -221,6 +223,7 @@ async fn run_serve(args: &[String]) -> Result<()> {
 }
 
 async fn run_serve_map(args: &[String]) -> Result<()> {
+    rlimit::raise_nofile_limit();
     let flags = parse_flags(
         args,
         &[
@@ -698,7 +701,7 @@ WorkingDirectory={}
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=10s
-LimitNOFILE=65536
+LimitNOFILE=infinity
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
