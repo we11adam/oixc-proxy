@@ -50,7 +50,7 @@ fn raise_nofile_limit_unix() -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn clamp_to_hard(wanted: rlim_t, hard: rlim_t) -> rlim_t {
     if hard == RLIM_INFINITY || wanted <= hard {
         wanted
@@ -59,7 +59,7 @@ fn clamp_to_hard(wanted: rlim_t, hard: rlim_t) -> rlim_t {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn preferred_hard(soft: rlim_t, hard: rlim_t) -> rlim_t {
     if hard == RLIM_INFINITY { soft } else { hard }
 }
