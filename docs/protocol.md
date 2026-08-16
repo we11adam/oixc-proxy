@@ -115,7 +115,7 @@ the token, remote address, PSK or ECH bytes.
 Each Surge line is:
 
 ```text
-NAME = socks5, OUTBOUND_IP, PORT, SELECTOR, ROUTING_SECRET, test-timeout=45
+NAME = socks5, OUTBOUND_IP, PORT, SELECTOR, ROUTING_SECRET
 ```
 
 UDP-capable entries append:

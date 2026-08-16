@@ -59,12 +59,12 @@ pub fn render_provider(
         match protocol {
             ProviderProtocol::Http => write!(
                 output,
-                "{policy_name} = http, {listen_address}, {port}, {selector}, {routing_secret}, test-timeout=45"
+                "{policy_name} = http, {listen_address}, {port}, {selector}, {routing_secret}"
             )?,
             ProviderProtocol::Socks5 => {
                 write!(
                     output,
-                    "{policy_name} = socks5, {listen_address}, {port}, {selector}, {routing_secret}, test-timeout=45"
+                    "{policy_name} = socks5, {listen_address}, {port}, {selector}, {routing_secret}"
                 )?;
                 if proxy.udp {
                     output.push_str(", udp-relay=true, test-udp=example.com@1.1.1.1");
@@ -184,6 +184,7 @@ mod tests {
         assert!(http.contains(" = http, 127.0.0.1, 6178, "));
         assert!(!http.contains("socks5"));
         assert!(!http.contains("udp-relay"));
+        assert!(!http.contains("test-timeout"));
 
         let socks = String::from_utf8(
             render_provider(
@@ -198,5 +199,6 @@ mod tests {
         .unwrap();
         assert!(socks.contains(" = socks5, 127.0.0.1, 6178, "));
         assert!(socks.contains("udp-relay=true"));
+        assert!(!socks.contains("test-timeout"));
     }
 }
