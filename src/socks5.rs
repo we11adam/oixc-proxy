@@ -50,15 +50,58 @@ struct Request {
 }
 
 pub async fn serve_connection(mut client: TcpStream, options: Options) -> Result<()> {
-    let session_started = Instant::now();
     client.set_nodelay(true).ok();
     if options.handshake_timeout.is_zero() || options.handshake_timeout > Duration::from_secs(120) {
-        bail!("SOCKS5 handshake timeout is invalid");
+        bail!("inbound handshake timeout is invalid");
     }
+    let mut first = [0u8; 1];
+    timeout(options.handshake_timeout, client.read_exact(&mut first))
+        .await
+        .map_err(|_| anyhow::anyhow!("inbound handshake timed out"))?
+        .map_err(|error| anyhow::anyhow!("read inbound greeting: {error}"))?;
+    if first[0] == VERSION {
+        serve_socks5(client, options, first[0]).await
+    } else if first[0].is_ascii_alphabetic() {
+        crate::http_proxy::serve(client, options, first[0]).await
+    } else {
+        bail!("unrecognized inbound protocol");
+    }
+}
+
+pub(crate) fn requires_auth(mode: &Mode) -> bool {
+    match mode {
+        Mode::Dynamic(_) => true,
+        Mode::Fixed { credentials, .. } => credentials.is_some(),
+    }
+}
+
+pub(crate) async fn authenticate(mode: &Mode, username: &str, password: &str) -> Result<Route> {
+    match mode {
+        Mode::Dynamic(manager) => manager.authenticate(username, password).await,
+        Mode::Fixed {
+            route,
+            credentials: Some(expected),
+        } => {
+            if !constant_time_equal(username.as_bytes(), expected.username.as_bytes())
+                || !constant_time_equal(password.as_bytes(), expected.password.as_bytes())
+            {
+                bail!("gateway authentication failed");
+            }
+            Ok(route.clone())
+        }
+        Mode::Fixed {
+            route,
+            credentials: None,
+        } => Ok(route.clone()),
+    }
+}
+
+async fn serve_socks5(mut client: TcpStream, options: Options, version: u8) -> Result<()> {
+    let session_started = Instant::now();
     let handshake_started = Instant::now();
     let route_result = timeout(
         options.handshake_timeout,
-        negotiate_and_read_request(&mut client, &options.mode),
+        negotiate_and_read_request(&mut client, &options.mode, version),
     )
     .await;
     let route = match route_result {
@@ -97,24 +140,24 @@ pub async fn serve_connection(mut client: TcpStream, options: Options) -> Result
 async fn negotiate_and_read_request(
     client: &mut TcpStream,
     mode: &Mode,
+    version: u8,
 ) -> Result<(Route, Request)> {
-    let mut greeting = [0u8; 2];
-    client
-        .read_exact(&mut greeting)
-        .await
-        .map_err(|error| anyhow::anyhow!("read SOCKS5 greeting: {error}"))?;
-    if greeting[0] != VERSION || greeting[1] == 0 {
+    if version != VERSION {
         bail!("SOCKS5 greeting is invalid");
     }
-    let mut methods = vec![0u8; greeting[1] as usize];
+    let method_count = client
+        .read_u8()
+        .await
+        .map_err(|error| anyhow::anyhow!("read SOCKS5 greeting: {error}"))?;
+    if method_count == 0 {
+        bail!("SOCKS5 greeting is invalid");
+    }
+    let mut methods = vec![0u8; method_count as usize];
     client
         .read_exact(&mut methods)
         .await
         .map_err(|error| anyhow::anyhow!("read SOCKS5 methods: {error}"))?;
-    let requires_auth = match mode {
-        Mode::Dynamic(_) => true,
-        Mode::Fixed { credentials, .. } => credentials.is_some(),
-    };
+    let requires_auth = requires_auth(mode);
     let selected = if requires_auth {
         METHOD_USERNAME_PASSWORD
     } else {
@@ -127,27 +170,12 @@ async fn negotiate_and_read_request(
     client.write_all(&[VERSION, selected]).await?;
     let route = if requires_auth {
         let (username, password) = read_credentials(client).await?;
-        match mode {
-            Mode::Dynamic(manager) => match manager.authenticate(&username, &password).await {
-                Ok(route) => route,
-                Err(_) => {
-                    client.write_all(&[1, 1]).await?;
-                    bail!("SOCKS5 authentication failed");
-                }
-            },
-            Mode::Fixed {
-                route,
-                credentials: Some(expected),
-            } => {
-                if !constant_time_equal(username.as_bytes(), expected.username.as_bytes())
-                    || !constant_time_equal(password.as_bytes(), expected.password.as_bytes())
-                {
-                    client.write_all(&[1, 1]).await?;
-                    bail!("SOCKS5 authentication failed");
-                }
-                route.clone()
+        match authenticate(mode, &username, &password).await {
+            Ok(route) => route,
+            Err(_) => {
+                client.write_all(&[1, 1]).await?;
+                bail!("SOCKS5 authentication failed");
             }
-            Mode::Fixed { .. } => unreachable!(),
         }
     } else {
         match mode {
@@ -248,7 +276,7 @@ async fn serve_connect(mut client: TcpStream, route: Route, request: Request) ->
     relay(client, session).await
 }
 
-async fn relay(client: TcpStream, mut session: SnellSession) -> Result<()> {
+pub(crate) async fn relay(client: TcpStream, mut session: SnellSession) -> Result<()> {
     let started = Instant::now();
     crate::perftrace::event("socks.relay_start", &[]);
     let (client_read, client_write) = client.into_split();

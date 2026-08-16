@@ -9,20 +9,27 @@ use crate::nodes::Proxy;
 
 const NODE_SELECTOR_PREFIX: &str = "name-";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderProtocol {
+    Http,
+    Socks5,
+}
+
 pub fn render_provider(
     proxies: &[Proxy],
     listen_address: &str,
     port: u16,
     routing_secret: &str,
+    protocol: ProviderProtocol,
 ) -> Result<Vec<u8>> {
     let ip: IpAddr = listen_address
         .parse()
-        .map_err(|_| anyhow::anyhow!("Surge provider requires a specific numeric SOCKS5 IP"))?;
+        .map_err(|_| anyhow::anyhow!("Surge provider requires a specific numeric listen IP"))?;
     if ip.is_unspecified() || ip.is_multicast() {
-        bail!("Surge provider requires a specific numeric SOCKS5 IP");
+        bail!("Surge provider requires a specific numeric listen IP");
     }
     if port == 0 {
-        bail!("Surge provider SOCKS5 port cannot be zero");
+        bail!("Surge provider listen port cannot be zero");
     }
     if proxies.is_empty() {
         bail!("Surge provider requires at least one node");
@@ -49,12 +56,20 @@ pub fn render_provider(
         if names[&policy_name] > 1 {
             write!(policy_name, " [{selector}]")?;
         }
-        write!(
-            output,
-            "{policy_name} = socks5, {listen_address}, {port}, {selector}, {routing_secret}, test-timeout=45"
-        )?;
-        if proxy.udp {
-            output.push_str(", udp-relay=true, test-udp=example.com@1.1.1.1");
+        match protocol {
+            ProviderProtocol::Http => write!(
+                output,
+                "{policy_name} = http, {listen_address}, {port}, {selector}, {routing_secret}, test-timeout=45"
+            )?,
+            ProviderProtocol::Socks5 => {
+                write!(
+                    output,
+                    "{policy_name} = socks5, {listen_address}, {port}, {selector}, {routing_secret}, test-timeout=45"
+                )?;
+                if proxy.udp {
+                    output.push_str(", udp-relay=true, test-udp=example.com@1.1.1.1");
+                }
+            }
         }
         output.push('\n');
     }
@@ -123,5 +138,65 @@ mod tests {
         let selector = node_selector(name).unwrap();
         assert_eq!(node_name_from_selector(&selector).unwrap(), name);
         assert!(selector.len() <= 255);
+    }
+
+    fn proxy(name: &str, udp: bool) -> Proxy {
+        use crate::nodes::ObfsOptions;
+        Proxy {
+            name: name.to_owned(),
+            proxy_type: "snell".to_owned(),
+            server: "node.example.com".to_owned(),
+            port: 443,
+            psk: "psk".to_owned(),
+            version: 4,
+            udp,
+            tfo: false,
+            reuse: true,
+            identity: true,
+            obfs: ObfsOptions {
+                mode: "ech-tls".to_owned(),
+                sni: "sni.example.com".to_owned(),
+                path: "/".to_owned(),
+                alpn: "snell-ech/1".to_owned(),
+                ech_config: "config".to_owned(),
+                identity_version: 2,
+                legacy_fallback: false,
+                skip_cert_verify: false,
+                preconnect: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn renders_http_by_default_and_socks_on_request() {
+        let proxies = [proxy("🇭🇰 Hong Kong 01", true)];
+        let http = String::from_utf8(
+            render_provider(
+                &proxies,
+                "127.0.0.1",
+                6178,
+                "secret-1",
+                ProviderProtocol::Http,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(http.contains(" = http, 127.0.0.1, 6178, "));
+        assert!(!http.contains("socks5"));
+        assert!(!http.contains("udp-relay"));
+
+        let socks = String::from_utf8(
+            render_provider(
+                &proxies,
+                "127.0.0.1",
+                6178,
+                "secret-1",
+                ProviderProtocol::Socks5,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(socks.contains(" = socks5, 127.0.0.1, 6178, "));
+        assert!(socks.contains("udp-relay=true"));
     }
 }

@@ -3,7 +3,8 @@
 `oixc-proxy` is a clean-room Rust client and local named-node proxy for
 oixCloud. It fetches, authenticates and decrypts the managed node catalog, then
 publishes only nodes whose names contain `Fusion` or standalone `CIA`/`IXP`
-markers through one SOCKS5 listener and a separate HTTP nodelist listener.
+markers through one mixed HTTP/SOCKS5 listener and a separate HTTP nodelist
+listener.
 
 This repository is the Rust rewrite of the Go implementation in `oixc`. The
 binary name, commands, configuration, HTTP endpoints, Surge provider format,
@@ -45,9 +46,9 @@ The default endpoints are:
 
 | Endpoint | Address | Purpose |
 | --- | --- | --- |
-| SOCKS5 | `127.0.0.1:6172` | Routes provider credentials to one named node |
-| Nodelist | `http://127.0.0.1:6173/surge-proxies.conf` | Surge external-policy list (`?all=1` publishes every node) |
-| Clash | `http://127.0.0.1:6173/clash-proxies.yaml` | Clash proxy-provider (`?all=1` publishes every node) |
+| Mixed proxy | `127.0.0.1:6172` | HTTP and SOCKS5 on one port; routes provider credentials to one named node |
+| Nodelist | `http://127.0.0.1:6173/surge-proxies.conf` | Surge list (`?all=1` every node, `?socks=1` advertise SOCKS5) |
+| Clash | `http://127.0.0.1:6173/clash-proxies.yaml` | Clash list (`?all=1` every node, `?socks=1` advertise SOCKS5) |
 | Health | `http://127.0.0.1:6173/healthz` | Readiness probe |
 
 Example Surge group:
@@ -57,18 +58,21 @@ Example Surge group:
 OIXC = select, policy-path=http://127.0.0.1:6173/surge-proxies.conf, update-interval=3600
 ```
 
-Every provider entry points to the shared SOCKS5 listener. The username is a
-reversible URL-safe encoding of the exact managed node name; the password is a
-stable HMAC-derived routing secret. The access token, node address, PSK and ECH
-configuration are never returned by the HTTP endpoint.
+Every provider entry points to the shared mixed listener. Entries are HTTP
+proxies by default; `?socks=1` advertises SOCKS5 instead (UDP ASSOCIATE is
+only available on the SOCKS path). The username is a reversible URL-safe
+encoding of the exact managed node name; the password is a stable HMAC-derived
+routing secret. HTTP clients send those as `Proxy-Authorization: Basic`. The
+access token, node address, PSK and ECH configuration are never returned by
+the nodelist HTTP endpoint.
 
 Only names containing `Fusion` or standalone `CIA`/`IXP` tokens,
 case-insensitively, are published by default. Treating the acronyms as tokens
 avoids admitting ordinary names such as `Special`. An empty filtered catalog
 is rejected so a control-plane naming change cannot expose ordinary nodes.
 `GET` `/surge-proxies.conf?all=1` and `/clash-proxies.yaml?all=1` publish the
-full catalog; those extra nodes are still routed through the same SOCKS5
-listener.
+full catalog; those extra nodes are still routed through the same mixed
+listener. Append `socks=1` when the client should use SOCKS5.
 
 ## Service configuration
 
@@ -83,25 +87,29 @@ The file must be a regular file with Unix mode `0600` or stricter.
 | Key | Required | Default | Meaning |
 | --- | --- | --- | --- |
 | `token` | Yes | — | oixCloud access token |
-| `socks5-listen` | No | `127.0.0.1:6172` | SOCKS5 numeric IP and port |
+| `listen` | No | `127.0.0.1:6172` | Mixed HTTP/SOCKS5 numeric IP and port |
 | `nodelist-listen` | No | `127.0.0.1:6173` | HTTP numeric IP and port |
 | `outbound-ip` | Conditional | SOCKS5 bind IP | Specific IP placed in provider entries and used for UDP binding |
 | `node-refresh-interval` | No | `1h` | Catalog refresh period, `1m` through `24h` |
 
-Both listeners may use `0.0.0.0` or `[::]`. A wildcard SOCKS5 listener requires
+Both listeners may use `0.0.0.0` or `[::]`. A wildcard `listen` address requires
 a specific, same-family `outbound-ip`. For a trusted LAN host:
 
 ```ini
 token=REPLACE_WITH_OIXC_ACCESS_TOKEN
-socks5-listen=0.0.0.0:6172
+listen=0.0.0.0:6172
 nodelist-listen=0.0.0.0:6173
 outbound-ip=10.0.0.16
 node-refresh-interval=1h
 ```
 
-The initial catalog fetch must succeed. A later refresh failure keeps the
-previous catalog. Unchanged node profiles retain their Snell clients and idle
-connection pools; changed, added and removed profiles are rotated atomically.
+Startup loads `nodes-cache.yaml` beside the config file when present, so the
+SOCKS5 and nodelist listeners can bind before the control-plane fetch
+finishes. The cache is mode `0600` and holds the last validated catalog. A
+later refresh failure keeps the previous catalog. The first start still
+requires a successful fetch if no cache exists. Unchanged node profiles
+retain their Snell clients and idle connection pools; changed, added and
+removed profiles are rotated atomically.
 
 ## Commands
 
@@ -118,10 +126,11 @@ oixc-proxy install-systemd [--config PATH]
 `information` performs the read-only account/API request and creates a new JSON
 file with mode `0600`. It refuses to replace an existing file.
 
-`serve` is the normal named-node gateway. SOCKS username/password pairs from
-the generated provider select different managed nodes on one port. It also
-serves `GET`/`HEAD` for `/surge-proxies.conf`, `/clash-proxies.yaml` and
-`/healthz`. Append `?all=1` to either provider URL to list every node.
+`serve` is the normal named-node gateway. Username/password pairs from the
+generated provider select different managed nodes on one mixed HTTP/SOCKS5
+port. It also serves `GET`/`HEAD` for `/surge-proxies.conf`,
+`/clash-proxies.yaml` and `/healthz`. Append `?all=1` to list every node, or
+`?socks=1` to advertise SOCKS5 instead of HTTP.
 
 `serve-map` fetches the same Fusion/CIA/IXP catalog itself, then gives each
 node one loopback SOCKS5 port beginning at 7200 by default. Its default
@@ -205,8 +214,8 @@ The control plane:
 The data plane:
 
 ```text
-Surge provider
-  -> shared SOCKS5 listener
+Surge / Clash provider
+  -> shared mixed HTTP/SOCKS5 listener
   -> username selects a managed node
   -> signed private DNS for cloud-nodes.com
   -> certificate-verified TLS 1.3 with mandatory ECH

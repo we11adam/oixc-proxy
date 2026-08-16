@@ -5,22 +5,23 @@ use std::net::IpAddr;
 use anyhow::{Result, bail};
 
 use crate::nodes::Proxy;
-use crate::surge::{node_selector, sanitize_policy_name};
+use crate::surge::{ProviderProtocol, node_selector, sanitize_policy_name};
 
 pub fn render_provider(
     proxies: &[Proxy],
     listen_address: &str,
     port: u16,
     routing_secret: &str,
+    protocol: ProviderProtocol,
 ) -> Result<Vec<u8>> {
     let ip: IpAddr = listen_address
         .parse()
-        .map_err(|_| anyhow::anyhow!("Clash provider requires a specific numeric SOCKS5 IP"))?;
+        .map_err(|_| anyhow::anyhow!("Clash provider requires a specific numeric listen IP"))?;
     if ip.is_unspecified() || ip.is_multicast() {
-        bail!("Clash provider requires a specific numeric SOCKS5 IP");
+        bail!("Clash provider requires a specific numeric listen IP");
     }
     if port == 0 {
-        bail!("Clash provider SOCKS5 port cannot be zero");
+        bail!("Clash provider listen port cannot be zero");
     }
     if proxies.is_empty() {
         bail!("Clash provider requires at least one node");
@@ -48,12 +49,23 @@ pub fn render_provider(
             write!(policy_name, " [{selector}]")?;
         }
         writeln!(output, "- name: {}", yaml_quote(&policy_name))?;
-        writeln!(output, "  type: socks5")?;
-        writeln!(output, "  server: {listen_address}")?;
-        writeln!(output, "  port: {port}")?;
-        writeln!(output, "  username: {selector}")?;
-        writeln!(output, "  password: {routing_secret}")?;
-        writeln!(output, "  udp: {}", proxy.udp)?;
+        match protocol {
+            ProviderProtocol::Http => {
+                writeln!(output, "  type: http")?;
+                writeln!(output, "  server: {listen_address}")?;
+                writeln!(output, "  port: {port}")?;
+                writeln!(output, "  username: {selector}")?;
+                writeln!(output, "  password: {routing_secret}")?;
+            }
+            ProviderProtocol::Socks5 => {
+                writeln!(output, "  type: socks5")?;
+                writeln!(output, "  server: {listen_address}")?;
+                writeln!(output, "  port: {port}")?;
+                writeln!(output, "  username: {selector}")?;
+                writeln!(output, "  password: {routing_secret}")?;
+                writeln!(output, "  udp: {}", proxy.udp)?;
+            }
+        }
     }
     Ok(output.into_bytes())
 }
@@ -117,17 +129,24 @@ mod tests {
     #[test]
     fn renders_clash_provider_yaml() {
         let proxies = [proxy("🇭🇰 Hong Kong 01", true), proxy("US \"West\"", false)];
-        let output = render_provider(&proxies, "127.0.0.1", 6178, "secret-1").unwrap();
+        let output = render_provider(
+            &proxies,
+            "127.0.0.1",
+            6178,
+            "secret-1",
+            ProviderProtocol::Http,
+        )
+        .unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.starts_with("proxies:\n"));
         assert!(output.contains("- name: \"🇭🇰 Hong Kong 01\"\n"));
         assert!(output.contains("- name: \"US \\\"West\\\"\"\n"));
-        assert!(output.contains("  type: socks5\n"));
+        assert!(output.contains("  type: http\n"));
+        assert!(!output.contains("  type: socks5\n"));
+        assert!(!output.contains("  udp:"));
         assert!(output.contains("  server: 127.0.0.1\n"));
         assert!(output.contains("  port: 6178\n"));
         assert!(output.contains("  password: secret-1\n"));
-        assert!(output.contains("  udp: true\n"));
-        assert!(output.contains("  udp: false\n"));
         assert!(output.contains(&format!(
             "  username: {}\n",
             node_selector("🇭🇰 Hong Kong 01").unwrap()
@@ -135,9 +154,32 @@ mod tests {
     }
 
     #[test]
+    fn renders_clash_socks_provider_when_requested() {
+        let proxies = [proxy("🇭🇰 Hong Kong 01", true)];
+        let output = render_provider(
+            &proxies,
+            "127.0.0.1",
+            6178,
+            "secret-1",
+            ProviderProtocol::Socks5,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("  type: socks5\n"));
+        assert!(output.contains("  udp: true\n"));
+    }
+
+    #[test]
     fn duplicate_display_names_get_selector_suffix() {
         let proxies = [proxy("Node,A", false), proxy("Node=A", false)];
-        let output = render_provider(&proxies, "127.0.0.1", 6178, "secret-1").unwrap();
+        let output = render_provider(
+            &proxies,
+            "127.0.0.1",
+            6178,
+            "secret-1",
+            ProviderProtocol::Http,
+        )
+        .unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains(&format!(
             "- name: \"Node A [{}]\"\n",

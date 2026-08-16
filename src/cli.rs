@@ -11,6 +11,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
 use crate::api::Client as ApiClient;
+use crate::catalog_cache::CatalogCache;
 use crate::config::{RuntimeConfig, default_proxy_config_path, load_proxy_config, load_token_file};
 use crate::gateway::{
     CLASH_PROVIDER_PATH, GatewayManager, PROVIDER_PATH, Route, Router, derive_routing_secret,
@@ -38,7 +39,9 @@ whose names contain Fusion, CIA, or IXP markers. Use this when your
 account does not include any Fusion/CIA/IXP nodes.
 
 GET /surge-proxies.conf?all=1 and /clash-proxies.yaml?all=1 publish the
-full catalog without changing the default filtered listing.
+full catalog without changing the default filtered listing. Provider
+entries are HTTP proxies by default; append socks=1 to advertise SOCKS5
+instead. The local listener accepts both HTTP and SOCKS5.
 ";
 
 #[derive(Debug, thiserror::Error)]
@@ -120,7 +123,14 @@ async fn run_serve(args: &[String]) -> Result<()> {
     let config_path = flag_path(&flags, "config", &default);
     let disable_node_filter = flags.contains_key("disable-node-filter");
     let service = load_proxy_config(&config_path)?;
-    let mut managed = load_managed_nodes(&service.runtime, true).await?;
+    let cache = CatalogCache::beside_config(&config_path);
+    let (mut managed, from_cache) = if let Some(cached) = cache.load() {
+        (cached, true)
+    } else {
+        let fetched = load_managed_nodes(&service.runtime, true).await?;
+        cache.store_or_log(&fetched);
+        (fetched, false)
+    };
     let published = published_proxies(&managed, disable_node_filter)?;
     let routing_secret = derive_routing_secret(&service.runtime.access_token)?;
     let dial_limit = Arc::new(Semaphore::new(32));
@@ -134,15 +144,15 @@ async fn run_serve(args: &[String]) -> Result<()> {
         None,
     )?;
     let manager = Arc::new(GatewayManager::new(router));
-    let socks_listener = TcpListener::bind(service.socks5_listen)
+    let socks_listener = TcpListener::bind(service.listen)
         .await
         .map_err(|_| anyhow::anyhow!("listen on local SOCKS5 address"))?;
     let nodelist_listener = TcpListener::bind(service.nodelist_listen)
         .await
         .map_err(|_| anyhow::anyhow!("listen on local nodelist HTTP address"))?;
     println!(
-        "Proxy ready: SOCKS5 {}; nodelist http://{}{}; clash http://{}{}; {}; refresh {}",
-        service.socks5_listen,
+        "Proxy ready: mixed {}; nodelist http://{}{}; clash http://{}{}; {}; refresh {}",
+        service.listen,
         service.nodelist_listen,
         PROVIDER_PATH,
         service.nodelist_listen,
@@ -150,6 +160,9 @@ async fn run_serve(args: &[String]) -> Result<()> {
         format_node_count(published.len(), managed.proxies.len()),
         format_duration(service.node_refresh_interval),
     );
+    if from_cache {
+        println!("Started from cached catalog; refreshing in background");
+    }
 
     let mut socks_task = tokio::spawn(serve_socks_listener(
         socks_listener,
@@ -163,7 +176,9 @@ async fn run_serve(args: &[String]) -> Result<()> {
     ));
     let mut http_task = tokio::spawn(http_server::serve(nodelist_listener, manager.clone()));
     let mut refresh = tokio::time::interval(service.node_refresh_interval);
-    refresh.tick().await;
+    if !from_cache {
+        refresh.tick().await;
+    }
     loop {
         tokio::select! {
             result = &mut socks_task => {
@@ -213,6 +228,7 @@ async fn run_serve(args: &[String]) -> Result<()> {
                 let published_count = published.len();
                 let total_count = refreshed.proxies.len();
                 managed = refreshed;
+                cache.store_or_log(&managed);
                 println!(
                     "Refreshed node catalog ({})",
                     format_node_count(published_count, total_count)

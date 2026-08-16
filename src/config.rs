@@ -11,7 +11,7 @@ use url::Url;
 
 pub const DEFAULT_API_BASE_URL: &str = "https://oix-api.dler.io";
 pub const DEFAULT_APP_SECRET: &str = "4a7f27227e2779e5d3e9cd968ba06ceb";
-const DEFAULT_SOCKS5_LISTEN: &str = "127.0.0.1:6172";
+const DEFAULT_LISTEN: &str = "127.0.0.1:6172";
 const DEFAULT_NODELIST_LISTEN: &str = "127.0.0.1:6173";
 const MAX_PROXY_CONFIG_BYTES: usize = 64 << 10;
 
@@ -37,7 +37,7 @@ pub struct RuntimeConfig {
 #[derive(Clone, Debug)]
 pub struct ProxyConfig {
     pub runtime: RuntimeConfig,
-    pub socks5_listen: SocketAddr,
+    pub listen: SocketAddr,
     pub nodelist_listen: SocketAddr,
     pub outbound_ip: IpAddr,
     pub node_refresh_interval: Duration,
@@ -83,23 +83,17 @@ pub fn load_proxy_config(path: &Path) -> Result<ProxyConfig> {
         .cloned()
         .context("proxy config requires token")?;
 
-    let socks5_listen = parse_listen(
-        "socks5-listen",
-        values.get("socks5-listen").map(String::as_str),
-        DEFAULT_SOCKS5_LISTEN,
-    )?;
+    let listen = parse_listen("listen", listen_value(&values)?, DEFAULT_LISTEN)?;
     let nodelist_listen = parse_listen(
         "nodelist-listen",
         values.get("nodelist-listen").map(String::as_str),
         DEFAULT_NODELIST_LISTEN,
     )?;
-    if listens_conflict(socks5_listen, nodelist_listen) {
-        bail!("socks5-listen and nodelist-listen conflict");
+    if listens_conflict(listen, nodelist_listen) {
+        bail!("listen and nodelist-listen conflict");
     }
-    let outbound_ip = parse_outbound_ip(
-        values.get("outbound-ip").map(String::as_str),
-        socks5_listen.ip(),
-    )?;
+    let outbound_ip =
+        parse_outbound_ip(values.get("outbound-ip").map(String::as_str), listen.ip())?;
     let node_refresh_interval = match values.get("node-refresh-interval") {
         Some(value) => {
             let duration =
@@ -117,17 +111,17 @@ pub fn load_proxy_config(path: &Path) -> Result<ProxyConfig> {
         FileConfig {
             access_token: token,
             listen_address: "127.0.0.1".to_owned(),
-            serve_port: socks5_listen.port(),
+            serve_port: listen.port(),
             ..FileConfig::default()
         },
     )?;
-    runtime.listen_address = socks5_listen.ip();
-    runtime.serve_port = socks5_listen.port();
-    runtime.allow_remote_access = !socks5_listen.ip().is_loopback();
+    runtime.listen_address = listen.ip();
+    runtime.serve_port = listen.port();
+    runtime.allow_remote_access = !listen.ip().is_loopback();
 
     Ok(ProxyConfig {
         runtime,
-        socks5_listen,
+        listen,
         nodelist_listen,
         outbound_ip,
         node_refresh_interval,
@@ -269,12 +263,13 @@ fn parse_proxy_config(content: &[u8]) -> Result<HashMap<String, String>> {
     let text = std::str::from_utf8(content).context("read proxy config")?;
     let allowed = [
         "token",
+        "listen",
         "socks5-listen",
         "nodelist-listen",
         "outbound-ip",
         "node-refresh-interval",
     ];
-    let mut values = HashMap::with_capacity(5);
+    let mut values = HashMap::with_capacity(6);
     for (index, original) in text.lines().enumerate() {
         let line_number = index + 1;
         let line = original.trim();
@@ -297,6 +292,16 @@ fn parse_proxy_config(content: &[u8]) -> Result<HashMap<String, String>> {
         }
     }
     Ok(values)
+}
+
+fn listen_value(values: &HashMap<String, String>) -> Result<Option<&str>> {
+    match (values.get("listen"), values.get("socks5-listen")) {
+        (Some(_), Some(_)) => {
+            bail!("proxy config cannot set both listen and socks5-listen")
+        }
+        (Some(value), None) | (None, Some(value)) => Ok(Some(value.as_str())),
+        (None, None) => Ok(None),
+    }
 }
 
 fn parse_listen(name: &str, value: Option<&str>, default: &str) -> Result<SocketAddr> {
@@ -323,7 +328,7 @@ fn listens_conflict(first: SocketAddr, second: SocketAddr) -> bool {
 fn parse_outbound_ip(value: Option<&str>, socks5_ip: IpAddr) -> Result<IpAddr> {
     let Some(value) = value else {
         if socks5_ip.is_unspecified() {
-            bail!("outbound-ip is required when socks5-listen uses an unspecified IP");
+            bail!("outbound-ip is required when listen uses an unspecified IP");
         }
         return Ok(socks5_ip);
     };
@@ -334,7 +339,7 @@ fn parse_outbound_ip(value: Option<&str>, socks5_ip: IpAddr) -> Result<IpAddr> {
         bail!("outbound-ip must be a specific, non-multicast numeric IP");
     }
     if outbound.is_ipv4() != socks5_ip.is_ipv4() {
-        bail!("outbound-ip and socks5-listen must use the same IP family");
+        bail!("outbound-ip and listen must use the same IP family");
     }
     Ok(outbound)
 }
@@ -463,7 +468,7 @@ fn read_limited(path: &Path, maximum: usize, name: &str) -> Result<Vec<u8>> {
     Ok(content)
 }
 
-fn require_private_file(path: &Path, allow_insecure: bool) -> Result<()> {
+pub(crate) fn require_private_file(path: &Path, allow_insecure: bool) -> Result<()> {
     let metadata = fs::metadata(path)?;
     if !metadata.is_file() {
         bail!("path is not a regular file");
@@ -486,6 +491,21 @@ fn require_private_file(path: &Path, allow_insecure: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listen_accepts_legacy_socks5_listen_alias() {
+        let mut values = HashMap::new();
+        values.insert("socks5-listen".to_owned(), "127.0.0.1:6178".to_owned());
+        assert_eq!(listen_value(&values).unwrap(), Some("127.0.0.1:6178"));
+
+        values.insert("listen".to_owned(), "127.0.0.1:6172".to_owned());
+        assert!(
+            listen_value(&values)
+                .unwrap_err()
+                .to_string()
+                .contains("both")
+        );
+    }
 
     #[test]
     fn go_duration_grammar_is_supported() {

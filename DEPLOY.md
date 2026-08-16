@@ -66,7 +66,7 @@ token=YOUR_OIXCLOUD_ACCESS_TOKEN
 | 键 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `token` | 是 | — | oixCloud access token |
-| `socks5-listen` | 否 | `127.0.0.1:6172` | SOCKS5 监听地址 |
+| `listen` | 否 | `127.0.0.1:6172` | Mixed HTTP/SOCKS5 监听地址 |
 | `nodelist-listen` | 否 | `127.0.0.1:6173` | HTTP nodelist 监听地址 |
 | `outbound-ip` | 条件 | 同 socks5 IP | listen 为 `0.0.0.0` 时**必填**，写入 provider 条目并用于 UDP 绑定 |
 | `node-refresh-interval` | 否 | `1h` | 节点目录刷新周期，范围 `1m` ~ `24h` |
@@ -81,7 +81,7 @@ token=YOUR_OIXCLOUD_ACCESS_TOKEN
 
 ```ini
 token=YOUR_OIXCLOUD_ACCESS_TOKEN
-socks5-listen=0.0.0.0:6172
+listen=0.0.0.0:6172
 nodelist-listen=0.0.0.0:6173
 outbound-ip=192.168.1.10        # 替换为本机局域网 IP（ifconfig | grep "inet " 查看）
 node-refresh-interval=1h
@@ -109,9 +109,9 @@ target/release/oixc-proxy information --output ~/oixc-info.json
 
 | 端点 | 地址 | 用途 |
 | --- | --- | --- |
-| SOCKS5 | `127.0.0.1:6172` | 用 provider 凭据路由到指定命名节点 |
-| Surge provider | `http://127.0.0.1:6173/surge-proxies.conf` | Surge external-policy list（`?all=1` 放出全部节点） |
-| Clash provider | `http://127.0.0.1:6173/clash-proxies.yaml` | Clash proxy-provider（`?all=1` 放出全部节点） |
+| Mixed 代理 | `127.0.0.1:6172` | 同一端口同时接受 HTTP 与 SOCKS5 |
+| Surge provider | `http://127.0.0.1:6173/surge-proxies.conf` | 默认 HTTP 节点；`?all=1` 全部节点，`?socks=1` 改声明为 SOCKS5 |
+| Clash provider | `http://127.0.0.1:6173/clash-proxies.yaml` | 默认 HTTP 节点；`?all=1` 全部节点，`?socks=1` 改声明为 SOCKS5 |
 | 健康检查 | `http://127.0.0.1:6173/healthz` | 就绪探针（204） |
 
 ### 客户端接入
@@ -150,8 +150,9 @@ rules:
 
 要点：
 
-- provider 中每个节点已包含 `server`、`port`、`username`、`password`、
-  `udp`，客户端**无需**额外配置认证信息；
+- provider 中每个节点已包含 `server`、`port`、`username`、`password`；
+  默认声明为 HTTP 代理。需要 SOCKS5（含 UDP）时在 URL 后加 `?socks=1`；
+  客户端**无需**额外配置认证信息；
 - `username` 是节点名的可逆编码（selector），`password` 是 HMAC 派生的
   路由密钥；均由 oixc-proxy 自动生成，**不要手动修改**；
 - 默认只发布名称含 `Fusion`、`CIA` 或 `IXP` 标记的节点；若账户没有这些
@@ -550,7 +551,7 @@ ssh root@192.168.1.2 '
   mkdir -p /root/.config/oixc-proxy
   cat > /root/.config/oixc-proxy/oixc-proxy.conf << "OIXC_EOF"
 token=YOUR_OIXCLOUD_ACCESS_TOKEN
-socks5-listen=0.0.0.0:6172
+listen=0.0.0.0:6172
 nodelist-listen=0.0.0.0:6173
 outbound-ip=192.168.1.2
 node-refresh-interval=1h

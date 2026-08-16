@@ -74,15 +74,16 @@ async fn serve_connection(mut connection: TcpStream, manager: Arc<GatewayManager
                 )
                 .await;
             }
-            let include_all = wants_all_nodes(query);
+            let include_all = query_flag(query, "all");
+            let socks = query_flag(query, "socks");
             let (provider, content_type) = if path == CLASH_PROVIDER_PATH {
                 (
-                    manager.clash_provider(include_all).await,
+                    manager.clash_provider(include_all, socks).await,
                     "text/yaml; charset=utf-8",
                 )
             } else {
                 (
-                    manager.provider(include_all).await,
+                    manager.provider(include_all, socks).await,
                     "text/plain; charset=utf-8",
                 )
             };
@@ -133,12 +134,12 @@ fn split_target(target: &str) -> (&str, &str) {
     target.split_once('?').unwrap_or((target, ""))
 }
 
-fn wants_all_nodes(query: &str) -> bool {
+fn query_flag(query: &str, name: &str) -> bool {
     query
         .split('&')
         .filter_map(|pair| {
             let (key, value) = pair.split_once('=')?;
-            (key == "all").then_some(value)
+            (key == name).then_some(value)
         })
         .next_back()
         == Some("1")
@@ -210,19 +211,22 @@ mod tests {
     }
 
     #[test]
-    fn all_query_accepts_only_all_equals_one() {
-        assert!(!wants_all_nodes(""));
-        assert!(wants_all_nodes("all=1"));
-        assert!(wants_all_nodes("foo=bar&all=1"));
-        assert!(wants_all_nodes("all=1&foo=bar"));
-        assert!(wants_all_nodes("all=0&all=1"));
-        assert!(!wants_all_nodes("all=1&all=0"));
-        assert!(!wants_all_nodes("all=0"));
-        assert!(!wants_all_nodes("all=true"));
-        assert!(!wants_all_nodes("all="));
-        assert!(!wants_all_nodes("all"));
-        assert!(!wants_all_nodes("ALL=1"));
-        assert!(!wants_all_nodes("ball=1"));
-        assert!(!wants_all_nodes("all=11"));
+    fn query_flag_accepts_only_name_equals_one() {
+        assert!(!query_flag("", "all"));
+        assert!(query_flag("all=1", "all"));
+        assert!(query_flag("foo=bar&all=1", "all"));
+        assert!(query_flag("all=1&foo=bar", "all"));
+        assert!(query_flag("all=0&all=1", "all"));
+        assert!(!query_flag("all=1&all=0", "all"));
+        assert!(!query_flag("all=0", "all"));
+        assert!(!query_flag("all=true", "all"));
+        assert!(!query_flag("all=", "all"));
+        assert!(!query_flag("all", "all"));
+        assert!(!query_flag("ALL=1", "all"));
+        assert!(!query_flag("ball=1", "all"));
+        assert!(!query_flag("all=11", "all"));
+        assert!(query_flag("all=1&socks=1", "socks"));
+        assert!(!query_flag("all=1", "socks"));
+        assert!(!query_flag("socks=true", "socks"));
     }
 }

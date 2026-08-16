@@ -1,8 +1,10 @@
 pub mod api;
+pub mod catalog_cache;
 pub mod clash;
 pub mod cli;
 pub mod config;
 pub mod gateway;
+pub mod http_proxy;
 pub mod http_server;
 pub mod nodes;
 pub mod perftrace;

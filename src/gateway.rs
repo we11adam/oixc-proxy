@@ -12,7 +12,7 @@ use tokio::sync::{RwLock, Semaphore};
 use crate::config::RuntimeConfig;
 use crate::nodes::Proxy;
 use crate::snell::{SnellClient, SnellClientOptions};
-use crate::surge::{node_selector, render_provider};
+use crate::surge::{ProviderProtocol, node_selector, render_provider};
 use crate::transport::EchDialer;
 
 pub const PROVIDER_PATH: &str = "/surge-proxies.conf";
@@ -31,13 +31,19 @@ struct NodeRuntime {
     route: Route,
 }
 
+#[derive(Clone)]
+struct ProviderDocs {
+    surge_http: Arc<[u8]>,
+    surge_socks: Arc<[u8]>,
+    clash_http: Arc<[u8]>,
+    clash_socks: Arc<[u8]>,
+}
+
 pub struct Router {
     routes: HashMap<String, Route>,
     runtimes: HashMap<String, Arc<NodeRuntime>>,
-    provider: Arc<[u8]>,
-    clash_provider: Arc<[u8]>,
-    all_provider: Arc<[u8]>,
-    all_clash_provider: Arc<[u8]>,
+    filtered: ProviderDocs,
+    all: ProviderDocs,
     routing_secret: String,
 }
 
@@ -56,30 +62,16 @@ impl Router {
         previous: Option<&Router>,
     ) -> Result<Self> {
         let listen_address = outbound_ip.to_string();
-        let provider = render_provider(
+        let filtered = render_provider_docs(
             published,
             &listen_address,
             runtime.serve_port,
             routing_secret,
         )?;
-        let clash_provider = crate::clash::render_provider(
-            published,
-            &listen_address,
-            runtime.serve_port,
-            routing_secret,
-        )?;
-        let (all_provider, all_clash_provider) = if same_proxy_list(proxies, published) {
-            (provider.clone(), clash_provider.clone())
+        let all = if same_proxy_list(proxies, published) {
+            filtered.clone()
         } else {
-            (
-                render_provider(proxies, &listen_address, runtime.serve_port, routing_secret)?,
-                crate::clash::render_provider(
-                    proxies,
-                    &listen_address,
-                    runtime.serve_port,
-                    routing_secret,
-                )?,
-            )
+            render_provider_docs(proxies, &listen_address, runtime.serve_port, routing_secret)?
         };
         let mut routes = HashMap::with_capacity(proxies.len());
         let mut runtimes = HashMap::with_capacity(proxies.len());
@@ -124,27 +116,25 @@ impl Router {
         Ok(Self {
             routes,
             runtimes,
-            provider: provider.into(),
-            clash_provider: clash_provider.into(),
-            all_provider: all_provider.into(),
-            all_clash_provider: all_clash_provider.into(),
+            filtered,
+            all,
             routing_secret: routing_secret.to_owned(),
         })
     }
 
-    pub fn provider(&self, include_all: bool) -> Arc<[u8]> {
-        if include_all {
-            self.all_provider.clone()
-        } else {
-            self.provider.clone()
-        }
+    pub fn provider(&self, include_all: bool, socks: bool) -> Arc<[u8]> {
+        self.docs(include_all).surge(socks)
     }
 
-    pub fn clash_provider(&self, include_all: bool) -> Arc<[u8]> {
+    pub fn clash_provider(&self, include_all: bool, socks: bool) -> Arc<[u8]> {
+        self.docs(include_all).clash(socks)
+    }
+
+    fn docs(&self, include_all: bool) -> &ProviderDocs {
         if include_all {
-            self.all_clash_provider.clone()
+            &self.all
         } else {
-            self.clash_provider.clone()
+            &self.filtered
         }
     }
 
@@ -185,21 +175,21 @@ impl GatewayManager {
             .authenticate(selector, secret)
     }
 
-    pub async fn provider(&self, include_all: bool) -> Result<Arc<[u8]>> {
+    pub async fn provider(&self, include_all: bool, socks: bool) -> Result<Arc<[u8]>> {
         self.router
             .read()
             .await
             .as_ref()
-            .map(|router| router.provider(include_all))
+            .map(|router| router.provider(include_all, socks))
             .ok_or_else(|| anyhow::anyhow!("gateway unavailable"))
     }
 
-    pub async fn clash_provider(&self, include_all: bool) -> Result<Arc<[u8]>> {
+    pub async fn clash_provider(&self, include_all: bool, socks: bool) -> Result<Arc<[u8]>> {
         self.router
             .read()
             .await
             .as_ref()
-            .map(|router| router.clash_provider(include_all))
+            .map(|router| router.clash_provider(include_all, socks))
             .ok_or_else(|| anyhow::anyhow!("gateway unavailable"))
     }
 
@@ -241,6 +231,66 @@ pub fn derive_routing_secret(key_material: &str) -> Result<String> {
         .expect("HMAC accepts every key length");
     mac.update(ROUTING_SECRET_CONTEXT);
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
+}
+
+impl ProviderDocs {
+    fn surge(&self, socks: bool) -> Arc<[u8]> {
+        if socks {
+            self.surge_socks.clone()
+        } else {
+            self.surge_http.clone()
+        }
+    }
+
+    fn clash(&self, socks: bool) -> Arc<[u8]> {
+        if socks {
+            self.clash_socks.clone()
+        } else {
+            self.clash_http.clone()
+        }
+    }
+}
+
+fn render_provider_docs(
+    proxies: &[Proxy],
+    listen_address: &str,
+    port: u16,
+    routing_secret: &str,
+) -> Result<ProviderDocs> {
+    Ok(ProviderDocs {
+        surge_http: render_provider(
+            proxies,
+            listen_address,
+            port,
+            routing_secret,
+            ProviderProtocol::Http,
+        )?
+        .into(),
+        surge_socks: render_provider(
+            proxies,
+            listen_address,
+            port,
+            routing_secret,
+            ProviderProtocol::Socks5,
+        )?
+        .into(),
+        clash_http: crate::clash::render_provider(
+            proxies,
+            listen_address,
+            port,
+            routing_secret,
+            ProviderProtocol::Http,
+        )?
+        .into(),
+        clash_socks: crate::clash::render_provider(
+            proxies,
+            listen_address,
+            port,
+            routing_secret,
+            ProviderProtocol::Socks5,
+        )?
+        .into(),
+    })
 }
 
 fn same_proxy_list(left: &[Proxy], right: &[Proxy]) -> bool {
