@@ -43,6 +43,36 @@ It installs only the binary; it does not create a config, install a service or
 restart an existing process. Continue with the platform service instructions
 below or the complete [deployment guide](DEPLOY.md).
 
+## Use the deployment Skill with an agent
+
+This repository includes an agent-facing
+[`oixc-proxy-deploy` Skill](.agents/skills/oixc-proxy-deploy/SKILL.md). Agents
+such as Codex that support repository-local Skills can discover it when opened
+in this repository. You can also invoke it explicitly with
+`$oixc-proxy-deploy` in the prompt.
+
+Example prompts:
+
+```text
+Use $oixc-proxy-deploy to install the latest Release locally, then verify the
+version and health status.
+
+Use $oixc-proxy-deploy to update root@router.lan to v0.1.0. Preserve its
+existing config and service mechanism; verify the new PID, listeners, /healthz,
+and provider endpoint, and roll back on failure.
+
+Use $oixc-proxy-deploy to publish the current Cargo.toml version, follow the
+GitHub Release workflow, and download and verify every release asset.
+```
+
+Name every authorized target host and desired version in the prompt, and state
+whether the agent may create or change configuration and services. Do not put
+tokens directly in prompts. Private Releases should use an existing `gh` login
+or a securely injected read-only token in the agent environment. The Skill
+operates only on this Rust repository and preserves existing configuration and
+service management during updates. See the [deployment guide](DEPLOY.md) for
+platform details.
+
 ## Build
 
 Rust 1.85 or newer is required.

@@ -26,6 +26,24 @@ sh install.sh --install-dir "$HOME/.local/bin"
 
 安装脚本只安装二进制，不会创建配置、安装服务或重启现有进程。接下来可按照下方平台服务说明操作，也可查阅完整的[部署指南](DEPLOY.md)。
 
+## 让 Agent 使用部署 Skill
+
+仓库内置了面向 Agent 的 [`oixc-proxy-deploy` Skill](.agents/skills/oixc-proxy-deploy/SKILL.md)。在 Codex 等支持仓库级 Skill 的 Agent 中打开本仓库后，它可以自动发现该 Skill；也可以在提示词中用 `$oixc-proxy-deploy` 显式调用。
+
+示例提示词：
+
+```text
+使用 $oixc-proxy-deploy 将最新 Release 安装到本机，并验证版本和健康状态。
+
+使用 $oixc-proxy-deploy 将 v0.1.0 更新到 root@router.lan，保留现有配置和服务方式，
+并验证新 PID、监听端口、/healthz 与 provider 端点；失败时回滚。
+
+使用 $oixc-proxy-deploy 发布 Cargo.toml 中的当前版本，
+跟踪 GitHub Release workflow，下载并验证所有发布资产。
+```
+
+提示词应明确给出获准操作的目标主机、要部署的版本，以及是否允许创建或修改配置和服务。不要把 token 直接写进提示词；私有 Release 应使用 Agent 所在环境中已有的 `gh` 登录状态或安全注入的只读 token。该 Skill 只操作本 Rust 仓库，并会在更新时保留现有配置和服务管理方式。平台细节见[部署指南](DEPLOY.md)。
+
 ## 构建
 
 需要 Rust 1.85 或更高版本。
