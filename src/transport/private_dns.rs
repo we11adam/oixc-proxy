@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
 use base64::Engine as _;
@@ -11,11 +11,16 @@ use hickory_proto::op::{Message, MessageType, OpCode, Query};
 use hickory_proto::rr::{Name, RData, RecordType};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 
 pub const PRIVATE_DNS_SUFFIX: &str = "cloud-nodes.com";
 pub const PRIVATE_DNS_SERVER: &str = "124.221.68.73:1053";
 pub const PRIVATE_DNS_SEED_BASE64: &str = "QiXXv81GasAAq3TfApAmFZ7kOjj+QC/I21N5MP39YNY=";
 const CACHE_TTL: Duration = Duration::from_secs(300);
+const PARTIAL_CACHE_TTL: Duration = Duration::from_secs(30);
+const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+const QUERY_ATTEMPTS: usize = 2;
+const FAMILY_GRACE: Duration = Duration::from_millis(50);
 
 #[derive(Clone)]
 pub struct PrivateDnsResolver {
@@ -23,12 +28,13 @@ pub struct PrivateDnsResolver {
     seed: Arc<[u8; 32]>,
     server: SocketAddr,
     cache: Arc<Mutex<HashMap<String, CacheEntry>>>,
+    lookup_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 #[derive(Clone)]
 struct CacheEntry {
     addresses: Vec<IpAddr>,
-    expires: SystemTime,
+    expires: Instant,
 }
 
 impl PrivateDnsResolver {
@@ -46,6 +52,7 @@ impl PrivateDnsResolver {
                 .parse()
                 .map_err(|_| anyhow::anyhow!("private DNS server is invalid"))?,
             cache: Arc::new(Mutex::new(HashMap::new())),
+            lookup_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -54,25 +61,30 @@ impl PrivateDnsResolver {
         if !matches_dns_suffix(&host, &self.suffix) {
             return Ok(None);
         }
-        let now = SystemTime::now();
-        {
-            let mut cache = self.cache.lock().await;
-            if let Some(entry) = cache.get(&host) {
-                if now < entry.expires {
-                    return Ok(Some(entry.addresses.clone()));
-                }
-            }
-            cache.remove(&host);
+        if let Some(addresses) = self.cached(&host).await {
+            return Ok(Some(addresses));
         }
-        let unix_seconds = now
+
+        let lookup_lock = {
+            let mut locks = self.lookup_locks.lock().await;
+            locks
+                .entry(host.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _lookup_guard = lookup_lock.lock().await;
+        if let Some(addresses) = self.cached(&host).await {
+            return Ok(Some(addresses));
+        }
+
+        let unix_seconds = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| anyhow::anyhow!("system clock is before Unix epoch"))?
             .as_secs() as i64;
         let query_name = signed_dns_name(&host, unix_seconds, self.seed.as_ref())?;
-        let mut addresses = self.query(&query_name, RecordType::A).await?;
-        addresses.extend(self.query(&query_name, RecordType::AAAA).await?);
-        addresses.sort();
-        addresses.dedup();
+        let (mut addresses, complete) = self.query_dual_stack(&query_name).await;
+        let mut seen = HashSet::with_capacity(addresses.len());
+        addresses.retain(|address| seen.insert(*address));
         if addresses.is_empty() {
             bail!("resolve ECH-TLS node");
         }
@@ -80,13 +92,64 @@ impl PrivateDnsResolver {
             host,
             CacheEntry {
                 addresses: addresses.clone(),
-                expires: now + CACHE_TTL,
+                expires: Instant::now()
+                    + if complete {
+                        CACHE_TTL
+                    } else {
+                        PARTIAL_CACHE_TTL
+                    },
             },
         );
         Ok(Some(addresses))
     }
 
     async fn query(&self, name: &str, record_type: RecordType) -> Result<Vec<IpAddr>> {
+        for _ in 0..QUERY_ATTEMPTS {
+            if let Ok(Ok(result)) = timeout(QUERY_TIMEOUT, self.query_once(name, record_type)).await
+            {
+                return Ok(result);
+            }
+        }
+        bail!("resolve ECH-TLS node")
+    }
+
+    async fn query_dual_stack(&self, name: &str) -> (Vec<IpAddr>, bool) {
+        let ipv4 = self.query(name, RecordType::A);
+        let ipv6 = self.query(name, RecordType::AAAA);
+        tokio::pin!(ipv4, ipv6);
+        tokio::select! {
+            result = &mut ipv4 => {
+                let mut addresses = result.unwrap_or_default();
+                if addresses.is_empty() {
+                    addresses.extend(ipv6.await.unwrap_or_default());
+                    (addresses, true)
+                } else {
+                    match timeout(FAMILY_GRACE, &mut ipv6).await {
+                        Ok(Ok(other)) => addresses.extend(other),
+                        Ok(Err(_)) => {}
+                        Err(_) => return (addresses, false),
+                    }
+                    (addresses, true)
+                }
+            }
+            result = &mut ipv6 => {
+                let mut addresses = result.unwrap_or_default();
+                if addresses.is_empty() {
+                    addresses.extend(ipv4.await.unwrap_or_default());
+                    (addresses, true)
+                } else {
+                    match timeout(FAMILY_GRACE, &mut ipv4).await {
+                        Ok(Ok(other)) => addresses.extend(other),
+                        Ok(Err(_)) => {}
+                        Err(_) => return (addresses, false),
+                    }
+                    (addresses, true)
+                }
+            }
+        }
+    }
+
+    async fn query_once(&self, name: &str, record_type: RecordType) -> Result<Vec<IpAddr>> {
         let mut id_bytes = [0u8; 2];
         getrandom::fill(&mut id_bytes)
             .map_err(|_| anyhow::anyhow!("generate private DNS query ID"))?;
@@ -136,6 +199,18 @@ impl PrivateDnsResolver {
             })
             .collect())
     }
+
+    async fn cached(&self, host: &str) -> Option<Vec<IpAddr>> {
+        let now = Instant::now();
+        let mut cache = self.cache.lock().await;
+        if let Some(entry) = cache.get(host) {
+            if now < entry.expires {
+                return Some(entry.addresses.clone());
+            }
+        }
+        cache.remove(host);
+        None
+    }
 }
 
 pub fn signed_dns_name(host: &str, unix_seconds: i64, seed: &[u8]) -> Result<String> {
@@ -179,8 +254,6 @@ fn validate_dns_name(name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use base64::Engine as _;
-
     use super::*;
 
     #[test]
