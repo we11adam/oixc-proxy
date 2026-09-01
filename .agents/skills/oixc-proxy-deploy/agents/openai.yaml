@@ -1,0 +1,4 @@
+interface:
+  display_name: "oixc-proxy Deploy"
+  short_description: "Install, update, release, and verify oixc-proxy"
+  default_prompt: "Use $oixc-proxy-deploy to deploy and verify oixc-proxy on the hosts I specify."
