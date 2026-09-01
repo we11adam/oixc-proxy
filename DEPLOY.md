@@ -70,6 +70,15 @@ token=YOUR_OIXCLOUD_ACCESS_TOKEN
 | `nodelist-listen` | 否 | `127.0.0.1:6173` | HTTP nodelist 监听地址 |
 | `outbound-ip` | 条件 | 同 socks5 IP | listen 为 `0.0.0.0` 时**必填**，写入 provider 条目并用于 UDP 绑定 |
 | `node-refresh-interval` | 否 | `1h` | 节点目录刷新周期，范围 `1m` ~ `24h` |
+| `request-timeout` | 否 | `15s` | 控制面与节点操作超时，最大 `2m` |
+| `udp-idle-timeout` | 否 | `5m` | SOCKS5 UDP association 空闲超时 |
+| `max-client-connections` | 否 | `256` | 整个进程的 mixed proxy 连接上限 |
+| `dial-concurrency` | 否 | `32` | 整个进程同时新建 ECH-TLS 连接的上限 |
+| `per-node-dial-concurrency` | 否 | `8` | 单节点同时新建 ECH-TLS 连接的上限 |
+| `reuse-max-idle` | 否 | `8` | 每节点保留的空闲可复用 transport 数量 |
+| `reuse-max-uses` | 否 | `32` | 单个物理 transport 最多承载的逻辑会话数 |
+| `reuse-idle-timeout` | 否 | `90s` | 可复用 transport 最大空闲时间 |
+| `perf-trace-sample-every` | 否 | `0` | 每 N 个请求记录一个详细性能 trace；`0` 为关闭 |
 
 格式约束：严格 `key=value`；不允许引号、section、未知键、重复键；
 空行和 `#` 注释可用；文件必须是普通文件且权限为 `0600` 或更严格。

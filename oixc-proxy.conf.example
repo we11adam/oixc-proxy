@@ -4,6 +4,18 @@ listen=127.0.0.1:6172
 nodelist-listen=127.0.0.1:6173
 node-refresh-interval=1h
 
+# Optional performance tuning. Detailed tracing is disabled by default;
+# 1000 records roughly one request in every 1000.
+# request-timeout=15s
+# udp-idle-timeout=5m
+# max-client-connections=256
+# dial-concurrency=32
+# per-node-dial-concurrency=8
+# reuse-max-idle=8
+# reuse-max-uses=32
+# reuse-idle-timeout=90s
+# perf-trace-sample-every=1000
+
 # For a trusted LAN host, use wildcard listeners and publish one specific IP:
 # listen=0.0.0.0:6172
 # nodelist-listen=0.0.0.0:6173

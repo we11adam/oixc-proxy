@@ -91,6 +91,15 @@ The file must be a regular file with Unix mode `0600` or stricter.
 | `nodelist-listen` | No | `127.0.0.1:6173` | HTTP numeric IP and port |
 | `outbound-ip` | Conditional | SOCKS5 bind IP | Specific IP placed in provider entries and used for UDP binding |
 | `node-refresh-interval` | No | `1h` | Catalog refresh period, `1m` through `24h` |
+| `request-timeout` | No | `15s` | Control-plane and node operation deadline, up to `2m` |
+| `udp-idle-timeout` | No | `5m` | Idle lifetime of one SOCKS5 UDP association |
+| `max-client-connections` | No | `256` | Process-wide mixed proxy connection limit, `1` through `4096` |
+| `dial-concurrency` | No | `32` | Process-wide fresh ECH-TLS dial limit, `1` through `1024` |
+| `per-node-dial-concurrency` | No | `8` | Fresh ECH-TLS dial limit for one node, `1` through `128` |
+| `reuse-max-idle` | No | `8` | Maximum idle reusable transports retained per node |
+| `reuse-max-uses` | No | `32` | Logical sessions allowed on one physical transport |
+| `reuse-idle-timeout` | No | `90s` | Maximum idle age of a reusable transport |
+| `perf-trace-sample-every` | No | `0` | Emit detailed trace for one in every N requests; `0` disables tracing |
 
 Both listeners may use `0.0.0.0` or `[::]`. A wildcard `listen` address requires
 a specific, same-family `outbound-ip`. For a trusted LAN host:
@@ -175,10 +184,12 @@ Inspect the service:
 launchctl print "gui/$(id -u)/io.oixc.proxy"
 ```
 
-The stderr log contains sanitized, request-scoped performance events for SOCKS
-parsing, DNS/TCP/TLS setup, the initial Snell flight, first data in both
-directions and relay cleanup. It never logs tokens, PSKs, target names, ECH
-configuration or derived key material.
+When `perf-trace-sample-every` is nonzero, the stderr log contains sanitized,
+request-scoped performance events for SOCKS parsing, DNS/TCP/TLS setup, the
+initial Snell flight, first data in both directions and relay cleanup. Tracing
+is disabled by default so synchronous log output cannot slow the data plane.
+It never logs tokens, PSKs, target names, ECH configuration or derived key
+material.
 
 ## Install on Linux
 
@@ -231,6 +242,11 @@ the client can send its first payload immediately; the status is consumed by
 the first upstream read. Reusable transports are returned to the pool only
 after both peers exchange the Snell zero record.
 
+All node dialers share one system root store, crypto provider and signed-DNS
+cache. Cold signed-DNS A/AAAA lookups run concurrently and coalesce by host;
+TCP address attempts use a staggered Happy Eyeballs race and remember the last
+successful address for the node.
+
 The cryptographic and protocol layers are implemented in this repository.
 Rust crates provide primitives (`argon2`, `aes-gcm`, `hmac`, `sha2`), age and
 ECH-TLS (`rustls`); no third-party Snell implementation is used.
@@ -277,3 +293,15 @@ This benchmark deliberately replaces ECH-TLS with loopback TCP and one static
 exporter value. It isolates Identity v2, Argon2id, Snell v4 framing/encryption,
 application I/O, and connection pooling. It does not measure DNS, TCP network
 RTT, TLS/ECH handshakes, SOCKS5 parsing, or remote-node performance.
+
+Run the Rust-only end-to-end loopback gateway matrix separately:
+
+```sh
+scripts/benchmark-rust-gateway.sh
+```
+
+It adds a new local TCP connection, SOCKS5 negotiation, the fixed-route
+gateway, relay tasks and optional performance tracing around every logical
+operation while retaining the authenticated Snell benchmark server. Set
+`TRACE_SAMPLE_EVERY=1` to quantify full trace overhead, or leave it unset to
+measure the default no-trace data path.

@@ -4,8 +4,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use oixc_proxy::gateway::Route;
+use oixc_proxy::perftrace;
 use oixc_proxy::snell::{SnellClient, SnellClientOptions, SnellDialer};
+use oixc_proxy::socks5::{self, Mode};
 use serde::Serialize;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
 const DEFAULT_SERVER: &str = "127.0.0.1:19090";
@@ -21,6 +26,8 @@ struct Options {
     payload_bytes: usize,
     application_chunk_bytes: usize,
     reuse: bool,
+    gateway: bool,
+    trace_sample_every: usize,
 }
 
 #[derive(Serialize)]
@@ -64,9 +71,15 @@ async fn main() -> Result<()> {
         dial_limit: None,
         dial_limit_timeout: Duration::from_secs(10),
     })?;
+    let gateway = if options.gateway {
+        Some(start_gateway(client.clone(), options.trace_sample_every).await?)
+    } else {
+        None
+    };
 
     run_operations(
         client.clone(),
+        gateway,
         options.warmup,
         options.concurrency,
         options.payload_bytes,
@@ -76,6 +89,7 @@ async fn main() -> Result<()> {
     let started = Instant::now();
     let mut latencies = run_operations(
         client.clone(),
+        gateway,
         options.requests,
         options.concurrency,
         options.payload_bytes,
@@ -97,7 +111,11 @@ async fn main() -> Result<()> {
         / latencies.len() as f64;
     let summary = Summary {
         implementation: "rust",
-        transport: "plain-tcp-static-exporter",
+        transport: if options.gateway {
+            "loopback-socks-snell"
+        } else {
+            "plain-tcp-static-exporter"
+        },
         reuse: options.reuse,
         requests: options.requests,
         warmup: options.warmup,
@@ -119,6 +137,7 @@ async fn main() -> Result<()> {
 
 async fn run_operations(
     client: SnellClient,
+    gateway: Option<SocketAddr>,
     count: usize,
     concurrency: usize,
     payload_bytes: usize,
@@ -144,7 +163,13 @@ async fn run_operations(
                 let started = Instant::now();
                 timeout(
                     Duration::from_secs(15),
-                    run_operation(&client, &payload, &mut response, application_chunk_bytes),
+                    run_operation(
+                        &client,
+                        gateway,
+                        &payload,
+                        &mut response,
+                        application_chunk_bytes,
+                    ),
                 )
                 .await
                 .map_err(|_| anyhow::anyhow!("benchmark operation timed out"))??;
@@ -165,10 +190,14 @@ async fn run_operations(
 
 async fn run_operation(
     client: &SnellClient,
+    gateway: Option<SocketAddr>,
     payload: &[u8],
     response: &mut [u8],
     application_chunk_bytes: usize,
 ) -> Result<()> {
+    if let Some(gateway) = gateway {
+        return run_gateway_operation(gateway, payload, response, application_chunk_bytes).await;
+    }
     let mut session = client.dial_tcp("echo.bench", 443).await?;
     for chunk in payload.chunks(application_chunk_bytes) {
         let written = session.write(chunk).await?;
@@ -188,6 +217,95 @@ async fn run_operation(
         bail!("benchmark echo mismatch");
     }
     session.finish(true, false).await;
+    Ok(())
+}
+
+async fn start_gateway(client: SnellClient, sample_every: usize) -> Result<SocketAddr> {
+    perftrace::configure(sample_every);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("bind benchmark SOCKS gateway")?;
+    let address = listener.local_addr()?;
+    let options = socks5::Options {
+        handshake_timeout: Duration::from_secs(10),
+        udp_idle_timeout: Duration::from_secs(30),
+        udp_bind_address: "127.0.0.1".parse().unwrap(),
+        mode: Mode::Fixed {
+            route: Route { client, udp: false },
+            credentials: None,
+        },
+    };
+    tokio::spawn(async move {
+        while let Ok((connection, _)) = listener.accept().await {
+            let options = options.clone();
+            tokio::spawn(async move {
+                let _ = perftrace::scope(socks5::serve_connection(connection, options)).await;
+            });
+        }
+    });
+    Ok(address)
+}
+
+async fn run_gateway_operation(
+    gateway: SocketAddr,
+    payload: &[u8],
+    response: &mut [u8],
+    application_chunk_bytes: usize,
+) -> Result<()> {
+    let mut stream = TcpStream::connect(gateway)
+        .await
+        .context("connect benchmark SOCKS gateway")?;
+    stream.write_all(&[5, 1, 0]).await?;
+    let mut method = [0u8; 2];
+    stream.read_exact(&mut method).await?;
+    if method != [5, 0] {
+        bail!("benchmark SOCKS method negotiation failed");
+    }
+
+    let host = b"echo.bench";
+    let mut request = Vec::with_capacity(7 + host.len());
+    request.extend_from_slice(&[5, 1, 0, 3, host.len() as u8]);
+    request.extend_from_slice(host);
+    request.extend_from_slice(&443u16.to_be_bytes());
+    stream.write_all(&request).await?;
+    read_socks_reply(&mut stream).await?;
+
+    for chunk in payload.chunks(application_chunk_bytes) {
+        stream.write_all(chunk).await?;
+    }
+    stream.shutdown().await?;
+    let mut offset = 0;
+    while offset < response.len() {
+        let read = stream.read(&mut response[offset..]).await?;
+        if read == 0 {
+            bail!("benchmark gateway closed before echo completed");
+        }
+        offset += read;
+    }
+    if response != payload {
+        bail!("benchmark gateway echo mismatch");
+    }
+    let mut trailing = [0u8; 1];
+    if stream.read(&mut trailing).await? != 0 {
+        bail!("benchmark gateway returned trailing data");
+    }
+    Ok(())
+}
+
+async fn read_socks_reply(stream: &mut TcpStream) -> Result<()> {
+    let mut header = [0u8; 4];
+    stream.read_exact(&mut header).await?;
+    if header[..3] != [5, 0, 0] {
+        bail!("benchmark SOCKS CONNECT failed");
+    }
+    let remaining = match header[3] {
+        1 => 6,
+        4 => 18,
+        3 => stream.read_u8().await? as usize + 2,
+        _ => bail!("benchmark SOCKS reply address is invalid"),
+    };
+    let mut discard = vec![0u8; remaining];
+    stream.read_exact(&mut discard).await?;
     Ok(())
 }
 
@@ -213,6 +331,8 @@ fn parse_options() -> Result<Options> {
         payload_bytes: 1_024,
         application_chunk_bytes: 0,
         reuse: true,
+        gateway: false,
+        trace_sample_every: 0,
     };
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
@@ -221,8 +341,13 @@ fn parse_options() -> Result<Options> {
                 print_help();
                 std::process::exit(0);
             }
-            "--reuse" => {
-                options.reuse = parse_bool(&required_value(&mut arguments, "--reuse")?)?;
+            "--reuse" | "--gateway" => {
+                let parsed = parse_bool(&required_value(&mut arguments, &argument)?)?;
+                if argument == "--reuse" {
+                    options.reuse = parsed;
+                } else {
+                    options.gateway = parsed;
+                }
                 continue;
             }
             _ => required_value(&mut arguments, &argument)?,
@@ -247,6 +372,9 @@ fn parse_options() -> Result<Options> {
             "--application-chunk-bytes" => {
                 options.application_chunk_bytes =
                     value.parse().context("parse --application-chunk-bytes")?
+            }
+            "--trace-sample-every" => {
+                options.trace_sample_every = value.parse().context("parse --trace-sample-every")?
             }
             _ => bail!("unknown option: {argument}"),
         }
@@ -275,7 +403,7 @@ fn parse_bool(value: &str) -> Result<bool> {
     match value {
         "true" => Ok(true),
         "false" => Ok(false),
-        _ => bail!("--reuse must be true or false"),
+        _ => bail!("boolean option must be true or false"),
     }
 }
 
@@ -284,6 +412,7 @@ fn print_help() {
         "Usage: snell-bench-client [--server 127.0.0.1:19090] \
          [--psk VALUE] [--exporter 64_HEX_CHARS] [--requests N] \
          [--warmup N] [--concurrency N] [--payload-bytes N] \
-         [--application-chunk-bytes N] [--reuse true|false]"
+         [--application-chunk-bytes N] [--reuse true|false] \
+         [--gateway true|false] [--trace-sample-every N]"
     );
 }

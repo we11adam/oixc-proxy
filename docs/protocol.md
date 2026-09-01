@@ -151,6 +151,13 @@ query   = lower(base32-no-pad(sig[0:32]))
 Cache valid A/AAAA results by normalized host for five minutes. DNS names are
 limited to 253 bytes and each label to 63 bytes.
 
+The runtime shares this cache across every node dialer and coalesces concurrent
+misses for the same host. A and AAAA queries start together; a completed family
+gets a short grace period for the other family so packet loss cannot consume
+the complete TCP/TLS dial deadline. Partial answers are cached for only 30
+seconds. Resolved addresses are interleaved by family and connected with a
+250 ms stagger, with the last successful address preferred on later dials.
+
 Known vector for `Node.Cloud-Nodes.Com.` at Unix `1800000000`:
 
 ```text
@@ -312,7 +319,9 @@ records, extra unread data or a missing zero retires the physical connection.
 
 Idle pools are per node. Defaults are 8 idle connections, 32 uses per physical
 connection and 90 seconds idle time. Only a complete, unchanged managed profile
-may retain its pool across a catalog refresh.
+may retain its pool across a catalog refresh. The normal service configuration
+can tune these limits and applies both process-wide and per-node fresh-dial
+budgets.
 
 ## Subscription catalog layer
 
