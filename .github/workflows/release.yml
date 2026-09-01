@@ -1,0 +1,154 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test release source
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: rustup toolchain install 1.85.0 --profile minimal
+
+      - name: Run tests
+        shell: bash
+        run: cargo +1.85.0 test --locked --all-features
+
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            install_musl: true
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            install_musl: true
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            install_musl: false
+          - runner: macos-26
+            target: aarch64-apple-darwin
+            install_musl: false
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
+          tag_version=${GITHUB_REF_NAME#v}
+          if [[ "$tag_version" != "$package_version" ]]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $package_version" >&2
+            exit 1
+          fi
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: rustup toolchain install 1.85.0 --profile minimal --target "${{ matrix.target }}"
+
+      - name: Install musl tools
+        if: matrix.install_musl
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+
+      - name: Build release binary
+        shell: bash
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo +1.85.0 build --locked --release --target "${{ matrix.target }}"
+
+      - name: Verify and package binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/oixc-proxy"
+          "$binary" version
+          file "$binary"
+          mkdir -p package
+          cp "$binary" package/oixc-proxy
+          chmod 0755 package/oixc-proxy
+          tar -C package -czf "oixc-proxy-${{ matrix.target }}.tar.gz" oixc-proxy
+
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: oixc-proxy-${{ matrix.target }}
+          path: oixc-proxy-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: Publish GitHub Release
+    needs:
+      - test
+      - build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out release files
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download packaged binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Prepare checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp install.sh dist/install.sh
+          chmod 0755 dist/install.sh
+          cd dist
+          for archive in oixc-proxy-*.tar.gz; do
+            [[ "$(tar -tzf "$archive")" == "oixc-proxy" ]]
+          done
+          sha256sum install.sh oixc-proxy-*.tar.gz > SHA256SUMS
+
+      - name: Create or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --verify-tag \
+              --generate-notes \
+              --title "oixc-proxy $GITHUB_REF_NAME"
+          fi

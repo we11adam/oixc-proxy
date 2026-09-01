@@ -11,6 +11,36 @@ binary name, commands, configuration, HTTP endpoints, Surge provider format,
 SOCKS5 routing credentials, control-plane authentication and Snell/ECH wire
 behavior are intentionally compatible.
 
+## Install a release
+
+GitHub Releases provide native macOS binaries and static musl Linux binaries
+for x86-64 and aarch64. With an authenticated GitHub CLI, download and inspect
+the installer, then run it:
+
+```sh
+gh release download --repo we11adam/oixc-proxy --pattern install.sh --clobber
+sh install.sh
+```
+
+For a public repository, the installer can instead be downloaded from
+`https://github.com/we11adam/oixc-proxy/releases/latest/download/install.sh`.
+Private repository assets require `gh`, authenticated by its existing login or
+a read-only `GH_TOKEN`/`GITHUB_TOKEN`.
+
+The installer detects the host target, verifies the archive against the
+release `SHA256SUMS`, checks the binary version and atomically installs
+`/usr/local/bin/oixc-proxy`. Install a fixed version or a user-writable path
+with:
+
+```sh
+sh install.sh --version v0.1.0
+sh install.sh --install-dir "$HOME/.local/bin"
+```
+
+It installs only the binary; it does not create a config, install a service or
+restart an existing process. Continue with the platform service instructions
+below or the complete [deployment guide](DEPLOY.md).
+
 ## Build
 
 Rust 1.85 or newer is required.
@@ -25,6 +55,13 @@ The optimized binary is `target/release/oixc-proxy`. Release builds use
 On aarch64 macOS and Linux, the repository build configuration enables the
 RustCrypto ARMv8 AES and PMULL backends. Those backends still detect CPU
 support at runtime and safely fall back when the extensions are unavailable.
+
+## Publish a release
+
+Set the package version in `Cargo.toml`, commit the release, then push a matching
+`vVERSION` tag. For example, package version `0.1.0` requires tag `v0.1.0`.
+The release workflow rejects mismatches, builds all four supported targets,
+generates `SHA256SUMS` and creates or updates the GitHub Release.
 
 ## Configure and run
 

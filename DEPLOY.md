@@ -10,9 +10,9 @@ procd 守护进程）。
 
 | 平台 | 运行方式 | 适用场景 | 二进制来源 |
 | --- | --- | --- | --- |
-| macOS | LaunchAgent 用户服务，登录后开机自启 | 本机代理 | `target/release/oixc-proxy` 本机构建 |
-| Linux | systemd 用户服务 | 本机 / 服务器代理 | 本机构建或交叉编译 |
-| OpenWrt（斐讯 N1） | procd 守护进程，断电自启 | 局域网共享、7×24 低功耗 | aarch64 musl 静态交叉编译 |
+| macOS | LaunchAgent 用户服务，登录后开机自启 | 本机代理 | GitHub Release 或 `target/release/oixc-proxy` 本机构建 |
+| Linux | systemd 用户服务 | 本机 / 服务器代理 | GitHub Release 静态产物或本机构建 |
+| OpenWrt（斐讯 N1） | procd 守护进程，断电自启 | 局域网共享、7×24 低功耗 | GitHub Release 或 aarch64 musl 静态交叉编译 |
 
 ---
 
@@ -21,7 +21,29 @@ procd 守护进程）。
 ### 前置条件
 
 - [ ] 有效的 oixCloud access token
-- [ ] 已编译好的 `oixc-proxy` 二进制（各平台要求见对应章节）
+- [ ] 可访问 GitHub Release，或已有匹配目标架构的 `oixc-proxy` 二进制
+
+### 安装 GitHub Release
+
+Release 提供 x86-64/aarch64 的 macOS 原生产物，以及对应架构的 Linux musl
+静态产物。安装脚本会自动识别平台和架构、验证 `SHA256SUMS`、检查版本并
+原子替换 `/usr/local/bin/oixc-proxy`：
+
+```sh
+gh release download --repo we11adam/oixc-proxy --pattern install.sh --clobber
+sh install.sh
+```
+
+私有仓库需要 `gh`，通过已有登录或具有仓库 Contents read 权限的
+`GH_TOKEN`/`GITHUB_TOKEN` 认证；公开仓库也可直接从
+`https://github.com/we11adam/oixc-proxy/releases/latest/download/install.sh`
+下载脚本。OpenWrt 没有 `gh` 时，先在已认证的控制机下载并校验对应资产，
+再通过 `scp -O` 传入设备。
+
+固定版本用 `sh install.sh --version v0.1.0`。OpenWrt 的 procd 配置默认使用
+`/usr/bin/oixc-proxy`，因此传入 `--install-dir /usr/bin`。脚本只安装二进制，
+不会创建配置、安装服务或重启现有进程；首次安装继续按对应平台章节操作，
+更新已有服务则在安装后按对应章节重启并检查健康端点。
 
 macOS / Linux 需要 Rust 工具链（1.85 或更新），`cargo --version` 可运行；
 未安装时用 [rustup](https://rustup.rs/)：
