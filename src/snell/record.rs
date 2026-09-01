@@ -71,7 +71,7 @@ impl<W: AsyncWrite + Unpin> RecordWriter<W> {
         Ok(frame)
     }
 
-    fn encode_frame_append(
+    pub(crate) fn encode_frame_append(
         &mut self,
         frame: &mut Vec<u8>,
         payload: &[u8],

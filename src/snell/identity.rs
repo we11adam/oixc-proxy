@@ -10,41 +10,58 @@ pub type Exporter = [u8; 32];
 pub type IdentityNonce = [u8; 16];
 type HmacSha256 = Hmac<Sha256>;
 
+pub(crate) struct IdentityV2Key {
+    identity: [u8; IDENTITY_COMPONENT_SIZE],
+    authentication_key: [u8; 32],
+}
+
+impl IdentityV2Key {
+    pub(crate) fn new(psk: &str) -> Result<Self> {
+        if psk.is_empty() {
+            bail!("PSK cannot be empty");
+        }
+        let root_label_hash = Sha256::digest(IDENTITY_V2_ROOT_LABEL);
+        let root = hmac_sha256(&root_label_hash, psk.as_bytes());
+        let identity_key = derive_key(&root, b"identity");
+        let authentication_key = derive_key(&root, b"authentication");
+        let mut identity = [0u8; IDENTITY_COMPONENT_SIZE];
+        identity.copy_from_slice(&identity_key[..IDENTITY_COMPONENT_SIZE]);
+        Ok(Self {
+            identity,
+            authentication_key,
+        })
+    }
+
+    pub(crate) fn build(&self, exporter: &Exporter, nonce: &IdentityNonce) -> [u8; 56] {
+        let mut context = [0u8; 8 + 32 + 16 + 16];
+        context[..8].copy_from_slice(IDENTITY_V2_MAGIC);
+        context[8..40].copy_from_slice(exporter);
+        context[40..56].copy_from_slice(nonce);
+        context[56..].copy_from_slice(&self.identity);
+        let authentication = hmac_sha256(&self.authentication_key, &context);
+
+        let mut result = [0u8; 56];
+        result[..16].copy_from_slice(nonce);
+        result[16..24].copy_from_slice(IDENTITY_V2_MAGIC);
+        result[24..40].copy_from_slice(&self.identity);
+        result[40..].copy_from_slice(&authentication[..IDENTITY_COMPONENT_SIZE]);
+        result
+    }
+}
+
 pub fn build_identity_v2(
     psk: &str,
     exporter: &Exporter,
     nonce: &IdentityNonce,
 ) -> Result<[u8; 56]> {
-    if psk.is_empty() {
-        bail!("PSK cannot be empty");
-    }
-
-    let root_label_hash = Sha256::digest(IDENTITY_V2_ROOT_LABEL);
-    let root = hmac_sha256(&root_label_hash, psk.as_bytes());
-    let identity_key = derive_key(&root, b"identity");
-    let authentication_key = derive_key(&root, b"authentication");
-    let identity = &identity_key[..IDENTITY_COMPONENT_SIZE];
-
-    let mut context = Vec::with_capacity(8 + 32 + 16 + 16);
-    context.extend_from_slice(IDENTITY_V2_MAGIC);
-    context.extend_from_slice(exporter);
-    context.extend_from_slice(nonce);
-    context.extend_from_slice(identity);
-    let authentication = hmac_sha256(&authentication_key, &context);
-
-    let mut result = [0u8; 56];
-    result[..16].copy_from_slice(nonce);
-    result[16..24].copy_from_slice(IDENTITY_V2_MAGIC);
-    result[24..40].copy_from_slice(identity);
-    result[40..].copy_from_slice(&authentication[..IDENTITY_COMPONENT_SIZE]);
-    Ok(result)
+    Ok(IdentityV2Key::new(psk)?.build(exporter, nonce))
 }
 
 fn derive_key(root: &[u8], label: &[u8]) -> [u8; 32] {
-    let mut message = Vec::with_capacity(label.len() + 1);
-    message.extend_from_slice(label);
-    message.push(1);
-    hmac_sha256(root, &message)
+    let mut mac = HmacSha256::new_from_slice(root).expect("HMAC accepts every key length");
+    mac.update(label);
+    mac.update(&[1]);
+    mac.finalize().into_bytes().into()
 }
 
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {

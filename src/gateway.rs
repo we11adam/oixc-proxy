@@ -13,7 +13,7 @@ use crate::config::RuntimeConfig;
 use crate::nodes::Proxy;
 use crate::snell::{SnellClient, SnellClientOptions};
 use crate::surge::{ProviderProtocol, node_selector, render_provider};
-use crate::transport::EchDialer;
+use crate::transport::{EchDialer, TransportContext};
 
 pub const PROVIDER_PATH: &str = "/surge-proxies.conf";
 pub const CLASH_PROVIDER_PATH: &str = "/clash-proxies.yaml";
@@ -51,27 +51,53 @@ pub struct GatewayManager {
     router: RwLock<Option<Arc<Router>>>,
 }
 
+pub struct GatewayContext {
+    outbound_ip: IpAddr,
+    routing_secret: String,
+    dial_limit: Arc<Semaphore>,
+    transport: Arc<TransportContext>,
+}
+
+impl GatewayContext {
+    pub fn new(
+        outbound_ip: IpAddr,
+        routing_secret: String,
+        dial_limit: Arc<Semaphore>,
+        transport: Arc<TransportContext>,
+    ) -> Self {
+        Self {
+            outbound_ip,
+            routing_secret,
+            dial_limit,
+            transport,
+        }
+    }
+}
+
 impl Router {
     pub fn build(
         proxies: &[Proxy],
         published: &[Proxy],
         runtime: &RuntimeConfig,
-        outbound_ip: IpAddr,
-        routing_secret: &str,
-        dial_limit: Arc<Semaphore>,
+        context: &GatewayContext,
         previous: Option<&Router>,
     ) -> Result<Self> {
-        let listen_address = outbound_ip.to_string();
+        let listen_address = context.outbound_ip.to_string();
         let filtered = render_provider_docs(
             published,
             &listen_address,
             runtime.serve_port,
-            routing_secret,
+            &context.routing_secret,
         )?;
         let all = if same_proxy_list(proxies, published) {
             filtered.clone()
         } else {
-            render_provider_docs(proxies, &listen_address, runtime.serve_port, routing_secret)?
+            render_provider_docs(
+                proxies,
+                &listen_address,
+                runtime.serve_port,
+                &context.routing_secret,
+            )?
         };
         let mut routes = HashMap::with_capacity(proxies.len());
         let mut runtimes = HashMap::with_capacity(proxies.len());
@@ -82,20 +108,27 @@ impl Router {
             {
                 existing.clone()
             } else {
-                let dialer = EchDialer::new(proxy, runtime.request_timeout)?;
-                let client = SnellClient::new(SnellClientOptions {
-                    node_name: proxy.name.clone(),
-                    psk: proxy.psk.clone(),
-                    reuse: proxy.reuse,
-                    max_idle: runtime.reuse_max_idle,
-                    max_uses: runtime.reuse_max_uses,
-                    idle_timeout: runtime.reuse_idle_timeout,
-                    handshake_timeout: runtime.request_timeout,
-                    close_timeout: Duration::from_secs(2),
-                    dialer: dialer.into(),
-                    dial_limit: Some(dial_limit.clone()),
-                    dial_limit_timeout: runtime.request_timeout.max(Duration::from_secs(45)),
-                })?;
+                let dialer = EchDialer::new_with_context(
+                    proxy,
+                    runtime.request_timeout,
+                    context.transport.clone(),
+                )?;
+                let client = SnellClient::new_with_node_dial_limit(
+                    SnellClientOptions {
+                        node_name: proxy.name.clone(),
+                        psk: proxy.psk.clone(),
+                        reuse: proxy.reuse,
+                        max_idle: runtime.reuse_max_idle,
+                        max_uses: runtime.reuse_max_uses,
+                        idle_timeout: runtime.reuse_idle_timeout,
+                        handshake_timeout: runtime.request_timeout,
+                        close_timeout: Duration::from_secs(2),
+                        dialer: dialer.into(),
+                        dial_limit: Some(context.dial_limit.clone()),
+                        dial_limit_timeout: runtime.request_timeout.max(Duration::from_secs(45)),
+                    },
+                    Some(Arc::new(Semaphore::new(runtime.per_node_dial_concurrency))),
+                )?;
                 Arc::new(NodeRuntime {
                     proxy: proxy.clone(),
                     route: Route {
@@ -118,7 +151,7 @@ impl Router {
             runtimes,
             filtered,
             all,
-            routing_secret: routing_secret.to_owned(),
+            routing_secret: context.routing_secret.clone(),
         })
     }
 

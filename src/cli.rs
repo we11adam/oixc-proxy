@@ -14,14 +14,15 @@ use crate::api::Client as ApiClient;
 use crate::catalog_cache::CatalogCache;
 use crate::config::{RuntimeConfig, default_proxy_config_path, load_proxy_config, load_token_file};
 use crate::gateway::{
-    CLASH_PROVIDER_PATH, GatewayManager, PROVIDER_PATH, Route, Router, derive_routing_secret,
+    CLASH_PROVIDER_PATH, GatewayContext, GatewayManager, PROVIDER_PATH, Route, Router,
+    derive_routing_secret,
 };
 use crate::http_server;
 use crate::nodes::{ManagedConfig, Proxy};
 use crate::rlimit;
 use crate::snell::{SnellClient, SnellClientOptions};
 use crate::socks5::{self, Credentials, Mode};
-use crate::transport::EchDialer;
+use crate::transport::{EchDialer, TransportContext};
 
 const USAGE: &str = "Usage:
   oixc-proxy information [--config PATH] --output PATH
@@ -123,6 +124,7 @@ async fn run_serve(args: &[String]) -> Result<()> {
     let config_path = flag_path(&flags, "config", &default);
     let disable_node_filter = flags.contains_key("disable-node-filter");
     let service = load_proxy_config(&config_path)?;
+    crate::perftrace::configure(service.runtime.perf_trace_sample_every);
     let cache = CatalogCache::beside_config(&config_path);
     let (mut managed, from_cache) = if let Some(cached) = cache.load() {
         (cached, true)
@@ -133,14 +135,15 @@ async fn run_serve(args: &[String]) -> Result<()> {
     };
     let published = published_proxies(&managed, disable_node_filter)?;
     let routing_secret = derive_routing_secret(&service.runtime.access_token)?;
-    let dial_limit = Arc::new(Semaphore::new(32));
+    let transport = Arc::new(TransportContext::built_in()?);
+    let dial_limit = Arc::new(Semaphore::new(service.runtime.dial_concurrency));
+    let gateway_context =
+        GatewayContext::new(service.outbound_ip, routing_secret, dial_limit, transport);
     let router = Router::build(
         &managed.proxies,
         &published,
         &service.runtime,
-        service.outbound_ip,
-        &routing_secret,
-        dial_limit.clone(),
+        &gateway_context,
         None,
     )?;
     let manager = Arc::new(GatewayManager::new(router));
@@ -164,6 +167,7 @@ async fn run_serve(args: &[String]) -> Result<()> {
         println!("Started from cached catalog; refreshing in background");
     }
 
+    let connection_limit = Arc::new(Semaphore::new(service.runtime.max_client_connections));
     let mut socks_task = tokio::spawn(serve_socks_listener(
         socks_listener,
         socks5::Options {
@@ -172,7 +176,7 @@ async fn run_serve(args: &[String]) -> Result<()> {
             udp_bind_address: service.outbound_ip,
             mode: Mode::Dynamic(manager.clone()),
         },
-        service.runtime.max_client_connections,
+        connection_limit,
     ));
     let mut http_task = tokio::spawn(http_server::serve(nodelist_listener, manager.clone()));
     let mut refresh = tokio::time::interval(service.node_refresh_interval);
@@ -210,9 +214,7 @@ async fn run_serve(args: &[String]) -> Result<()> {
                     &refreshed.proxies,
                     &published,
                     &service.runtime,
-                    service.outbound_ip,
-                    &routing_secret,
-                    dial_limit.clone(),
+                    &gateway_context,
                     Some(previous.as_ref()),
                 ) {
                     Ok(value) => value,
@@ -259,6 +261,7 @@ async fn run_serve_map(args: &[String]) -> Result<()> {
         return Err(UsageError("--token-file cannot be empty".to_owned()).into());
     }
     let mut runtime = load_token_file(&token_file)?;
+    crate::perftrace::configure(runtime.perf_trace_sample_every);
     let listen: IpAddr = flags
         .get("listen")
         .and_then(|value| value.as_ref())
@@ -286,6 +289,9 @@ async fn run_serve_map(args: &[String]) -> Result<()> {
         bail!("SOCKS5 map port range exceeds 65535");
     }
 
+    let transport = Arc::new(TransportContext::built_in()?);
+    let dial_limit = Arc::new(Semaphore::new(runtime.dial_concurrency));
+    let connection_limit = Arc::new(Semaphore::new(runtime.max_client_connections));
     let mut listeners = Vec::with_capacity(managed.proxies.len());
     let mut routes = Vec::with_capacity(managed.proxies.len());
     for (index, proxy) in managed.proxies.iter().enumerate() {
@@ -295,7 +301,12 @@ async fn run_serve_map(args: &[String]) -> Result<()> {
                 .await
                 .with_context(|| format!("listen on local SOCKS5 map port {port}"))?,
         );
-        routes.push(build_fixed_route(proxy, &runtime)?);
+        routes.push(build_fixed_route(
+            proxy,
+            &runtime,
+            transport.clone(),
+            dial_limit.clone(),
+        )?);
     }
     let credentials = if runtime.socks_username.is_empty() {
         None
@@ -315,6 +326,7 @@ async fn run_serve_map(args: &[String]) -> Result<()> {
     let (error_tx, mut error_rx) = tokio::sync::mpsc::channel(1);
     for (listener, route) in listeners.into_iter().zip(routes) {
         let sender = error_tx.clone();
+        let connection_limit = connection_limit.clone();
         let options = socks5::Options {
             handshake_timeout: runtime.request_timeout,
             udp_idle_timeout: runtime.udp_idle_timeout,
@@ -325,8 +337,7 @@ async fn run_serve_map(args: &[String]) -> Result<()> {
             },
         };
         tokio::spawn(async move {
-            let error =
-                serve_socks_listener(listener, options, runtime.max_client_connections).await;
+            let error = serve_socks_listener(listener, options, connection_limit).await;
             let _ = sender.send(error).await;
         });
     }
@@ -340,19 +351,18 @@ async fn run_serve_map(args: &[String]) -> Result<()> {
 async fn serve_socks_listener(
     listener: TcpListener,
     options: socks5::Options,
-    max_connections: usize,
+    slots: Arc<Semaphore>,
 ) -> Result<()> {
-    let slots = Arc::new(Semaphore::new(max_connections));
     loop {
+        let (connection, _) = listener
+            .accept()
+            .await
+            .map_err(|_| anyhow::anyhow!("accept local SOCKS5 connection"))?;
         let permit = slots
             .clone()
             .acquire_owned()
             .await
             .map_err(|_| anyhow::anyhow!("SOCKS5 connection limiter is closed"))?;
-        let (connection, _) = listener
-            .accept()
-            .await
-            .map_err(|_| anyhow::anyhow!("accept local SOCKS5 connection"))?;
         let options = options.clone();
         tokio::spawn(async move {
             let _permit = permit;
@@ -361,22 +371,30 @@ async fn serve_socks_listener(
     }
 }
 
-fn build_fixed_route(proxy: &Proxy, runtime: &RuntimeConfig) -> Result<Route> {
-    let dialer = EchDialer::new(proxy, runtime.request_timeout)?;
+fn build_fixed_route(
+    proxy: &Proxy,
+    runtime: &RuntimeConfig,
+    transport: Arc<TransportContext>,
+    dial_limit: Arc<Semaphore>,
+) -> Result<Route> {
+    let dialer = EchDialer::new_with_context(proxy, runtime.request_timeout, transport)?;
     Ok(Route {
-        client: SnellClient::new(SnellClientOptions {
-            node_name: proxy.name.clone(),
-            psk: proxy.psk.clone(),
-            reuse: proxy.reuse,
-            max_idle: runtime.reuse_max_idle,
-            max_uses: runtime.reuse_max_uses,
-            idle_timeout: runtime.reuse_idle_timeout,
-            handshake_timeout: runtime.request_timeout,
-            close_timeout: Duration::from_secs(2),
-            dialer: dialer.into(),
-            dial_limit: None,
-            dial_limit_timeout: runtime.request_timeout,
-        })?,
+        client: SnellClient::new_with_node_dial_limit(
+            SnellClientOptions {
+                node_name: proxy.name.clone(),
+                psk: proxy.psk.clone(),
+                reuse: proxy.reuse,
+                max_idle: runtime.reuse_max_idle,
+                max_uses: runtime.reuse_max_uses,
+                idle_timeout: runtime.reuse_idle_timeout,
+                handshake_timeout: runtime.request_timeout,
+                close_timeout: Duration::from_secs(2),
+                dialer: dialer.into(),
+                dial_limit: Some(dial_limit),
+                dial_limit_timeout: runtime.request_timeout,
+            },
+            Some(Arc::new(Semaphore::new(runtime.per_node_dial_concurrency))),
+        )?,
         udp: proxy.udp,
     })
 }

@@ -29,9 +29,12 @@ pub struct RuntimeConfig {
     pub socks_username: String,
     pub socks_password: String,
     pub max_client_connections: usize,
+    pub dial_concurrency: usize,
+    pub per_node_dial_concurrency: usize,
     pub reuse_max_idle: usize,
     pub reuse_max_uses: usize,
     pub reuse_idle_timeout: Duration,
+    pub perf_trace_sample_every: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -59,9 +62,12 @@ struct FileConfig {
     socks_username: String,
     socks_password_file: String,
     max_client_connections: usize,
+    dial_concurrency: usize,
+    per_node_dial_concurrency: usize,
     reuse_max_idle: usize,
     reuse_max_uses: usize,
     reuse_idle_timeout: String,
+    perf_trace_sample_every: usize,
     allow_insecure_file_permissions: bool,
 }
 
@@ -112,6 +118,20 @@ pub fn load_proxy_config(path: &Path) -> Result<ProxyConfig> {
             access_token: token,
             listen_address: "127.0.0.1".to_owned(),
             serve_port: listen.port(),
+            request_timeout: config_string(&values, "request-timeout"),
+            udp_idle_timeout: config_string(&values, "udp-idle-timeout"),
+            max_client_connections: config_usize(&values, "max-client-connections", 1, 4096)?,
+            dial_concurrency: config_usize(&values, "dial-concurrency", 1, 1024)?,
+            per_node_dial_concurrency: config_usize(&values, "per-node-dial-concurrency", 1, 128)?,
+            reuse_max_idle: config_usize(&values, "reuse-max-idle", 1, 128)?,
+            reuse_max_uses: config_usize(&values, "reuse-max-uses", 1, 1024)?,
+            reuse_idle_timeout: config_string(&values, "reuse-idle-timeout"),
+            perf_trace_sample_every: config_usize(
+                &values,
+                "perf-trace-sample-every",
+                0,
+                1_000_000,
+            )?,
             ..FileConfig::default()
         },
     )?;
@@ -253,9 +273,23 @@ fn runtime_from_raw(config_dir: &Path, raw: FileConfig) -> Result<RuntimeConfig>
             1,
             4096,
         )?,
+        dial_concurrency: bounded_or_default("dialConcurrency", raw.dial_concurrency, 32, 1, 1024)?,
+        per_node_dial_concurrency: bounded_or_default(
+            "perNodeDialConcurrency",
+            raw.per_node_dial_concurrency,
+            8,
+            1,
+            128,
+        )?,
         reuse_max_idle: bounded_or_default("reuseMaxIdle", raw.reuse_max_idle, 8, 1, 128)?,
         reuse_max_uses: bounded_or_default("reuseMaxUses", raw.reuse_max_uses, 32, 1, 1024)?,
         reuse_idle_timeout,
+        perf_trace_sample_every: bounded_value(
+            "perfTraceSampleEvery",
+            raw.perf_trace_sample_every,
+            0,
+            1_000_000,
+        )?,
     })
 }
 
@@ -268,8 +302,17 @@ fn parse_proxy_config(content: &[u8]) -> Result<HashMap<String, String>> {
         "nodelist-listen",
         "outbound-ip",
         "node-refresh-interval",
+        "request-timeout",
+        "udp-idle-timeout",
+        "max-client-connections",
+        "dial-concurrency",
+        "per-node-dial-concurrency",
+        "reuse-max-idle",
+        "reuse-max-uses",
+        "reuse-idle-timeout",
+        "perf-trace-sample-every",
     ];
-    let mut values = HashMap::with_capacity(6);
+    let mut values = HashMap::with_capacity(16);
     for (index, original) in text.lines().enumerate() {
         let line_number = index + 1;
         let line = original.trim();
@@ -292,6 +335,28 @@ fn parse_proxy_config(content: &[u8]) -> Result<HashMap<String, String>> {
         }
     }
     Ok(values)
+}
+
+fn config_string(values: &HashMap<String, String>, name: &str) -> String {
+    values.get(name).cloned().unwrap_or_default()
+}
+
+fn config_usize(
+    values: &HashMap<String, String>,
+    name: &str,
+    minimum: usize,
+    maximum: usize,
+) -> Result<usize> {
+    let Some(value) = values.get(name) else {
+        return Ok(0);
+    };
+    let parsed = value
+        .parse::<usize>()
+        .with_context(|| format!("parse {name}"))?;
+    if parsed < minimum || parsed > maximum {
+        bail!("{name} must be between {minimum} and {maximum}");
+    }
+    Ok(parsed)
 }
 
 fn listen_value(values: &HashMap<String, String>) -> Result<Option<&str>> {
@@ -442,6 +507,13 @@ fn bounded_or_default(
     Ok(value)
 }
 
+fn bounded_value(name: &str, value: usize, minimum: usize, maximum: usize) -> Result<usize> {
+    if value < minimum || value > maximum {
+        bail!("{name} must be between {minimum} and {maximum}");
+    }
+    Ok(value)
+}
+
 fn nonzero_or(value: u16, default: u16) -> u16 {
     if value == 0 { default } else { value }
 }
@@ -517,5 +589,65 @@ mod tests {
             parse_go_duration("250ms").unwrap(),
             Duration::from_millis(250)
         );
+    }
+
+    #[test]
+    fn runtime_performance_settings_are_validated() {
+        let runtime = runtime_from_raw(
+            Path::new(""),
+            FileConfig {
+                access_token: "token".to_owned(),
+                dial_concurrency: 64,
+                per_node_dial_concurrency: 4,
+                reuse_max_idle: 16,
+                reuse_max_uses: 128,
+                reuse_idle_timeout: "2m".to_owned(),
+                perf_trace_sample_every: 1000,
+                ..FileConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(runtime.dial_concurrency, 64);
+        assert_eq!(runtime.per_node_dial_concurrency, 4);
+        assert_eq!(runtime.reuse_max_idle, 16);
+        assert_eq!(runtime.reuse_max_uses, 128);
+        assert_eq!(runtime.reuse_idle_timeout, Duration::from_secs(120));
+        assert_eq!(runtime.perf_trace_sample_every, 1000);
+    }
+
+    #[test]
+    fn proxy_config_maps_performance_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oixc-proxy.conf");
+        fs::write(
+            &path,
+            concat!(
+                "token=token\n",
+                "request-timeout=20s\n",
+                "max-client-connections=512\n",
+                "dial-concurrency=64\n",
+                "per-node-dial-concurrency=4\n",
+                "reuse-max-idle=16\n",
+                "reuse-max-uses=128\n",
+                "reuse-idle-timeout=2m\n",
+                "perf-trace-sample-every=1000\n",
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let config = load_proxy_config(&path).unwrap();
+        assert_eq!(config.runtime.request_timeout, Duration::from_secs(20));
+        assert_eq!(config.runtime.max_client_connections, 512);
+        assert_eq!(config.runtime.dial_concurrency, 64);
+        assert_eq!(config.runtime.per_node_dial_concurrency, 4);
+        assert_eq!(config.runtime.reuse_max_idle, 16);
+        assert_eq!(config.runtime.reuse_max_uses, 128);
+        assert_eq!(config.runtime.reuse_idle_timeout, Duration::from_secs(120));
+        assert_eq!(config.runtime.perf_trace_sample_every, 1000);
     }
 }

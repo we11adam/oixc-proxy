@@ -16,7 +16,7 @@ use crate::transport::EchDialer;
 
 use super::record::{RecordKind, ZeroRecord};
 use super::{
-    Exporter, RecordReader, RecordWriter, build_connect_request, build_identity_v2,
+    Exporter, IdentityV2Key, RecordReader, RecordWriter, build_connect_request,
     build_udp_associate_request, decode_udp_response, encode_udp_request,
 };
 
@@ -197,6 +197,8 @@ pub struct SnellClientOptions {
 
 struct ClientInner {
     options: SnellClientOptions,
+    identity: IdentityV2Key,
+    node_dial_limit: Option<Arc<Semaphore>>,
     idle: Mutex<Vec<IdleConnection>>,
     closed: AtomicBool,
 }
@@ -251,6 +253,13 @@ struct PacketWriter {
 
 impl SnellClient {
     pub fn new(options: SnellClientOptions) -> Result<Self> {
+        Self::new_with_node_dial_limit(options, None)
+    }
+
+    pub(crate) fn new_with_node_dial_limit(
+        options: SnellClientOptions,
+        node_dial_limit: Option<Arc<Semaphore>>,
+    ) -> Result<Self> {
         if options.psk.is_empty() {
             bail!("Snell PSK and transport dialer are required");
         }
@@ -273,9 +282,12 @@ impl SnellClient {
                 bail!("Snell reuse idle timeout is invalid");
             }
         }
+        let identity = IdentityV2Key::new(&options.psk)?;
         Ok(Self {
             inner: Arc::new(ClientInner {
                 options,
+                identity,
+                node_dial_limit,
                 idle: Mutex::new(Vec::new()),
                 closed: AtomicBool::new(false),
             }),
@@ -345,16 +357,22 @@ impl SnellClient {
     }
 
     async fn open_command(&self, request: &[u8], defer_reply: bool) -> Result<PhysicalConnection> {
-        let _permit = if let Some(limit) = &self.inner.options.dial_limit {
-            Some(
-                timeout(self.inner.options.dial_limit_timeout, limit.acquire())
-                    .await
-                    .map_err(|_| anyhow::anyhow!("ECH-TLS node connection timed out"))?
-                    .map_err(|_| anyhow::anyhow!("ECH dial concurrency limiter is closed"))?,
-            )
-        } else {
-            None
-        };
+        let _permits = timeout(self.inner.options.dial_limit_timeout, async {
+            let node = if let Some(limit) = &self.inner.node_dial_limit {
+                Some(limit.acquire().await?)
+            } else {
+                None
+            };
+            let global = if let Some(limit) = &self.inner.options.dial_limit {
+                Some(limit.acquire().await?)
+            } else {
+                None
+            };
+            Ok::<_, tokio::sync::AcquireError>((node, global))
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("ECH-TLS node connection timed out"))?
+        .map_err(|_| anyhow::anyhow!("ECH dial concurrency limiter is closed"))?;
         let connection = self.inner.options.dialer.dial().await?;
         let open_started = Instant::now();
         let local_addr = connection
@@ -366,29 +384,30 @@ impl SnellClient {
         let mut nonce = [0u8; 16];
         getrandom::fill(&mut nonce)
             .map_err(|_| anyhow::anyhow!("generate Snell identity nonce"))?;
-        let identity = build_identity_v2(&self.inner.options.psk, &exporter, &nonce)?;
+        let identity = self.inner.identity.build(&exporter, &nonce);
         let mut writer = RecordWriter::new(write_half, &self.inner.options.psk, nonce)?;
         // Identity v2 carries the record salt. The first record must therefore
         // omit the ordinary salt prefix.
         writer.mark_salt_sent();
         let padding_length = initial_padding_length(request.len())?;
-        let frame = writer
-            .encode_frame(request, padding_length)
-            .context("encode Snell CONNECT request")?;
-        let mut initial_flight = Vec::with_capacity(identity.len() + frame.len());
+        let mut initial_flight = Vec::with_capacity(identity.len() + INITIAL_FRAME_BUDGET + 64);
         initial_flight.extend_from_slice(&identity);
-        initial_flight.extend_from_slice(&frame);
+        writer
+            .encode_frame_append(&mut initial_flight, request, padding_length)
+            .context("encode Snell CONNECT request")?;
         writer.write_raw_all(&initial_flight).await?;
-        crate::perftrace::stage(
-            "snell.initial_flight",
-            open_started,
-            true,
-            &[
-                ("identity_bytes", identity.len().to_string()),
-                ("payload_bytes", request.len().to_string()),
-                ("padding_bytes", padding_length.to_string()),
-            ],
-        );
+        if crate::perftrace::enabled() {
+            crate::perftrace::stage(
+                "snell.initial_flight",
+                open_started,
+                true,
+                &[
+                    ("identity_bytes", identity.len().to_string()),
+                    ("payload_bytes", request.len().to_string()),
+                    ("padding_bytes", padding_length.to_string()),
+                ],
+            );
+        }
 
         let mut physical = PhysicalConnection {
             reader: SnellReader {

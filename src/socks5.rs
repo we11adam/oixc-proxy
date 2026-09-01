@@ -19,6 +19,7 @@ const METHOD_USERNAME_PASSWORD: u8 = 2;
 const METHOD_UNAVAILABLE: u8 = 0xff;
 const COMMAND_CONNECT: u8 = 1;
 const COMMAND_UDP_ASSOCIATE: u8 = 3;
+const DOWNLOAD_BUFFER_SIZE: usize = (1 << 14) - 1;
 
 #[derive(Clone)]
 pub enum Mode {
@@ -283,14 +284,15 @@ pub(crate) async fn relay(client: TcpStream, mut session: SnellSession) -> Resul
     let close_timeout = session.close_timeout();
     let (clean, close_write_sent) = {
         let (remote_read, remote_write) = session.split();
-        let mut upload = Box::pin(upload(client_read, remote_write));
-        let mut download = Box::pin(download(client_write, remote_read));
+        let upload = upload(client_read, remote_write);
+        let download = download(client_write, remote_read);
+        tokio::pin!(upload, download);
         let mut close_write_sent = false;
         let clean = tokio::select! {
             upload_result = &mut upload => {
                 close_write_sent = upload_result.is_ok();
                 if upload_result.is_ok() {
-                    timeout(close_timeout, download)
+                    timeout(close_timeout, &mut download)
                         .await
                         .is_ok_and(|result| result.is_ok())
                 } else {
@@ -323,7 +325,9 @@ async fn upload(mut client: OwnedReadHalf, mut session: SnellSessionWriter<'_>) 
             return Ok(());
         }
         if first_data {
-            crate::perftrace::event("socks.first_client_data", &[("bytes", read.to_string())]);
+            if crate::perftrace::enabled() {
+                crate::perftrace::event("socks.first_client_data", &[("bytes", read.to_string())]);
+            }
             first_data = false;
         }
         session.write(&buffer[..read]).await?;
@@ -331,7 +335,7 @@ async fn upload(mut client: OwnedReadHalf, mut session: SnellSessionWriter<'_>) 
 }
 
 async fn download(mut client: OwnedWriteHalf, mut session: SnellSessionReader<'_>) -> Result<()> {
-    let mut buffer = vec![0u8; 32 << 10];
+    let mut buffer = vec![0u8; DOWNLOAD_BUFFER_SIZE];
     let mut first_data = true;
     loop {
         let read = session.read(&mut buffer).await?;
@@ -340,7 +344,12 @@ async fn download(mut client: OwnedWriteHalf, mut session: SnellSessionReader<'_
             return Ok(());
         }
         if first_data {
-            crate::perftrace::event("socks.first_upstream_data", &[("bytes", read.to_string())]);
+            if crate::perftrace::enabled() {
+                crate::perftrace::event(
+                    "socks.first_upstream_data",
+                    &[("bytes", read.to_string())],
+                );
+            }
             first_data = false;
         }
         client.write_all(&buffer[..read]).await?;
