@@ -91,8 +91,8 @@ token=YOUR_OIXCLOUD_ACCESS_TOKEN
 | `listen` | 否 | `127.0.0.1:6172` | Mixed HTTP/SOCKS5 监听地址 |
 | `nodelist-listen` | 否 | `127.0.0.1:6173` | HTTP nodelist 监听地址 |
 | `outbound-ip` | 条件 | 同 socks5 IP | listen 为 `0.0.0.0` 时**必填**；写入 provider、用于 UDP，并以非回环地址固定上游物理出口 |
-| `udp-port-range` | 条件 | 动态端口 | 远程 SOCKS5 UDP relay 的固定端口范围，如 `10000-10099` |
-| `udp-advertise-address` | 条件 | UDP 绑定 IP | SOCKS5 UDP 响应中返回的客户端可达 IP；必须与端口范围同时配置 |
+| `udp-port-range` | 条件 | 未设置（系统动态分配） | 远程 SOCKS5 UDP relay 的固定端口范围，如 `10000-10099` |
+| `udp-advertise-address` | 条件 | 未设置（沿用绑定 IP） | SOCKS5 UDP 响应中返回的客户端可达 IP；必须与端口范围同时配置 |
 | `node-refresh-interval` | 否 | `1h` | 节点目录刷新周期，范围 `1m` ~ `24h` |
 | `request-timeout` | 否 | `15s` | 控制面与节点操作超时，最大 `2m` |
 | `udp-idle-timeout` | 否 | `5m` | SOCKS5 UDP association 空闲超时 |
@@ -126,6 +126,8 @@ node-refresh-interval=1h
   防火墙对话框，选择**允许**；之后可在系统设置 → 网络 → 防火墙 → 选项
   中调整。
 - Linux：需在系统防火墙放行 6172/6173 TCP；启用远程 SOCKS5 UDP 时还要放行配置的 UDP 端口范围（`firewalld` / `ufw`）。
+
+`udp-port-range` 与 `udp-advertise-address` 没有静态默认值，必须同时配置或同时省略。两项都省略时使用系统动态 UDP 端口并沿用实际绑定 IP；只设置一项会启动失败。动态端口模式适合本机回环使用，远程监听不会在 provider 中宣告 UDP。需要局域网、NAT 或防火墙后的客户端使用 UDP 时，应显式配置固定范围与客户端可达的宣告地址。
 
 默认回环部署会自动选择活动的非虚拟物理接口。macOS 会把控制面、私有 DNS 和 ECH-TLS 套接字绑定到该接口，以避开 Surge Enhanced Mode 的虚拟隧道；Linux 使用所选接口的源地址，不依赖 `SO_BINDTODEVICE` 权限。网络切换后程序会在下一次拨号时清理旧 DNS 结果和空闲复用连接。若配置了非回环 `outbound-ip`，请确保它确实属于当前活动网卡；该地址消失时程序不会回退到其他出口。
 

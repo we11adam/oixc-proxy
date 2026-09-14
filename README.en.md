@@ -162,8 +162,8 @@ The file must be a regular file with Unix mode `0600` or stricter.
 | `listen` | No | `127.0.0.1:6172` | Mixed HTTP/SOCKS5 numeric IP and port |
 | `nodelist-listen` | No | `127.0.0.1:6173` | HTTP numeric IP and port |
 | `outbound-ip` | Conditional | SOCKS5 bind IP | Provider/UDP address; a non-loopback value also pins control-plane and node connections to that physical source IP |
-| `udp-port-range` | Conditional | Dynamic port | Fixed SOCKS5 UDP relay range as `START-END`, limited to 4096 ports |
-| `udp-advertise-address` | Conditional | UDP bind IP | Client-reachable address returned by SOCKS5 UDP ASSOCIATE |
+| `udp-port-range` | Conditional | Unset (OS-assigned port) | Fixed SOCKS5 UDP relay range as `START-END`, limited to 4096 ports |
+| `udp-advertise-address` | Conditional | Unset (bound IP) | Client-reachable address returned by SOCKS5 UDP ASSOCIATE |
 | `node-refresh-interval` | No | `1h` | Catalog refresh period, `1m` through `24h` |
 | `request-timeout` | No | `15s` | Control-plane and node operation deadline, up to `2m` |
 | `udp-idle-timeout` | No | `5m` | Idle lifetime of one SOCKS5 UDP association |
@@ -188,10 +188,15 @@ udp-advertise-address=10.0.0.16
 node-refresh-interval=1h
 ```
 
-`udp-port-range` and `udp-advertise-address` must be configured together. The
-server rotates through the range, skips occupied ports, and lets the operating
-system release ports for reuse when associations end. Docker and NAT deployments
-must map the same UDP port numbers and allow the range through the firewall.
+Neither `udp-port-range` nor `udp-advertise-address` has a static default. They
+must be configured together or both omitted; setting only one prevents startup.
+When both are omitted, each UDP association uses an OS-assigned port and reports
+the actual bound IP. This suits the default loopback listener; a remote listener
+does not advertise UDP capability in provider output in this mode. When the pair
+is configured, the server rotates through the fixed range, skips occupied ports,
+and lets the operating system release ports for reuse when associations end.
+Docker and NAT deployments must map the same UDP port numbers and allow the
+range through the firewall.
 
 With the default loopback setup, control-plane, private DNS, and ECH-TLS node
 connections automatically use an active non-virtual physical interface. On

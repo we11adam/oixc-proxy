@@ -107,8 +107,8 @@ OIXC = select, policy-path=http://127.0.0.1:6173/surge-proxies.conf, update-inte
 | `listen` | 否 | `127.0.0.1:6172` | 混合 HTTP/SOCKS5 数字 IP 与端口 |
 | `nodelist-listen` | 否 | `127.0.0.1:6173` | HTTP 数字 IP 与端口 |
 | `outbound-ip` | 条件必填 | SOCKS5 绑定 IP | 写入 provider、用于 UDP 绑定，并在非回环时固定控制面与节点连接的物理出口源 IP |
-| `udp-port-range` | 条件必填 | 动态端口 | SOCKS5 UDP relay 固定端口范围，格式 `START-END`，最多 4096 个端口 |
-| `udp-advertise-address` | 条件必填 | UDP 绑定 IP | 在 SOCKS5 UDP ASSOCIATE 响应中返回的客户端可达地址 |
+| `udp-port-range` | 条件必填 | 未设置（系统动态分配） | SOCKS5 UDP relay 固定端口范围，格式 `START-END`，最多 4096 个端口 |
+| `udp-advertise-address` | 条件必填 | 未设置（沿用绑定 IP） | 在 SOCKS5 UDP ASSOCIATE 响应中返回的客户端可达地址 |
 | `node-refresh-interval` | 否 | `1h` | 节点目录刷新周期，范围 `1m` 至 `24h` |
 | `request-timeout` | 否 | `15s` | 控制面和节点操作超时，最大 `2m` |
 | `udp-idle-timeout` | 否 | `5m` | 单个 SOCKS5 UDP 会话的空闲存活时间 |
@@ -132,7 +132,7 @@ udp-advertise-address=10.0.0.16
 node-refresh-interval=1h
 ```
 
-`udp-port-range` 和 `udp-advertise-address` 必须同时配置。程序会在范围内轮转分配端口、跳过已占用端口，并在会话结束后由操作系统释放以供复用。Docker/NAT 部署必须按相同端口号映射 UDP 范围，防火墙也必须允许客户端访问。
+`udp-port-range` 和 `udp-advertise-address` 都没有静态默认值，并且必须同时配置或同时省略；只配置其中一个会导致启动失败。两项都省略时，每个 UDP association 使用系统动态分配的端口，响应中沿用实际绑定 IP。这适合默认回环监听；远程监听在这种模式下不会在 provider 中宣告 UDP 能力。显式配置后，程序会在固定范围内轮转分配端口、跳过已占用端口，并在会话结束后由操作系统释放以供复用。Docker/NAT 部署必须按相同端口号映射 UDP 范围，防火墙也必须允许客户端访问。
 
 默认回环配置会自动选择启用中的非虚拟物理接口作为控制面、私有 DNS 和 ECH-TLS 节点连接的出口；macOS 上会绑定接口，避免流量重新进入 Surge Enhanced Mode 的虚拟隧道。配置非回环 `outbound-ip` 时，该地址会成为强制出口源地址；如果地址不再属于活动网卡，连接会明确失败，而不会静默改走其他出口。程序每 2 秒按需检查网络路径，接口或地址变化后会丢弃旧 DNS 缓存、上次成功地址偏好和空闲 Snell 复用连接，新连接随即使用新网络。
 
