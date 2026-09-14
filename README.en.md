@@ -161,7 +161,7 @@ The file must be a regular file with Unix mode `0600` or stricter.
 | `token` | Yes | — | oixCloud access token |
 | `listen` | No | `127.0.0.1:6172` | Mixed HTTP/SOCKS5 numeric IP and port |
 | `nodelist-listen` | No | `127.0.0.1:6173` | HTTP numeric IP and port |
-| `outbound-ip` | Conditional | SOCKS5 bind IP | Specific IP placed in provider entries and used for UDP binding |
+| `outbound-ip` | Conditional | SOCKS5 bind IP | Provider/UDP address; a non-loopback value also pins control-plane and node connections to that physical source IP |
 | `udp-port-range` | Conditional | Dynamic port | Fixed SOCKS5 UDP relay range as `START-END`, limited to 4096 ports |
 | `udp-advertise-address` | Conditional | UDP bind IP | Client-reachable address returned by SOCKS5 UDP ASSOCIATE |
 | `node-refresh-interval` | No | `1h` | Catalog refresh period, `1m` through `24h` |
@@ -192,6 +192,16 @@ node-refresh-interval=1h
 server rotates through the range, skips occupied ports, and lets the operating
 system release ports for reuse when associations end. Docker and NAT deployments
 must map the same UDP port numbers and allow the range through the firewall.
+
+With the default loopback setup, control-plane, private DNS, and ECH-TLS node
+connections automatically use an active non-virtual physical interface. On
+macOS the socket is interface-bound so traffic does not loop back into a Surge
+Enhanced Mode tunnel. A non-loopback `outbound-ip` is a strict source-address
+pin: if it disappears from the active interfaces, connections fail explicitly
+instead of silently using another path. The route is checked on demand every two
+seconds. An interface or address change invalidates private DNS results, the
+last-success address preference, and idle reusable Snell transports so new
+connections recover on the new network.
 
 Startup loads `nodes-cache.yaml` beside the config file when present, so the
 SOCKS5 and nodelist listeners can bind before the control-plane fetch

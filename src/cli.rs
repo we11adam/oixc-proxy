@@ -18,6 +18,7 @@ use crate::gateway::{
     derive_routing_secret,
 };
 use crate::http_server;
+use crate::network::NetworkMonitor;
 use crate::nodes::{ManagedConfig, Proxy};
 use crate::rlimit;
 use crate::snell::{SnellClient, SnellClientOptions};
@@ -110,7 +111,8 @@ async fn run_information(args: &[String]) -> Result<()> {
         .map(PathBuf::from)
         .ok_or_else(|| UsageError("--output is required".to_owned()))?;
     let service = load_proxy_config(&config_path)?;
-    let client = api_client(&service.runtime)?;
+    let network = service_network(service.outbound_ip);
+    let client = api_client(&service.runtime, &network).await?;
     let content = client.information().await?;
     write_exclusive(&output, &content)?;
     println!("Wrote API response to {}", output.display());
@@ -124,18 +126,19 @@ async fn run_serve(args: &[String]) -> Result<()> {
     let config_path = flag_path(&flags, "config", &default);
     let disable_node_filter = flags.contains_key("disable-node-filter");
     let service = load_proxy_config(&config_path)?;
+    let network = service_network(service.outbound_ip);
     crate::perftrace::configure(service.runtime.perf_trace_sample_every);
     let cache = CatalogCache::beside_config(&config_path, &service.runtime.access_token);
     let (mut managed, from_cache) = if let Some(cached) = cache.load() {
         (cached, true)
     } else {
-        let fetched = load_managed_nodes(&service.runtime, true).await?;
+        let fetched = load_managed_nodes(&service.runtime, true, &network).await?;
         cache.store_or_log(&fetched);
         (fetched, false)
     };
     let published = published_proxies(&managed, disable_node_filter)?;
     let routing_secret = derive_routing_secret(&service.runtime.access_token)?;
-    let transport = Arc::new(TransportContext::built_in()?);
+    let transport = Arc::new(TransportContext::built_in_with_network(network.clone())?);
     let dial_limit = Arc::new(Semaphore::new(service.runtime.dial_concurrency));
     let udp_relay_advertised = service.listen.ip().is_loopback()
         || (service.udp_port_range.is_some() && service.udp_advertise_address.is_some());
@@ -206,7 +209,7 @@ async fn run_serve(args: &[String]) -> Result<()> {
                 return result.context("nodelist HTTP task failed")?;
             }
             _ = refresh.tick() => {
-                let refreshed = match load_managed_nodes(&service.runtime, true).await {
+                let refreshed = match load_managed_nodes(&service.runtime, true, &network).await {
                     Ok(value) => value,
                     Err(error) => {
                         eprintln!("node catalog refresh failed: {error:#}");
@@ -298,12 +301,13 @@ async fn run_serve_map(args: &[String]) -> Result<()> {
     } else {
         requested_base_port
     };
-    let managed = load_managed_nodes(&runtime, disable_node_filter).await?;
+    let network = NetworkMonitor::new(None);
+    let managed = load_managed_nodes(&runtime, disable_node_filter, &network).await?;
     if base_port as usize + managed.proxies.len() - 1 > u16::MAX as usize {
         bail!("SOCKS5 map port range exceeds 65535");
     }
 
-    let transport = Arc::new(TransportContext::built_in()?);
+    let transport = Arc::new(TransportContext::built_in_with_network(network)?);
     let dial_limit = Arc::new(Semaphore::new(runtime.dial_concurrency));
     let connection_limit = Arc::new(Semaphore::new(runtime.max_client_connections));
     let mut listeners = Vec::with_capacity(managed.proxies.len());
@@ -435,8 +439,9 @@ fn format_node_count(published: usize, total: usize) -> String {
 async fn load_managed_nodes(
     runtime: &RuntimeConfig,
     disable_filter: bool,
+    network: &NetworkMonitor,
 ) -> Result<ManagedConfig> {
-    let client = api_client(runtime)?;
+    let client = api_client(runtime, network).await?;
     let plaintext = client.dump_managed_config().await?;
     let managed = ManagedConfig::parse(&plaintext)?;
     if disable_filter {
@@ -446,13 +451,19 @@ async fn load_managed_nodes(
     }
 }
 
-fn api_client(runtime: &RuntimeConfig) -> Result<ApiClient> {
-    ApiClient::new(
+async fn api_client(runtime: &RuntimeConfig, network: &NetworkMonitor) -> Result<ApiClient> {
+    let snapshot = network.snapshot().await;
+    ApiClient::new_with_network(
         runtime.api_base_url.clone(),
         runtime.access_token.clone(),
         runtime.app_secret.clone(),
         runtime.request_timeout,
+        &snapshot,
     )
+}
+
+fn service_network(outbound_ip: IpAddr) -> NetworkMonitor {
+    NetworkMonitor::new((!outbound_ip.is_loopback()).then_some(outbound_ip))
 }
 
 fn parse_flags(

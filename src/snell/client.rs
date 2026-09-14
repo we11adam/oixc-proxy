@@ -47,6 +47,7 @@ enum SnellDialerKind {
 struct DialedTransport {
     stream: ClientTransportStream,
     exporter: Exporter,
+    network_generation: u64,
 }
 
 // Keep the production TLS stream inline. Boxing it only to make the
@@ -93,6 +94,7 @@ impl SnellDialer {
                 Ok(DialedTransport {
                     stream: ClientTransportStream::Ech(connection.stream),
                     exporter: connection.exporter,
+                    network_generation: connection.network_generation,
                 })
             }
             #[cfg(feature = "benchmark")]
@@ -109,8 +111,17 @@ impl SnellDialer {
                 Ok(DialedTransport {
                     stream: ClientTransportStream::Direct(stream),
                     exporter: *exporter,
+                    network_generation: 0,
                 })
             }
+        }
+    }
+
+    async fn network_generation(&self) -> u64 {
+        match &self.inner {
+            SnellDialerKind::Ech(dialer) => dialer.network_generation().await,
+            #[cfg(feature = "benchmark")]
+            SnellDialerKind::Direct { .. } => 0,
         }
     }
 }
@@ -213,6 +224,7 @@ struct PhysicalConnection {
     reader: SnellReader,
     writer: RecordWriter<TransportWriteHalf>,
     local_addr: SocketAddr,
+    network_generation: u64,
 }
 
 struct SnellReader {
@@ -299,7 +311,8 @@ impl SnellClient {
             bail!("Snell client is closed");
         }
         if self.inner.options.reuse {
-            while let Some(mut idle) = self.take_idle().await {
+            let network_generation = self.inner.options.dialer.network_generation().await;
+            while let Some(mut idle) = self.take_idle(network_generation).await {
                 if idle
                     .physical
                     .start_reuse(host, port, self.inner.options.handshake_timeout)
@@ -380,6 +393,7 @@ impl SnellClient {
             .local_addr()
             .context("read Snell local address")?;
         let exporter = connection.exporter;
+        let network_generation = connection.network_generation;
         let (read_half, write_half) = tokio::io::split(connection.stream);
         let mut nonce = [0u8; 16];
         getrandom::fill(&mut nonce)
@@ -423,6 +437,7 @@ impl SnellClient {
             },
             writer,
             local_addr,
+            network_generation,
         };
         if !defer_reply {
             timeout(
@@ -435,10 +450,12 @@ impl SnellClient {
         Ok(physical)
     }
 
-    async fn take_idle(&self) -> Option<IdleConnection> {
+    async fn take_idle(&self, network_generation: u64) -> Option<IdleConnection> {
         loop {
             let entry = self.inner.idle.lock().await.pop()?;
-            if entry.idle_since.elapsed() <= self.inner.options.idle_timeout {
+            if entry.idle_since.elapsed() <= self.inner.options.idle_timeout
+                && entry.physical.network_generation == network_generation
+            {
                 return Some(entry);
             }
             entry.physical.retire().await;

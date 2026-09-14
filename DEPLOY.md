@@ -90,7 +90,7 @@ token=YOUR_OIXCLOUD_ACCESS_TOKEN
 | `token` | 是 | — | oixCloud access token |
 | `listen` | 否 | `127.0.0.1:6172` | Mixed HTTP/SOCKS5 监听地址 |
 | `nodelist-listen` | 否 | `127.0.0.1:6173` | HTTP nodelist 监听地址 |
-| `outbound-ip` | 条件 | 同 socks5 IP | listen 为 `0.0.0.0` 时**必填**，写入 provider 条目并用于 UDP 绑定 |
+| `outbound-ip` | 条件 | 同 socks5 IP | listen 为 `0.0.0.0` 时**必填**；写入 provider、用于 UDP，并以非回环地址固定上游物理出口 |
 | `udp-port-range` | 条件 | 动态端口 | 远程 SOCKS5 UDP relay 的固定端口范围，如 `10000-10099` |
 | `udp-advertise-address` | 条件 | UDP 绑定 IP | SOCKS5 UDP 响应中返回的客户端可达 IP；必须与端口范围同时配置 |
 | `node-refresh-interval` | 否 | `1h` | 节点目录刷新周期，范围 `1m` ~ `24h` |
@@ -126,6 +126,8 @@ node-refresh-interval=1h
   防火墙对话框，选择**允许**；之后可在系统设置 → 网络 → 防火墙 → 选项
   中调整。
 - Linux：需在系统防火墙放行 6172/6173 TCP；启用远程 SOCKS5 UDP 时还要放行配置的 UDP 端口范围（`firewalld` / `ufw`）。
+
+默认回环部署会自动选择活动的非虚拟物理接口。macOS 会把控制面、私有 DNS 和 ECH-TLS 套接字绑定到该接口，以避开 Surge Enhanced Mode 的虚拟隧道；Linux 使用所选接口的源地址，不依赖 `SO_BINDTODEVICE` 权限。网络切换后程序会在下一次拨号时清理旧 DNS 结果和空闲复用连接。若配置了非回环 `outbound-ip`，请确保它确实属于当前活动网卡；该地址消失时程序不会回退到其他出口。
 
 ### 验证 token（可选但推荐）
 
@@ -322,6 +324,8 @@ rm -f ~/Library/Logs/oixc-proxy.stdout.log ~/Library/Logs/oixc-proxy.stderr.log
 | 更新后启动报 `Killed: 9`（日志含 `OS_REASON_CODESIGNING`） | 用 `cp` 原地覆写了正在运行的签名可执行文件，内核代码签名缓存失效 | 用「临时文件 + `mv`」原子替换二进制（见“更新”一节），再 `launchctl kickstart -k` |
 | 启动报 `permissions` 错误 | 配置文件权限过宽 | `chmod 600 ~/.config/oixc-proxy/oixc-proxy.conf` |
 | 启动报 `outbound-ip is required` | listen 为 `0.0.0.0` 但未设 outbound-ip | 在配置中添加 `outbound-ip=<本机局域网 IP>` |
+| 切换网络后新连接提示 outbound IP 不可用 | 固定的 `outbound-ip` 已不属于活动网卡 | 将 `outbound-ip` 改为新网卡地址并重启；仅本机使用时可恢复回环监听，让程序自动选择物理出口 |
+| Surge Enhanced Mode 下出现代理回环 | 运行的还是旧版本，或固定出口指向虚拟/失效地址 | 更新 oixc-proxy；确认 `outbound-ip` 是物理网卡地址，回环监听则由程序自动绕开 `utun` |
 | 启动报 TLS / certificate 错误 | 系统时间不正确 | 系统设置 → 通用 → 日期与时间，打开“自动设置时间与日期” |
 | 启动报 DNS 解析失败 | 无法解析 `oix-api.dler.io` | `nslookup oix-api.dler.io`；检查网络与 DNS 设置 |
 | provider 返回 503 | 节点目录尚未加载完成 | 等待 5~10 秒后重试 |

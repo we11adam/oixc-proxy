@@ -9,9 +9,10 @@ use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::{Signer, SigningKey};
 use hickory_proto::op::{Message, MessageType, OpCode, Query};
 use hickory_proto::rr::{Name, RData, RecordType};
-use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
+
+use crate::network::{NetworkSnapshot, bind_udp_socket};
 
 pub const PRIVATE_DNS_SUFFIX: &str = "cloud-nodes.com";
 pub const PRIVATE_DNS_SERVER: &str = "124.221.68.73:1053";
@@ -35,6 +36,7 @@ pub struct PrivateDnsResolver {
 struct CacheEntry {
     addresses: Vec<IpAddr>,
     expires: Instant,
+    network_generation: u64,
 }
 
 impl PrivateDnsResolver {
@@ -56,12 +58,16 @@ impl PrivateDnsResolver {
         })
     }
 
-    pub async fn lookup(&self, host: &str) -> Result<Option<Vec<IpAddr>>> {
+    pub async fn lookup(
+        &self,
+        host: &str,
+        network: &NetworkSnapshot,
+    ) -> Result<Option<Vec<IpAddr>>> {
         let host = normalize_dns_name(host);
         if !matches_dns_suffix(&host, &self.suffix) {
             return Ok(None);
         }
-        if let Some(addresses) = self.cached(&host).await {
+        if let Some(addresses) = self.cached(&host, network.generation()).await {
             return Ok(Some(addresses));
         }
 
@@ -73,7 +79,7 @@ impl PrivateDnsResolver {
                 .clone()
         };
         let _lookup_guard = lookup_lock.lock().await;
-        if let Some(addresses) = self.cached(&host).await {
+        if let Some(addresses) = self.cached(&host, network.generation()).await {
             return Ok(Some(addresses));
         }
 
@@ -82,7 +88,7 @@ impl PrivateDnsResolver {
             .map_err(|_| anyhow::anyhow!("system clock is before Unix epoch"))?
             .as_secs() as i64;
         let query_name = signed_dns_name(&host, unix_seconds, self.seed.as_ref())?;
-        let (mut addresses, complete) = self.query_dual_stack(&query_name).await;
+        let (mut addresses, complete) = self.query_dual_stack(&query_name, network).await;
         let mut seen = HashSet::with_capacity(addresses.len());
         addresses.retain(|address| seen.insert(*address));
         if addresses.is_empty() {
@@ -98,14 +104,21 @@ impl PrivateDnsResolver {
                     } else {
                         PARTIAL_CACHE_TTL
                     },
+                network_generation: network.generation(),
             },
         );
         Ok(Some(addresses))
     }
 
-    async fn query(&self, name: &str, record_type: RecordType) -> Result<Vec<IpAddr>> {
+    async fn query(
+        &self,
+        name: &str,
+        record_type: RecordType,
+        network: &NetworkSnapshot,
+    ) -> Result<Vec<IpAddr>> {
         for _ in 0..QUERY_ATTEMPTS {
-            if let Ok(Ok(result)) = timeout(QUERY_TIMEOUT, self.query_once(name, record_type)).await
+            if let Ok(Ok(result)) =
+                timeout(QUERY_TIMEOUT, self.query_once(name, record_type, network)).await
             {
                 return Ok(result);
             }
@@ -113,9 +126,9 @@ impl PrivateDnsResolver {
         bail!("resolve ECH-TLS node")
     }
 
-    async fn query_dual_stack(&self, name: &str) -> (Vec<IpAddr>, bool) {
-        let ipv4 = self.query(name, RecordType::A);
-        let ipv6 = self.query(name, RecordType::AAAA);
+    async fn query_dual_stack(&self, name: &str, network: &NetworkSnapshot) -> (Vec<IpAddr>, bool) {
+        let ipv4 = self.query(name, RecordType::A, network);
+        let ipv6 = self.query(name, RecordType::AAAA, network);
         tokio::pin!(ipv4, ipv6);
         tokio::select! {
             result = &mut ipv4 => {
@@ -149,7 +162,12 @@ impl PrivateDnsResolver {
         }
     }
 
-    async fn query_once(&self, name: &str, record_type: RecordType) -> Result<Vec<IpAddr>> {
+    async fn query_once(
+        &self,
+        name: &str,
+        record_type: RecordType,
+        network: &NetworkSnapshot,
+    ) -> Result<Vec<IpAddr>> {
         let mut id_bytes = [0u8; 2];
         getrandom::fill(&mut id_bytes)
             .map_err(|_| anyhow::anyhow!("generate private DNS query ID"))?;
@@ -167,12 +185,7 @@ impl PrivateDnsResolver {
         let request = message
             .to_vec()
             .map_err(|_| anyhow::anyhow!("encode private DNS query"))?;
-        let bind_address = if self.server.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        };
-        let socket = UdpSocket::bind(bind_address)
+        let socket = bind_udp_socket(network, self.server)
             .await
             .map_err(|_| anyhow::anyhow!("resolve ECH-TLS node"))?;
         socket
@@ -200,11 +213,11 @@ impl PrivateDnsResolver {
             .collect())
     }
 
-    async fn cached(&self, host: &str) -> Option<Vec<IpAddr>> {
+    async fn cached(&self, host: &str, network_generation: u64) -> Option<Vec<IpAddr>> {
         let now = Instant::now();
         let mut cache = self.cache.lock().await;
         if let Some(entry) = cache.get(host) {
-            if now < entry.expires {
+            if now < entry.expires && entry.network_generation == network_generation {
                 return Some(entry.addresses.clone());
             }
         }
@@ -269,5 +282,20 @@ mod tests {
                 "node.cloud-nodes.com"
             )
         );
+    }
+
+    #[tokio::test]
+    async fn cached_addresses_are_scoped_to_network_generation() {
+        let resolver = PrivateDnsResolver::built_in().unwrap();
+        resolver.cache.lock().await.insert(
+            "node.cloud-nodes.com".to_owned(),
+            CacheEntry {
+                addresses: vec!["192.0.2.1".parse().unwrap()],
+                expires: Instant::now() + Duration::from_secs(60),
+                network_generation: 7,
+            },
+        );
+        assert!(resolver.cached("node.cloud-nodes.com", 7).await.is_some());
+        assert!(resolver.cached("node.cloud-nodes.com", 8).await.is_none());
     }
 }

@@ -106,7 +106,7 @@ OIXC = select, policy-path=http://127.0.0.1:6173/surge-proxies.conf, update-inte
 | `token` | 是 | — | oixCloud 访问 token |
 | `listen` | 否 | `127.0.0.1:6172` | 混合 HTTP/SOCKS5 数字 IP 与端口 |
 | `nodelist-listen` | 否 | `127.0.0.1:6173` | HTTP 数字 IP 与端口 |
-| `outbound-ip` | 条件必填 | SOCKS5 绑定 IP | 写入 provider 条目并用于 UDP 绑定的指定 IP |
+| `outbound-ip` | 条件必填 | SOCKS5 绑定 IP | 写入 provider、用于 UDP 绑定，并在非回环时固定控制面与节点连接的物理出口源 IP |
 | `udp-port-range` | 条件必填 | 动态端口 | SOCKS5 UDP relay 固定端口范围，格式 `START-END`，最多 4096 个端口 |
 | `udp-advertise-address` | 条件必填 | UDP 绑定 IP | 在 SOCKS5 UDP ASSOCIATE 响应中返回的客户端可达地址 |
 | `node-refresh-interval` | 否 | `1h` | 节点目录刷新周期，范围 `1m` 至 `24h` |
@@ -133,6 +133,8 @@ node-refresh-interval=1h
 ```
 
 `udp-port-range` 和 `udp-advertise-address` 必须同时配置。程序会在范围内轮转分配端口、跳过已占用端口，并在会话结束后由操作系统释放以供复用。Docker/NAT 部署必须按相同端口号映射 UDP 范围，防火墙也必须允许客户端访问。
+
+默认回环配置会自动选择启用中的非虚拟物理接口作为控制面、私有 DNS 和 ECH-TLS 节点连接的出口；macOS 上会绑定接口，避免流量重新进入 Surge Enhanced Mode 的虚拟隧道。配置非回环 `outbound-ip` 时，该地址会成为强制出口源地址；如果地址不再属于活动网卡，连接会明确失败，而不会静默改走其他出口。程序每 2 秒按需检查网络路径，接口或地址变化后会丢弃旧 DNS 缓存、上次成功地址偏好和空闲 Snell 复用连接，新连接随即使用新网络。
 
 启动时，如果配置文件旁存在 `nodes-cache.yaml`，程序会先加载它，使 SOCKS5 和节点列表监听器可以在控制面获取完成前开始监听。缓存权限为 `0600`，保存最近一次验证通过的目录，并通过不可逆账户指纹与当前 token 绑定；token 变化时旧缓存会被拒绝。后续刷新失败时继续使用当前账户的原目录；如果首次启动没有可用缓存，则仍要求首次获取成功。配置未变化的节点会保留其 Snell 客户端和空闲连接池；发生变化、新增或删除的节点配置会原子轮换。
 

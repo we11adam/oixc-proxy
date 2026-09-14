@@ -20,7 +20,9 @@ node-refresh-interval=1h
 # reuse-idle-timeout=90s
 # perf-trace-sample-every=1000
 
-# For a trusted LAN host, use wildcard listeners and publish one specific IP:
+# For a trusted LAN host, use wildcard listeners and publish one specific IP.
+# A non-loopback outbound-ip also pins API, private DNS, and node connections
+# to that physical source address; update it if the host changes networks.
 # listen=0.0.0.0:6172
 # nodelist-listen=0.0.0.0:6173
 # outbound-ip=10.0.0.16

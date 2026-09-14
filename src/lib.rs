@@ -6,6 +6,7 @@ pub mod config;
 pub mod gateway;
 pub mod http_proxy;
 pub mod http_server;
+pub mod network;
 pub mod nodes;
 pub mod perftrace;
 pub mod rlimit;

@@ -10,6 +10,8 @@ use serde::Deserialize;
 use sha2::Sha256;
 use url::Url;
 
+use crate::network::NetworkSnapshot;
+
 pub const MANAGED_NODES_PATH: &str = "/api/v1/managed/anywhere/direct";
 pub const INFORMATION_PATH: &str = "/api/v1/information";
 pub const HEADER_TIMESTAMP: &str = "X-Anywhere-Timestamp";
@@ -35,6 +37,26 @@ impl Client {
         app_secret: impl Into<String>,
         timeout: Duration,
     ) -> Result<Self> {
+        Self::build(base_url, access_token, app_secret, timeout, None)
+    }
+
+    pub fn new_with_network(
+        base_url: Url,
+        access_token: impl Into<String>,
+        app_secret: impl Into<String>,
+        timeout: Duration,
+        network: &NetworkSnapshot,
+    ) -> Result<Self> {
+        Self::build(base_url, access_token, app_secret, timeout, Some(network))
+    }
+
+    fn build(
+        base_url: Url,
+        access_token: impl Into<String>,
+        app_secret: impl Into<String>,
+        timeout: Duration,
+        network: Option<&NetworkSnapshot>,
+    ) -> Result<Self> {
         if base_url.scheme() != "https" || base_url.host_str().is_none() {
             bail!("base URL must be an absolute HTTPS URL");
         }
@@ -49,13 +71,24 @@ impl Client {
         if timeout.is_zero() || timeout > Duration::from_secs(120) {
             bail!("timeout must be between 1ns and 2m");
         }
-        let http = HttpClient::builder()
+        let mut builder = HttpClient::builder()
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
-            .user_agent(USER_AGENT)
-            .build()
-            .context("create API HTTP client")?;
+            .user_agent(USER_AGENT);
+        if let Some(network) = network {
+            if let Some(source) = network
+                .preferred_source()
+                .context("select API outbound address")?
+            {
+                builder = builder.local_address(source);
+            }
+            #[cfg(target_os = "macos")]
+            if let Some(interface) = network.interface_name() {
+                builder = builder.interface(interface);
+            }
+        }
+        let http = builder.build().context("create API HTTP client")?;
         Ok(Self {
             base_url,
             access_token,

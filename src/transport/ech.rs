@@ -12,12 +12,13 @@ use rustls::client::{EchConfig, EchMode};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{EchConfigListBytes, ServerName};
 use rustls::{ClientConfig, ProtocolVersion, RootCertStore};
-use tokio::net::{TcpStream, lookup_host};
+use tokio::net::{TcpSocket, TcpStream, lookup_host};
 use tokio::task::JoinSet;
 use tokio::time::{Instant as TokioInstant, sleep, timeout};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
+use crate::network::{NetworkMonitor, NetworkSnapshot};
 use crate::nodes::Proxy;
 use crate::snell::Exporter;
 
@@ -30,12 +31,14 @@ const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
 pub struct EchConnection {
     pub stream: TlsStream<TcpStream>,
     pub exporter: Exporter,
+    pub network_generation: u64,
 }
 
 pub struct TransportContext {
     roots: Arc<RootCertStore>,
     provider: Arc<CryptoProvider>,
     resolver: PrivateDnsResolver,
+    network: NetworkMonitor,
 }
 
 #[derive(Clone)]
@@ -47,11 +50,16 @@ pub struct EchDialer {
     timeout: Duration,
     tls_config: Arc<ClientConfig>,
     resolver: PrivateDnsResolver,
-    last_success: Arc<Mutex<Option<SocketAddr>>>,
+    network: NetworkMonitor,
+    last_success: Arc<Mutex<Option<(u64, SocketAddr)>>>,
 }
 
 impl TransportContext {
     pub fn built_in() -> Result<Self> {
+        Self::built_in_with_network(NetworkMonitor::new(None))
+    }
+
+    pub fn built_in_with_network(network: NetworkMonitor) -> Result<Self> {
         let mut roots = RootCertStore::empty();
         let native = rustls_native_certs::load_native_certs();
         for certificate in native.certs {
@@ -64,6 +72,7 @@ impl TransportContext {
             roots: Arc::new(roots),
             provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
             resolver: PrivateDnsResolver::built_in()?,
+            network,
         })
     }
 }
@@ -116,6 +125,7 @@ impl EchDialer {
             timeout: dial_timeout,
             tls_config: Arc::new(tls_config),
             resolver: context.resolver.clone(),
+            network: context.network.clone(),
             last_success: Arc::new(Mutex::new(None)),
         })
     }
@@ -133,7 +143,7 @@ impl EchDialer {
         let tcp_started = Instant::now();
         let raw = self.dial_tcp().await;
         crate::perftrace::stage("ech.tcp_connect", tcp_started, raw.is_ok(), &[]);
-        let raw = raw?;
+        let (raw, network_generation) = raw?;
         raw.set_nodelay(true).ok();
         let server_name = ServerName::try_from(self.sni.clone())
             .map_err(|_| anyhow::anyhow!("ECH-TLS server name is invalid"))?;
@@ -154,12 +164,21 @@ impl EchDialer {
         let exporter = connection
             .export_keying_material([0u8; 32], EXPORTER_LABEL, None)
             .map_err(|_| anyhow::anyhow!("export ECH-TLS identity material"))?;
-        Ok(EchConnection { stream, exporter })
+        Ok(EchConnection {
+            stream,
+            exporter,
+            network_generation,
+        })
     }
 
-    async fn dial_tcp(&self) -> Result<TcpStream> {
+    pub async fn network_generation(&self) -> u64 {
+        self.network.snapshot().await.generation()
+    }
+
+    async fn dial_tcp(&self) -> Result<(TcpStream, u64)> {
+        let network = self.network.snapshot().await;
         let dns_started = Instant::now();
-        let addresses = match self.resolver.lookup(&self.server).await {
+        let addresses = match self.resolver.lookup(&self.server, &network).await {
             Ok(Some(addresses)) => Ok(addresses
                 .into_iter()
                 .map(|ip| SocketAddr::new(ip, self.port))
@@ -171,25 +190,32 @@ impl EchDialer {
             Err(error) => Err(error),
         };
         crate::perftrace::stage("ech.dns", dns_started, addresses.is_ok(), &[]);
-        let addresses = addresses?;
-        let preferred = self.last_success.lock().ok().and_then(|value| *value);
+        let addresses = addresses?
+            .into_iter()
+            .filter(|address| network.supports(*address))
+            .collect();
+        let preferred = self
+            .last_success
+            .lock()
+            .ok()
+            .and_then(|value| value.filter(|(generation, _)| *generation == network.generation()))
+            .map(|(_, address)| address);
         let addresses = interleave_addresses(addresses, preferred);
-        let (stream, address) =
-            connect_happy_eyeballs(addresses)
-                .await
-                .map_err(|error| match error.kind() {
-                    io::ErrorKind::ConnectionRefused => {
-                        anyhow::anyhow!("ECH-TLS node refused the connection")
-                    }
-                    io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable => {
-                        anyhow::anyhow!("ECH-TLS node network is unreachable")
-                    }
-                    _ => anyhow::anyhow!("connect to ECH-TLS node"),
-                })?;
+        let (stream, address) = connect_happy_eyeballs(addresses, network.clone())
+            .await
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::ConnectionRefused => {
+                    anyhow::anyhow!("ECH-TLS node refused the connection")
+                }
+                io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable => {
+                    anyhow::anyhow!("ECH-TLS node network is unreachable")
+                }
+                _ => anyhow::anyhow!("connect to ECH-TLS node"),
+            })?;
         if let Ok(mut preferred) = self.last_success.lock() {
-            *preferred = Some(address);
+            *preferred = Some((network.generation(), address));
         }
-        Ok(stream)
+        Ok((stream, network.generation()))
     }
 }
 
@@ -236,7 +262,10 @@ fn interleave_addresses(
     ordered
 }
 
-async fn connect_happy_eyeballs(addresses: Vec<SocketAddr>) -> io::Result<(TcpStream, SocketAddr)> {
+async fn connect_happy_eyeballs(
+    addresses: Vec<SocketAddr>,
+    network: NetworkSnapshot,
+) -> io::Result<(TcpStream, SocketAddr)> {
     let mut pending = VecDeque::from(addresses);
     let Some(first) = pending.pop_front() else {
         return Err(io::Error::new(
@@ -245,7 +274,7 @@ async fn connect_happy_eyeballs(addresses: Vec<SocketAddr>) -> io::Result<(TcpSt
         ));
     };
     let mut attempts = JoinSet::new();
-    spawn_connect(&mut attempts, first);
+    spawn_connect(&mut attempts, first, network.clone());
     let launch_delay = sleep(HAPPY_EYEBALLS_DELAY);
     tokio::pin!(launch_delay);
     let mut last_error = None;
@@ -261,7 +290,7 @@ async fn connect_happy_eyeballs(addresses: Vec<SocketAddr>) -> io::Result<(TcpSt
                 }
                 if attempts.is_empty() {
                     if let Some(address) = pending.pop_front() {
-                        spawn_connect(&mut attempts, address);
+                        spawn_connect(&mut attempts, address, network.clone());
                         launch_delay
                             .as_mut()
                             .reset(TokioInstant::now() + HAPPY_EYEBALLS_DELAY);
@@ -274,7 +303,7 @@ async fn connect_happy_eyeballs(addresses: Vec<SocketAddr>) -> io::Result<(TcpSt
             }
             _ = &mut launch_delay, if !pending.is_empty() => {
                 let address = pending.pop_front().expect("guarded above");
-                spawn_connect(&mut attempts, address);
+                spawn_connect(&mut attempts, address, network.clone());
                 launch_delay
                     .as_mut()
                     .reset(TokioInstant::now() + HAPPY_EYEBALLS_DELAY);
@@ -283,9 +312,20 @@ async fn connect_happy_eyeballs(addresses: Vec<SocketAddr>) -> io::Result<(TcpSt
     }
 }
 
-fn spawn_connect(attempts: &mut JoinSet<io::Result<(TcpStream, SocketAddr)>>, address: SocketAddr) {
+fn spawn_connect(
+    attempts: &mut JoinSet<io::Result<(TcpStream, SocketAddr)>>,
+    address: SocketAddr,
+    network: NetworkSnapshot,
+) {
     attempts.spawn(async move {
-        TcpStream::connect(address)
+        let socket = if address.is_ipv4() {
+            TcpSocket::new_v4()?
+        } else {
+            TcpSocket::new_v6()?
+        };
+        network.bind_tcp(&socket, address)?;
+        socket
+            .connect(address)
             .await
             .map(|stream| (stream, address))
     });
