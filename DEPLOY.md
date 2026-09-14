@@ -370,7 +370,8 @@ Installed /usr/local/bin/oixc-proxy and started systemd user service oixc-proxy.
 - 单元为 `Type=simple`，`Restart=on-failure`（5 秒后重拉），开机/登录后
   随 user manager 启动；
 - 服务以登录用户身份运行，并启用加固（`NoNewPrivileges`、`PrivateTmp`、
-  `ProtectSystem=strict`、`ProtectHome=read-only`、受限地址族等）；
+  `ProtectSystem=strict`、`ProtectHome=read-only`、受限地址族等）；地址族白名单
+  包含 `AF_NETLINK`，供程序读取物理网卡和地址变化；
 - 标准输出/错误进入 journal，不落敏感信息（同 macOS，见上一节说明）。
 
 查看状态与日志：

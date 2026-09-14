@@ -98,6 +98,16 @@ impl EgressSelection {
     fn has_address(&self) -> bool {
         self.ipv4.is_some() || self.ipv6.is_some()
     }
+
+    #[cfg(target_os = "linux")]
+    fn pinned_without_interface(address: IpAddr) -> Self {
+        let mut selection = Self::empty();
+        match address {
+            IpAddr::V4(address) => selection.ipv4 = Some(address),
+            IpAddr::V6(address) => selection.ipv6 = Some(address),
+        }
+        selection
+    }
 }
 
 impl NetworkSnapshot {
@@ -206,7 +216,23 @@ pub async fn bind_udp_socket(
 }
 
 fn detect_egress(pinned_ip: Option<IpAddr>) -> io::Result<EgressSelection> {
-    let addresses = interface_addresses()?;
+    detect_egress_from_addresses(interface_addresses(), pinned_ip)
+}
+
+fn detect_egress_from_addresses(
+    addresses: io::Result<Vec<InterfaceAddress>>,
+    pinned_ip: Option<IpAddr>,
+) -> io::Result<EgressSelection> {
+    let addresses = match addresses {
+        Ok(addresses) => addresses,
+        Err(error) => {
+            #[cfg(target_os = "linux")]
+            if let Some(pinned_ip) = pinned_ip {
+                return Ok(EgressSelection::pinned_without_interface(pinned_ip));
+            }
+            return Err(error);
+        }
+    };
     if let Some(pinned_ip) = pinned_ip {
         let Some(pinned) = addresses.iter().find(|entry| entry.address == pinned_ip) else {
             return Ok(EgressSelection::empty());
@@ -465,6 +491,24 @@ mod tests {
         };
         assert!(snapshot.preferred_source().is_err());
         assert!(!snapshot.supports("198.51.100.1:443".parse().unwrap()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restricted_interface_discovery_keeps_pinned_source() {
+        let address = "192.0.2.10".parse().unwrap();
+        let selection = detect_egress_from_addresses(
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "AF_NETLINK is restricted",
+            )),
+            Some(address),
+        )
+        .unwrap();
+        assert_eq!(selection.interface_name, None);
+        assert_eq!(selection.interface_index, None);
+        assert_eq!(selection.ipv4, Some("192.0.2.10".parse().unwrap()));
+        assert_eq!(selection.ipv6, None);
     }
 
     #[test]

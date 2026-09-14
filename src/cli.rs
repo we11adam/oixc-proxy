@@ -765,7 +765,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
 LockPersonality=true
 MemoryDenyWriteExecute=true
 
@@ -879,5 +879,15 @@ mod tests {
     fn format_node_count_mentions_total_when_filtered() {
         assert_eq!(format_node_count(12, 12), "12 named nodes");
         assert_eq!(format_node_count(12, 40), "12 named nodes (40 total)");
+    }
+
+    #[test]
+    fn systemd_unit_allows_interface_discovery() {
+        let unit = render_systemd(
+            Path::new("/usr/local/bin/oixc-proxy"),
+            Path::new("/home/user/.config/oixc-proxy/oixc-proxy.conf"),
+            Path::new("/home/user/.config/oixc-proxy"),
+        );
+        assert!(unit.contains("RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX"));
     }
 }
