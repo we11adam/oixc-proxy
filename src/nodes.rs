@@ -88,7 +88,7 @@ impl ManagedConfig {
         Ok(Self { proxies })
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.proxies.is_empty() {
             bail!("managed config contains no proxies");
         }

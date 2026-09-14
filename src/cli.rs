@@ -125,7 +125,7 @@ async fn run_serve(args: &[String]) -> Result<()> {
     let disable_node_filter = flags.contains_key("disable-node-filter");
     let service = load_proxy_config(&config_path)?;
     crate::perftrace::configure(service.runtime.perf_trace_sample_every);
-    let cache = CatalogCache::beside_config(&config_path);
+    let cache = CatalogCache::beside_config(&config_path, &service.runtime.access_token);
     let (mut managed, from_cache) = if let Some(cached) = cache.load() {
         (cached, true)
     } else {
