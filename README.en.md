@@ -35,7 +35,7 @@ release `SHA256SUMS`, checks the binary version and atomically installs
 with:
 
 ```sh
-sh install.sh --version v0.2.0
+sh install.sh --version v0.2.1
 sh install.sh --install-dir "$HOME/.local/bin"
 ```
 
@@ -57,7 +57,7 @@ Example prompts:
 Use $oixc-proxy-deploy to install the latest Release locally, then verify the
 version and health status.
 
-Use $oixc-proxy-deploy to update root@router.lan to v0.2.0. Preserve its
+Use $oixc-proxy-deploy to update root@router.lan to v0.2.1. Preserve its
 existing config and service mechanism; verify the new PID, listeners, /healthz,
 and provider endpoint, and roll back on failure.
 
