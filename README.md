@@ -91,7 +91,7 @@ Surge 代理组示例：
 OIXC = select, policy-path=http://127.0.0.1:6173/surge-proxies.conf, update-interval=3600
 ```
 
-每个 provider 条目都指向共享的混合监听器。条目默认声明为 HTTP 代理；`?socks=1` 会改为声明 SOCKS5（UDP ASSOCIATE 仅在 SOCKS 路径可用）。用户名是节点准确名称的可逆 URL-safe 编码，密码是稳定的 HMAC 派生路由密钥。HTTP 客户端通过 `Proxy-Authorization: Basic` 发送这些凭据。访问 token、节点地址、PSK 和 ECH 配置绝不会由节点列表 HTTP 端点返回。
+每个 provider 条目都指向共享的混合监听器。条目默认声明为 HTTP 代理；`?socks=1` 会改为声明 SOCKS5（UDP ASSOCIATE 仅在 SOCKS 路径可用）。回环监听会直接声明节点的 UDP 能力；远程监听只有同时配置固定 UDP 端口范围和客户端可达的宣告地址后才会声明 UDP，避免生成实际不可用的配置。用户名是节点准确名称的可逆 URL-safe 编码，密码是稳定的 HMAC 派生路由密钥。HTTP 客户端通过 `Proxy-Authorization: Basic` 发送这些凭据。访问 token、节点地址、PSK 和 ECH 配置绝不会由节点列表 HTTP 端点返回。
 
 默认只发布名称中包含 `Fusion` 或独立 `CIA`/`IXP` token 的节点，匹配不区分大小写。将缩写视为独立 token，可避免错误纳入 `Special` 等普通名称。过滤后目录为空时会拒绝加载，以免控制面命名变化意外暴露普通节点。`GET /surge-proxies.conf?all=1` 和 `/clash-proxies.yaml?all=1` 会发布完整目录；这些额外节点仍通过同一个混合监听器路由。需要客户端使用 SOCKS5 时，再附加 `socks=1`。
 
@@ -107,6 +107,8 @@ OIXC = select, policy-path=http://127.0.0.1:6173/surge-proxies.conf, update-inte
 | `listen` | 否 | `127.0.0.1:6172` | 混合 HTTP/SOCKS5 数字 IP 与端口 |
 | `nodelist-listen` | 否 | `127.0.0.1:6173` | HTTP 数字 IP 与端口 |
 | `outbound-ip` | 条件必填 | SOCKS5 绑定 IP | 写入 provider 条目并用于 UDP 绑定的指定 IP |
+| `udp-port-range` | 条件必填 | 动态端口 | SOCKS5 UDP relay 固定端口范围，格式 `START-END`，最多 4096 个端口 |
+| `udp-advertise-address` | 条件必填 | UDP 绑定 IP | 在 SOCKS5 UDP ASSOCIATE 响应中返回的客户端可达地址 |
 | `node-refresh-interval` | 否 | `1h` | 节点目录刷新周期，范围 `1m` 至 `24h` |
 | `request-timeout` | 否 | `15s` | 控制面和节点操作超时，最大 `2m` |
 | `udp-idle-timeout` | 否 | `5m` | 单个 SOCKS5 UDP 会话的空闲存活时间 |
@@ -125,10 +127,14 @@ token=REPLACE_WITH_OIXC_ACCESS_TOKEN
 listen=0.0.0.0:6172
 nodelist-listen=0.0.0.0:6173
 outbound-ip=10.0.0.16
+udp-port-range=10000-10099
+udp-advertise-address=10.0.0.16
 node-refresh-interval=1h
 ```
 
-启动时，如果配置文件旁存在 `nodes-cache.yaml`，程序会先加载它，使 SOCKS5 和节点列表监听器可以在控制面获取完成前开始监听。缓存权限为 `0600`，保存最近一次验证通过的目录。后续刷新失败时继续使用原目录；如果首次启动没有缓存，则仍要求首次获取成功。配置未变化的节点会保留其 Snell 客户端和空闲连接池；发生变化、新增或删除的节点配置会原子轮换。
+`udp-port-range` 和 `udp-advertise-address` 必须同时配置。程序会在范围内轮转分配端口、跳过已占用端口，并在会话结束后由操作系统释放以供复用。Docker/NAT 部署必须按相同端口号映射 UDP 范围，防火墙也必须允许客户端访问。
+
+启动时，如果配置文件旁存在 `nodes-cache.yaml`，程序会先加载它，使 SOCKS5 和节点列表监听器可以在控制面获取完成前开始监听。缓存权限为 `0600`，保存最近一次验证通过的目录，并通过不可逆账户指纹与当前 token 绑定；token 变化时旧缓存会被拒绝。后续刷新失败时继续使用当前账户的原目录；如果首次启动没有可用缓存，则仍要求首次获取成功。配置未变化的节点会保留其 Snell 客户端和空闲连接池；发生变化、新增或删除的节点配置会原子轮换。
 
 ## 命令
 

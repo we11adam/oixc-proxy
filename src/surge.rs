@@ -21,6 +21,7 @@ pub fn render_provider(
     port: u16,
     routing_secret: &str,
     protocol: ProviderProtocol,
+    udp_relay_advertised: bool,
 ) -> Result<Vec<u8>> {
     let ip: IpAddr = listen_address
         .parse()
@@ -66,7 +67,7 @@ pub fn render_provider(
                     output,
                     "{policy_name} = socks5, {listen_address}, {port}, {selector}, {routing_secret}"
                 )?;
-                if proxy.udp {
+                if proxy.udp && udp_relay_advertised {
                     output.push_str(", udp-relay=true, test-udp=example.com@1.1.1.1");
                 }
             }
@@ -177,6 +178,7 @@ mod tests {
                 6178,
                 "secret-1",
                 ProviderProtocol::Http,
+                false,
             )
             .unwrap(),
         )
@@ -193,6 +195,7 @@ mod tests {
                 6178,
                 "secret-1",
                 ProviderProtocol::Socks5,
+                true,
             )
             .unwrap(),
         )
@@ -200,5 +203,19 @@ mod tests {
         assert!(socks.contains(" = socks5, 127.0.0.1, 6178, "));
         assert!(socks.contains("udp-relay=true"));
         assert!(!socks.contains("test-timeout"));
+
+        let socks_without_reachable_udp = String::from_utf8(
+            render_provider(
+                &proxies,
+                "127.0.0.1",
+                6178,
+                "secret-1",
+                ProviderProtocol::Socks5,
+                false,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!socks_without_reachable_udp.contains("udp-relay=true"));
     }
 }

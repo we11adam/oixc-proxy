@@ -21,7 +21,7 @@ use crate::http_server;
 use crate::nodes::{ManagedConfig, Proxy};
 use crate::rlimit;
 use crate::snell::{SnellClient, SnellClientOptions};
-use crate::socks5::{self, Credentials, Mode};
+use crate::socks5::{self, Credentials, Mode, UdpRelay};
 use crate::transport::{EchDialer, TransportContext};
 
 const USAGE: &str = "Usage:
@@ -137,8 +137,15 @@ async fn run_serve(args: &[String]) -> Result<()> {
     let routing_secret = derive_routing_secret(&service.runtime.access_token)?;
     let transport = Arc::new(TransportContext::built_in()?);
     let dial_limit = Arc::new(Semaphore::new(service.runtime.dial_concurrency));
-    let gateway_context =
-        GatewayContext::new(service.outbound_ip, routing_secret, dial_limit, transport);
+    let udp_relay_advertised = service.listen.ip().is_loopback()
+        || (service.udp_port_range.is_some() && service.udp_advertise_address.is_some());
+    let gateway_context = GatewayContext::new(
+        service.outbound_ip,
+        udp_relay_advertised,
+        routing_secret,
+        dial_limit,
+        transport,
+    );
     let router = Router::build(
         &managed.proxies,
         &published,
@@ -168,12 +175,19 @@ async fn run_serve(args: &[String]) -> Result<()> {
     }
 
     let connection_limit = Arc::new(Semaphore::new(service.runtime.max_client_connections));
+    let udp_relay = match (service.udp_port_range, service.udp_advertise_address) {
+        (Some(range), Some(advertise_address)) => {
+            UdpRelay::fixed(service.outbound_ip, advertise_address, range)?
+        }
+        (None, None) => UdpRelay::ephemeral(service.outbound_ip),
+        _ => unreachable!("paired UDP relay configuration was validated"),
+    };
     let mut socks_task = tokio::spawn(serve_socks_listener(
         socks_listener,
         socks5::Options {
             handshake_timeout: service.runtime.request_timeout.max(Duration::from_secs(45)),
             udp_idle_timeout: service.runtime.udp_idle_timeout,
-            udp_bind_address: service.outbound_ip,
+            udp_relay,
             mode: Mode::Dynamic(manager.clone()),
         },
         connection_limit,
@@ -330,7 +344,7 @@ async fn run_serve_map(args: &[String]) -> Result<()> {
         let options = socks5::Options {
             handshake_timeout: runtime.request_timeout,
             udp_idle_timeout: runtime.udp_idle_timeout,
-            udp_bind_address: listen,
+            udp_relay: UdpRelay::ephemeral(listen),
             mode: Mode::Fixed {
                 route,
                 credentials: credentials.clone(),

@@ -53,6 +53,7 @@ pub struct GatewayManager {
 
 pub struct GatewayContext {
     outbound_ip: IpAddr,
+    udp_relay_advertised: bool,
     routing_secret: String,
     dial_limit: Arc<Semaphore>,
     transport: Arc<TransportContext>,
@@ -61,12 +62,14 @@ pub struct GatewayContext {
 impl GatewayContext {
     pub fn new(
         outbound_ip: IpAddr,
+        udp_relay_advertised: bool,
         routing_secret: String,
         dial_limit: Arc<Semaphore>,
         transport: Arc<TransportContext>,
     ) -> Self {
         Self {
             outbound_ip,
+            udp_relay_advertised,
             routing_secret,
             dial_limit,
             transport,
@@ -88,6 +91,7 @@ impl Router {
             &listen_address,
             runtime.serve_port,
             &context.routing_secret,
+            context.udp_relay_advertised,
         )?;
         let all = if same_proxy_list(proxies, published) {
             filtered.clone()
@@ -97,6 +101,7 @@ impl Router {
                 &listen_address,
                 runtime.serve_port,
                 &context.routing_secret,
+                context.udp_relay_advertised,
             )?
         };
         let mut routes = HashMap::with_capacity(proxies.len());
@@ -289,6 +294,7 @@ fn render_provider_docs(
     listen_address: &str,
     port: u16,
     routing_secret: &str,
+    udp_relay_advertised: bool,
 ) -> Result<ProviderDocs> {
     Ok(ProviderDocs {
         surge_http: render_provider(
@@ -297,6 +303,7 @@ fn render_provider_docs(
             port,
             routing_secret,
             ProviderProtocol::Http,
+            false,
         )?
         .into(),
         surge_socks: render_provider(
@@ -305,6 +312,7 @@ fn render_provider_docs(
             port,
             routing_secret,
             ProviderProtocol::Socks5,
+            udp_relay_advertised,
         )?
         .into(),
         clash_http: crate::clash::render_provider(
@@ -313,6 +321,7 @@ fn render_provider_docs(
             port,
             routing_secret,
             ProviderProtocol::Http,
+            false,
         )?
         .into(),
         clash_socks: crate::clash::render_provider(
@@ -321,6 +330,7 @@ fn render_provider_docs(
             port,
             routing_secret,
             ProviderProtocol::Socks5,
+            udp_relay_advertised,
         )?
         .into(),
     })

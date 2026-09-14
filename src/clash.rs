@@ -13,6 +13,7 @@ pub fn render_provider(
     port: u16,
     routing_secret: &str,
     protocol: ProviderProtocol,
+    udp_relay_advertised: bool,
 ) -> Result<Vec<u8>> {
     let ip: IpAddr = listen_address
         .parse()
@@ -63,7 +64,7 @@ pub fn render_provider(
                 writeln!(output, "  port: {port}")?;
                 writeln!(output, "  username: {selector}")?;
                 writeln!(output, "  password: {routing_secret}")?;
-                writeln!(output, "  udp: {}", proxy.udp)?;
+                writeln!(output, "  udp: {}", proxy.udp && udp_relay_advertised)?;
             }
         }
     }
@@ -135,6 +136,7 @@ mod tests {
             6178,
             "secret-1",
             ProviderProtocol::Http,
+            false,
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
@@ -162,11 +164,24 @@ mod tests {
             6178,
             "secret-1",
             ProviderProtocol::Socks5,
+            true,
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("  type: socks5\n"));
         assert!(output.contains("  udp: true\n"));
+
+        let output = render_provider(
+            &proxies,
+            "127.0.0.1",
+            6178,
+            "secret-1",
+            ProviderProtocol::Socks5,
+            false,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("  udp: false\n"));
     }
 
     #[test]
@@ -178,6 +193,7 @@ mod tests {
             6178,
             "secret-1",
             ProviderProtocol::Http,
+            false,
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();

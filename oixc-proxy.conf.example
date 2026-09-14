@@ -8,6 +8,10 @@ node-refresh-interval=1h
 # 1000 records roughly one request in every 1000.
 # request-timeout=15s
 # udp-idle-timeout=5m
+# Remote SOCKS5 UDP requires both a fixed relay range and the address clients
+# can reach. Publish the same UDP range through NAT and the host firewall.
+# udp-port-range=10000-10099
+# udp-advertise-address=192.168.1.10
 # max-client-connections=256
 # dial-concurrency=32
 # per-node-dial-concurrency=8
@@ -20,3 +24,5 @@ node-refresh-interval=1h
 # listen=0.0.0.0:6172
 # nodelist-listen=0.0.0.0:6173
 # outbound-ip=10.0.0.16
+# udp-port-range=10000-10099
+# udp-advertise-address=10.0.0.16

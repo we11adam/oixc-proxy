@@ -129,7 +129,10 @@ OIXC = select, policy-path=http://127.0.0.1:6173/surge-proxies.conf, update-inte
 
 Every provider entry points to the shared mixed listener. Entries are HTTP
 proxies by default; `?socks=1` advertises SOCKS5 instead (UDP ASSOCIATE is
-only available on the SOCKS path). The username is a reversible URL-safe
+only available on the SOCKS path). Loopback listeners advertise each node's
+UDP capability directly. A remote listener advertises UDP only when a fixed
+relay port range and a client-reachable address are both configured, avoiding
+providers that claim unusable UDP support. The username is a reversible URL-safe
 encoding of the exact managed node name; the password is a stable HMAC-derived
 routing secret. HTTP clients send those as `Proxy-Authorization: Basic`. The
 access token, node address, PSK and ECH configuration are never returned by
@@ -159,6 +162,8 @@ The file must be a regular file with Unix mode `0600` or stricter.
 | `listen` | No | `127.0.0.1:6172` | Mixed HTTP/SOCKS5 numeric IP and port |
 | `nodelist-listen` | No | `127.0.0.1:6173` | HTTP numeric IP and port |
 | `outbound-ip` | Conditional | SOCKS5 bind IP | Specific IP placed in provider entries and used for UDP binding |
+| `udp-port-range` | Conditional | Dynamic port | Fixed SOCKS5 UDP relay range as `START-END`, limited to 4096 ports |
+| `udp-advertise-address` | Conditional | UDP bind IP | Client-reachable address returned by SOCKS5 UDP ASSOCIATE |
 | `node-refresh-interval` | No | `1h` | Catalog refresh period, `1m` through `24h` |
 | `request-timeout` | No | `15s` | Control-plane and node operation deadline, up to `2m` |
 | `udp-idle-timeout` | No | `5m` | Idle lifetime of one SOCKS5 UDP association |
@@ -178,14 +183,23 @@ token=REPLACE_WITH_OIXC_ACCESS_TOKEN
 listen=0.0.0.0:6172
 nodelist-listen=0.0.0.0:6173
 outbound-ip=10.0.0.16
+udp-port-range=10000-10099
+udp-advertise-address=10.0.0.16
 node-refresh-interval=1h
 ```
 
+`udp-port-range` and `udp-advertise-address` must be configured together. The
+server rotates through the range, skips occupied ports, and lets the operating
+system release ports for reuse when associations end. Docker and NAT deployments
+must map the same UDP port numbers and allow the range through the firewall.
+
 Startup loads `nodes-cache.yaml` beside the config file when present, so the
 SOCKS5 and nodelist listeners can bind before the control-plane fetch
-finishes. The cache is mode `0600` and holds the last validated catalog. A
-later refresh failure keeps the previous catalog. The first start still
-requires a successful fetch if no cache exists. Unchanged node profiles
+finishes. The cache is mode `0600`, holds the last validated catalog, and is
+bound to the current token through a one-way account fingerprint. A token
+change rejects the old cache. A later refresh failure keeps the current
+account's previous catalog. The first start still requires a successful fetch
+if no usable cache exists. Unchanged node profiles
 retain their Snell clients and idle connection pools; changed, added and
 removed profiles are rotated atomically.
 

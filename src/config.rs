@@ -43,7 +43,21 @@ pub struct ProxyConfig {
     pub listen: SocketAddr,
     pub nodelist_listen: SocketAddr,
     pub outbound_ip: IpAddr,
+    pub udp_port_range: Option<UdpPortRange>,
+    pub udp_advertise_address: Option<IpAddr>,
     pub node_refresh_interval: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UdpPortRange {
+    pub start: u16,
+    pub end: u16,
+}
+
+impl UdpPortRange {
+    pub fn port_count(self) -> usize {
+        usize::from(self.end - self.start) + 1
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -100,6 +114,17 @@ pub fn load_proxy_config(path: &Path) -> Result<ProxyConfig> {
     }
     let outbound_ip =
         parse_outbound_ip(values.get("outbound-ip").map(String::as_str), listen.ip())?;
+    let udp_port_range = values
+        .get("udp-port-range")
+        .map(|value| parse_udp_port_range(value))
+        .transpose()?;
+    let udp_advertise_address = values
+        .get("udp-advertise-address")
+        .map(|value| parse_udp_advertise_address(value, outbound_ip))
+        .transpose()?;
+    if udp_port_range.is_some() != udp_advertise_address.is_some() {
+        bail!("udp-port-range and udp-advertise-address must be configured together");
+    }
     let node_refresh_interval = match values.get("node-refresh-interval") {
         Some(value) => {
             let duration =
@@ -144,6 +169,8 @@ pub fn load_proxy_config(path: &Path) -> Result<ProxyConfig> {
         listen,
         nodelist_listen,
         outbound_ip,
+        udp_port_range,
+        udp_advertise_address,
         node_refresh_interval,
     })
 }
@@ -301,6 +328,8 @@ fn parse_proxy_config(content: &[u8]) -> Result<HashMap<String, String>> {
         "socks5-listen",
         "nodelist-listen",
         "outbound-ip",
+        "udp-port-range",
+        "udp-advertise-address",
         "node-refresh-interval",
         "request-timeout",
         "udp-idle-timeout",
@@ -407,6 +436,42 @@ fn parse_outbound_ip(value: Option<&str>, socks5_ip: IpAddr) -> Result<IpAddr> {
         bail!("outbound-ip and listen must use the same IP family");
     }
     Ok(outbound)
+}
+
+fn parse_udp_port_range(value: &str) -> Result<UdpPortRange> {
+    let Some((start, end)) = value.split_once('-') else {
+        bail!("udp-port-range must use START-END");
+    };
+    if start.is_empty() || end.is_empty() || end.contains('-') {
+        bail!("udp-port-range must use START-END");
+    }
+    let start = start
+        .parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("udp-port-range start must be between 1 and 65535"))?;
+    let end = end
+        .parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("udp-port-range end must be between 1 and 65535"))?;
+    if start == 0 || end == 0 || start > end {
+        bail!("udp-port-range must be an ordered non-zero START-END range");
+    }
+    let range = UdpPortRange { start, end };
+    if range.port_count() > 4096 {
+        bail!("udp-port-range cannot contain more than 4096 ports");
+    }
+    Ok(range)
+}
+
+fn parse_udp_advertise_address(value: &str, bind_ip: IpAddr) -> Result<IpAddr> {
+    let address: IpAddr = value.parse().map_err(|_| {
+        anyhow::anyhow!("udp-advertise-address must be a specific, non-multicast numeric IP")
+    })?;
+    if address.is_unspecified() || address.is_multicast() {
+        bail!("udp-advertise-address must be a specific, non-multicast numeric IP");
+    }
+    if address.is_ipv4() != bind_ip.is_ipv4() {
+        bail!("udp-advertise-address and outbound-ip must use the same IP family");
+    }
+    Ok(address)
 }
 
 fn resolve_socks_credentials(config_dir: &Path, raw: &FileConfig) -> Result<(String, String)> {
@@ -649,5 +714,80 @@ mod tests {
         assert_eq!(config.runtime.reuse_max_uses, 128);
         assert_eq!(config.runtime.reuse_idle_timeout, Duration::from_secs(120));
         assert_eq!(config.runtime.perf_trace_sample_every, 1000);
+    }
+
+    #[test]
+    fn proxy_config_maps_udp_relay_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oixc-proxy.conf");
+        fs::write(
+            &path,
+            concat!(
+                "token=token\n",
+                "listen=0.0.0.0:6172\n",
+                "outbound-ip=192.0.2.10\n",
+                "udp-port-range=10000-10099\n",
+                "udp-advertise-address=198.51.100.10\n",
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let config = load_proxy_config(&path).unwrap();
+        assert_eq!(
+            config.udp_port_range,
+            Some(UdpPortRange {
+                start: 10000,
+                end: 10099,
+            })
+        );
+        assert_eq!(
+            config.udp_advertise_address,
+            Some("198.51.100.10".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn udp_relay_range_and_advertise_address_are_paired() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oixc-proxy.conf");
+        fs::write(
+            &path,
+            concat!(
+                "token=token\n",
+                "listen=0.0.0.0:6172\n",
+                "outbound-ip=192.0.2.10\n",
+                "udp-port-range=10000-10099\n",
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        assert!(
+            load_proxy_config(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("must be configured together")
+        );
+    }
+
+    #[test]
+    fn udp_port_range_is_bounded_and_ordered() {
+        assert_eq!(
+            parse_udp_port_range("10000-10099").unwrap().port_count(),
+            100
+        );
+        assert!(parse_udp_port_range("10099-10000").is_err());
+        assert!(parse_udp_port_range("0-100").is_err());
+        assert!(parse_udp_port_range("1-5000").is_err());
+        assert!(parse_udp_port_range("10000").is_err());
     }
 }

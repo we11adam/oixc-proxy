@@ -229,7 +229,7 @@ async fn start_gateway(client: SnellClient, sample_every: usize) -> Result<Socke
     let options = socks5::Options {
         handshake_timeout: Duration::from_secs(10),
         udp_idle_timeout: Duration::from_secs(30),
-        udp_bind_address: "127.0.0.1".parse().unwrap(),
+        udp_relay: oixc_proxy::socks5::UdpRelay::ephemeral("127.0.0.1".parse().unwrap()),
         mode: Mode::Fixed {
             route: Route { client, udp: false },
             credentials: None,

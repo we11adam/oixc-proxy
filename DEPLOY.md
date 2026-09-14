@@ -91,6 +91,8 @@ token=YOUR_OIXCLOUD_ACCESS_TOKEN
 | `listen` | 否 | `127.0.0.1:6172` | Mixed HTTP/SOCKS5 监听地址 |
 | `nodelist-listen` | 否 | `127.0.0.1:6173` | HTTP nodelist 监听地址 |
 | `outbound-ip` | 条件 | 同 socks5 IP | listen 为 `0.0.0.0` 时**必填**，写入 provider 条目并用于 UDP 绑定 |
+| `udp-port-range` | 条件 | 动态端口 | 远程 SOCKS5 UDP relay 的固定端口范围，如 `10000-10099` |
+| `udp-advertise-address` | 条件 | UDP 绑定 IP | SOCKS5 UDP 响应中返回的客户端可达 IP；必须与端口范围同时配置 |
 | `node-refresh-interval` | 否 | `1h` | 节点目录刷新周期，范围 `1m` ~ `24h` |
 | `request-timeout` | 否 | `15s` | 控制面与节点操作超时，最大 `2m` |
 | `udp-idle-timeout` | 否 | `5m` | SOCKS5 UDP association 空闲超时 |
@@ -115,13 +117,15 @@ token=YOUR_OIXCLOUD_ACCESS_TOKEN
 listen=0.0.0.0:6172
 nodelist-listen=0.0.0.0:6173
 outbound-ip=192.168.1.10        # 替换为本机局域网 IP（ifconfig | grep "inet " 查看）
+udp-port-range=10000-10099
+udp-advertise-address=192.168.1.10
 node-refresh-interval=1h
 ```
 
 - macOS：首次监听 `0.0.0.0` 时，macOS 会弹出“是否允许传入网络连接”的
   防火墙对话框，选择**允许**；之后可在系统设置 → 网络 → 防火墙 → 选项
   中调整。
-- Linux：需在系统防火墙放行 6172/6173 端口（`firewalld` / `ufw`）。
+- Linux：需在系统防火墙放行 6172/6173 TCP；启用远程 SOCKS5 UDP 时还要放行配置的 UDP 端口范围（`firewalld` / `ufw`）。
 
 ### 验证 token（可选但推荐）
 
@@ -184,6 +188,9 @@ rules:
 - provider 中每个节点已包含 `server`、`port`、`username`、`password`；
   默认声明为 HTTP 代理。需要 SOCKS5（含 UDP）时在 URL 后加 `?socks=1`；
   客户端**无需**额外配置认证信息；
+- 回环监听会直接声明节点的 UDP 能力；局域网、Docker 或 NAT 部署只有在
+  `udp-port-range` 与 `udp-advertise-address` 同时有效时才声明 UDP。映射和
+  防火墙必须使用完全相同的 UDP 端口范围；
 - `username` 是节点名的可逆编码（selector），`password` 是 HMAC 派生的
   路由密钥；均由 oixc-proxy 自动生成，**不要手动修改**；
 - 默认只发布名称含 `Fusion`、`CIA` 或 `IXP` 标记的节点；若账户没有这些
@@ -585,6 +592,8 @@ token=YOUR_OIXCLOUD_ACCESS_TOKEN
 listen=0.0.0.0:6172
 nodelist-listen=0.0.0.0:6173
 outbound-ip=192.168.1.2
+udp-port-range=10000-10099
+udp-advertise-address=192.168.1.2
 node-refresh-interval=1h
 OIXC_EOF
   chmod 600 /root/.config/oixc-proxy/oixc-proxy.conf
@@ -593,28 +602,35 @@ OIXC_EOF
 
 > 将 `YOUR_OIXCLOUD_ACCESS_TOKEN` 替换为真实 token，
 > `192.168.1.2` 替换为 N1 的实际 LAN IP。局域网共享必须监听 `0.0.0.0`
-> 并填写 `outbound-ip`（即 N1 的 LAN IP）。
+> 并填写 `outbound-ip`（即 N1 的 LAN IP）。如需让局域网客户端使用
+> SOCKS5 UDP，还要配置同地址的 `udp-advertise-address` 和固定端口范围。
 
 ### 防火墙
 
-OpenWrt 默认阻止 LAN 到路由器自身的新入站连接。放行两个端口：
+OpenWrt 默认阻止 LAN 到路由器自身的新入站连接。放行两个 TCP 端口和配置的 UDP relay 范围：
 
 ```sh
 ssh root@192.168.1.2 '
   # 避免重复添加：先检查是否已存在
-  if ! uci show firewall 2>/dev/null | grep -q "oixc-proxy"; then
+  if ! uci show firewall 2>/dev/null | grep -q "oixc-proxy-tcp"; then
     uci add firewall rule
-    uci set firewall.@rule[-1].name="oixc-proxy"
+    uci set firewall.@rule[-1].name="oixc-proxy-tcp"
     uci set firewall.@rule[-1].src="lan"
     uci set firewall.@rule[-1].proto="tcp"
     uci set firewall.@rule[-1].dest_port="6172 6173"
     uci set firewall.@rule[-1].target="ACCEPT"
-    uci commit firewall
-    /etc/init.d/firewall reload
-    echo "firewall rule added"
-  else
-    echo "firewall rule already exists"
   fi
+  if ! uci show firewall 2>/dev/null | grep -q "oixc-proxy-udp"; then
+    uci add firewall rule
+    uci set firewall.@rule[-1].name="oixc-proxy-udp"
+    uci set firewall.@rule[-1].src="lan"
+    uci set firewall.@rule[-1].proto="udp"
+    uci set firewall.@rule[-1].dest_port="10000-10099"
+    uci set firewall.@rule[-1].target="ACCEPT"
+  fi
+  uci commit firewall
+  /etc/init.d/firewall reload
+  echo "firewall rules ready"
 '
 ```
 

@@ -1,5 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -10,6 +11,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
+use crate::config::UdpPortRange;
 use crate::gateway::{GatewayManager, Route};
 use crate::snell::{SnellPacketSession, SnellSession, SnellSessionReader, SnellSessionWriter};
 
@@ -40,8 +42,75 @@ pub struct Credentials {
 pub struct Options {
     pub handshake_timeout: Duration,
     pub udp_idle_timeout: Duration,
-    pub udp_bind_address: IpAddr,
+    pub udp_relay: UdpRelay,
     pub mode: Mode,
+}
+
+#[derive(Clone)]
+pub struct UdpRelay {
+    bind_address: IpAddr,
+    advertise_address: IpAddr,
+    port_range: Option<UdpPortRange>,
+    next_port: Arc<AtomicUsize>,
+}
+
+impl UdpRelay {
+    pub fn ephemeral(bind_address: IpAddr) -> Self {
+        Self {
+            bind_address,
+            advertise_address: bind_address,
+            port_range: None,
+            next_port: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn fixed(
+        bind_address: IpAddr,
+        advertise_address: IpAddr,
+        port_range: UdpPortRange,
+    ) -> Result<Self> {
+        if bind_address.is_unspecified() || bind_address.is_multicast() {
+            bail!("SOCKS5 UDP bind address must be a specific, non-multicast IP");
+        }
+        if advertise_address.is_unspecified() || advertise_address.is_multicast() {
+            bail!("SOCKS5 UDP advertise address must be a specific, non-multicast IP");
+        }
+        if bind_address.is_ipv4() != advertise_address.is_ipv4() {
+            bail!("SOCKS5 UDP bind and advertise addresses must use the same IP family");
+        }
+        Ok(Self {
+            bind_address,
+            advertise_address,
+            port_range: Some(port_range),
+            next_port: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    async fn bind(&self) -> Result<(UdpSocket, SocketAddr)> {
+        let Some(range) = self.port_range else {
+            let socket = UdpSocket::bind(SocketAddr::new(self.bind_address, 0))
+                .await
+                .map_err(|_| anyhow::anyhow!("listen for SOCKS5 UDP relay"))?;
+            let advertised = SocketAddr::new(self.advertise_address, socket.local_addr()?.port());
+            return Ok((socket, advertised));
+        };
+
+        let count = range.port_count();
+        let first = self.next_port.fetch_add(1, Ordering::Relaxed) % count;
+        for offset in 0..count {
+            let index = (first + offset) % count;
+            let port = range.start + index as u16;
+            match UdpSocket::bind(SocketAddr::new(self.bind_address, port)).await {
+                Ok(socket) => {
+                    self.next_port.store(index + 1, Ordering::Relaxed);
+                    return Ok((socket, SocketAddr::new(self.advertise_address, port)));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(_) => bail!("listen for SOCKS5 UDP relay"),
+            }
+        }
+        bail!("all configured SOCKS5 UDP relay ports are in use")
+    }
 }
 
 struct Request {
@@ -357,14 +426,8 @@ async fn download(mut client: OwnedWriteHalf, mut session: SnellSessionReader<'_
 }
 
 async fn serve_udp_associate(mut client: TcpStream, route: Route, options: Options) -> Result<()> {
-    if options.udp_bind_address.is_unspecified() {
-        bail!("SOCKS5 UDP bind address must be a specific IP");
-    }
-    let local = Arc::new(
-        UdpSocket::bind(SocketAddr::new(options.udp_bind_address, 0))
-            .await
-            .map_err(|_| anyhow::anyhow!("listen for SOCKS5 UDP relay"))?,
-    );
+    let (local, advertised) = options.udp_relay.bind().await?;
+    let local = Arc::new(local);
     let upstream = Arc::new(
         route
             .client
@@ -372,7 +435,7 @@ async fn serve_udp_associate(mut client: TcpStream, route: Route, options: Optio
             .await
             .map_err(|_| anyhow::anyhow!("open upstream UDP association"))?,
     );
-    write_reply(&mut client, 0, Some(local.local_addr()?)).await?;
+    write_reply(&mut client, 0, Some(advertised)).await?;
     let control_ip = client.peer_addr().ok().map(|address| address.ip());
     let client_address = Arc::new(Mutex::new(None::<SocketAddr>));
 
@@ -543,4 +606,74 @@ async fn write_reply(
 fn constant_time_equal(first: &[u8], second: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
     first.ct_eq(second).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fixed_udp_relay_advertises_configured_address_and_reuses_ports() {
+        let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let relay = UdpRelay::fixed(
+            "127.0.0.1".parse().unwrap(),
+            "192.0.2.10".parse().unwrap(),
+            UdpPortRange {
+                start: port,
+                end: port,
+            },
+        )
+        .unwrap();
+
+        let (first, advertised) = relay.bind().await.unwrap();
+        assert_eq!(
+            advertised,
+            SocketAddr::new("192.0.2.10".parse().unwrap(), port)
+        );
+        assert!(relay.bind().await.is_err());
+        drop(first);
+        let (reused, _) = relay.bind().await.unwrap();
+        assert_eq!(reused.local_addr().unwrap().port(), port);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_udp_relay_uses_its_bound_address() {
+        let relay = UdpRelay::ephemeral("127.0.0.1".parse().unwrap());
+        let (socket, advertised) = relay.bind().await.unwrap();
+        assert_eq!(advertised, socket.local_addr().unwrap());
+        assert_ne!(advertised.port(), 0);
+    }
+
+    #[tokio::test]
+    async fn fixed_udp_relay_skips_an_occupied_port() {
+        let mut pair = None;
+        for start in 30000..60000u16 {
+            let Ok(occupied) = UdpSocket::bind(("127.0.0.1", start)).await else {
+                continue;
+            };
+            let Ok(next) = UdpSocket::bind(("127.0.0.1", start + 1)).await else {
+                continue;
+            };
+            drop(next);
+            pair = Some((start, occupied));
+            break;
+        }
+        let (start, occupied) = pair.expect("find two adjacent UDP ports for the test");
+        let relay = UdpRelay::fixed(
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+            UdpPortRange {
+                start,
+                end: start + 1,
+            },
+        )
+        .unwrap();
+
+        let (socket, advertised) = relay.bind().await.unwrap();
+        assert_eq!(advertised.port(), start + 1);
+        drop(occupied);
+        drop(socket);
+    }
 }
