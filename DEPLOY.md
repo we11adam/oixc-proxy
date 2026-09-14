@@ -40,7 +40,7 @@ sh install.sh
 下载脚本。OpenWrt 没有 `gh` 时，先在已认证的控制机下载并校验对应资产，
 再通过 `scp -O` 传入设备。
 
-固定版本用 `sh install.sh --version v0.1.0`。OpenWrt 的 procd 配置默认使用
+固定版本用 `sh install.sh --version v0.2.0`。OpenWrt 的 procd 配置默认使用
 `/usr/bin/oixc-proxy`，因此传入 `--install-dir /usr/bin`。脚本只安装二进制，
 不会创建配置、安装服务或重启现有进程；首次安装继续按对应平台章节操作，
 更新已有服务则在安装后按对应章节重启并检查健康端点。

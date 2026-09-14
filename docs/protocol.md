@@ -16,7 +16,7 @@ The built-in API base is `https://oix-api.dler.io`.
 | Account information | `POST /api/v1/information` |
 
 All requests use `Authorization: Bearer TOKEN`, `Accept: application/json` and
-`User-Agent: oixc-proxy/0.1`. Redirects are not followed and no environment
+`User-Agent: oixc-proxy/<Cargo package version>`. Redirects are not followed and no environment
 HTTP proxy is used.
 
 For each managed request:

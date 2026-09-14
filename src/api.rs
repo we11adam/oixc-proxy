@@ -19,7 +19,7 @@ pub const HEADER_SIGNATURE: &str = "X-Anywhere-Signature";
 pub const HEADER_AGE_PUBKEY: &str = "X-Anywhere-Age-Pubkey";
 pub const HEADER_RESPONSE_SIGNATURE: &str = "X-Anywhere-Response-Signature";
 const MAX_RESPONSE_BYTES: usize = 8 << 20;
-const USER_AGENT: &str = "oixc-proxy/0.1";
+const USER_AGENT: &str = concat!("oixc-proxy/", env!("CARGO_PKG_VERSION"));
 type HmacSha256 = Hmac<Sha256>;
 
 pub struct Client {
