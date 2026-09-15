@@ -44,6 +44,19 @@ pub fn enabled() -> bool {
     CURRENT.try_with(|_| ()).is_ok()
 }
 
+pub fn configured() -> bool {
+    SAMPLE_EVERY.load(Ordering::Relaxed) != 0
+}
+
+pub fn diagnostic(stage: &str, fields: &[(&str, String)]) {
+    if !configured() {
+        return;
+    }
+    let mut message = format!("diagnostic stage={stage}");
+    append_fields(&mut message, fields);
+    eprintln!("{message}");
+}
+
 pub fn event(stage: &str, fields: &[(&str, String)]) {
     write(stage, None, None, fields);
 }
@@ -69,17 +82,21 @@ fn write(stage: &str, step: Option<Duration>, status_ok: Option<bool>, fields: &
                 " status=error"
             });
         }
-        for (key, value) in fields {
-            if key.is_empty() {
-                continue;
-            }
-            message.push(' ');
-            message.push_str(key);
-            message.push('=');
-            message.push_str(&value.replace(['\r', '\n'], " "));
-        }
+        append_fields(&mut message, fields);
         eprintln!("{message}");
     });
+}
+
+fn append_fields(message: &mut String, fields: &[(&str, String)]) {
+    for (key, value) in fields {
+        if key.is_empty() {
+            continue;
+        }
+        message.push(' ');
+        message.push_str(key);
+        message.push('=');
+        message.push_str(&value.replace(['\r', '\n'], " "));
+    }
 }
 
 fn should_sample(request: u64, sample_every: u64) -> bool {

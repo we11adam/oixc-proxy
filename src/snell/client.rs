@@ -320,6 +320,14 @@ impl SnellClient {
                     .is_ok()
                 {
                     idle.uses += 1;
+                    crate::perftrace::event(
+                        "snell.connection",
+                        &[
+                            ("action", "reuse".to_owned()),
+                            ("uses", idle.uses.to_string()),
+                            ("generation", network_generation.to_string()),
+                        ],
+                    );
                     return Ok(SnellSession {
                         physical: idle.physical,
                         client: self.clone(),
@@ -327,11 +335,25 @@ impl SnellClient {
                         reusable: true,
                     });
                 }
+                crate::perftrace::event(
+                    "snell.connection",
+                    &[
+                        ("action", "retire_failed_reuse".to_owned()),
+                        ("generation", network_generation.to_string()),
+                    ],
+                );
                 idle.physical.retire().await;
             }
         }
 
         let physical = Box::new(self.open_tcp(host, port, self.inner.options.reuse).await?);
+        crate::perftrace::event(
+            "snell.connection",
+            &[
+                ("action", "new".to_owned()),
+                ("generation", physical.network_generation.to_string()),
+            ],
+        );
         Ok(SnellSession {
             physical,
             client: self.clone(),

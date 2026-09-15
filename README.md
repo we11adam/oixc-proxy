@@ -183,7 +183,7 @@ target/release/oixc-proxy install-launch-agent
 launchctl print "gui/$(id -u)/io.oixc.proxy"
 ```
 
-当 `perf-trace-sample-every` 非零时，stderr 日志会包含已脱敏、按请求划分的性能事件，覆盖 SOCKS 解析、DNS/TCP/TLS 建连、首个 Snell flight、双向首包和 relay 清理。追踪默认关闭，避免同步日志输出拖慢数据面。它绝不会记录 token、PSK、目标名称、ECH 配置或派生密钥材料。
+当 `perf-trace-sample-every` 非零时，stderr 日志会包含已脱敏、按请求划分的性能事件，覆盖 SOCKS 解析、物理出口初始化与切换、连接使用的接口/源地址/地址族、DNS/TCP/TLS 建连、Snell transport 新建与复用、首个 Snell flight、双向首包和 relay 清理。追踪默认关闭，避免同步日志输出拖慢数据面。它绝不会记录 token、PSK、目标名称、远端地址、ECH 配置或派生密钥材料。
 
 ## 在 Linux 上安装服务
 

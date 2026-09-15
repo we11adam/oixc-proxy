@@ -177,6 +177,7 @@ impl EchDialer {
 
     async fn dial_tcp(&self) -> Result<(TcpStream, u64)> {
         let network = self.network.snapshot().await;
+        crate::perftrace::event("network.snapshot", &network.diagnostic_fields());
         let dns_started = Instant::now();
         let addresses = match self.resolver.lookup(&self.server, &network).await {
             Ok(Some(addresses)) => Ok(addresses
@@ -201,17 +202,57 @@ impl EchDialer {
             .and_then(|value| value.filter(|(generation, _)| *generation == network.generation()))
             .map(|(_, address)| address);
         let addresses = interleave_addresses(addresses, preferred);
-        let (stream, address) = connect_happy_eyeballs(addresses, network.clone())
-            .await
-            .map_err(|error| match error.kind() {
-                io::ErrorKind::ConnectionRefused => {
-                    anyhow::anyhow!("ECH-TLS node refused the connection")
-                }
-                io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable => {
-                    anyhow::anyhow!("ECH-TLS node network is unreachable")
-                }
-                _ => anyhow::anyhow!("connect to ECH-TLS node"),
-            })?;
+        if crate::perftrace::enabled() {
+            crate::perftrace::event(
+                "network.candidates",
+                &[
+                    ("count", addresses.len().to_string()),
+                    (
+                        "families",
+                        addresses
+                            .iter()
+                            .map(|address| if address.is_ipv4() { "ipv4" } else { "ipv6" })
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ),
+                ],
+            );
+        }
+        let connected = connect_happy_eyeballs(addresses, network.clone()).await;
+        if let Err(error) = &connected {
+            crate::perftrace::event(
+                "network.connect_error",
+                &[("kind", format!("{:?}", error.kind()))],
+            );
+        }
+        let (stream, address) = connected.map_err(|error| match error.kind() {
+            io::ErrorKind::ConnectionRefused => {
+                anyhow::anyhow!("ECH-TLS node refused the connection")
+            }
+            io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable => {
+                anyhow::anyhow!("ECH-TLS node network is unreachable")
+            }
+            _ => anyhow::anyhow!("connect to ECH-TLS node"),
+        })?;
+        if crate::perftrace::enabled() {
+            let local = stream.local_addr().ok();
+            crate::perftrace::event(
+                "network.connected",
+                &[
+                    (
+                        "family",
+                        if address.is_ipv4() { "ipv4" } else { "ipv6" }.to_owned(),
+                    ),
+                    (
+                        "local",
+                        local
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                    ),
+                    ("generation", network.generation().to_string()),
+                ],
+            );
+        }
         if let Ok(mut preferred) = self.last_success.lock() {
             *preferred = Some((network.generation(), address));
         }

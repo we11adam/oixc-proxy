@@ -47,7 +47,20 @@ struct InterfaceAddress {
 
 impl NetworkMonitor {
     pub fn new(pinned_ip: Option<IpAddr>) -> Self {
-        let selection = detect_egress(pinned_ip).unwrap_or_else(|_| EgressSelection::empty());
+        let detected = detect_egress(pinned_ip);
+        let selection = detected
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|_| EgressSelection::empty());
+        let mut fields = selection.diagnostic_fields(1, pinned_ip);
+        fields.push((
+            "status",
+            if detected.is_ok() { "ok" } else { "error" }.to_owned(),
+        ));
+        if let Err(error) = &detected {
+            fields.push(("error", error.to_string()));
+        }
+        crate::perftrace::diagnostic("network.initial", &fields);
         Self {
             pinned_ip,
             state: Arc::new(Mutex::new(MonitorState {
@@ -64,8 +77,28 @@ impl NetworkMonitor {
             let pinned_ip = self.pinned_ip;
             let detected = tokio::task::spawn_blocking(move || detect_egress(pinned_ip)).await;
             state.checked_at = Instant::now();
-            if let Ok(Ok(selection)) = detected {
-                state.update(selection);
+            match detected {
+                Ok(Ok(selection)) => {
+                    if state.update(selection) {
+                        crate::perftrace::diagnostic(
+                            "network.changed",
+                            &state
+                                .selection
+                                .diagnostic_fields(state.generation, self.pinned_ip),
+                        );
+                    }
+                }
+                Ok(Err(error)) => crate::perftrace::diagnostic(
+                    "network.refresh",
+                    &[("status", "error".to_owned()), ("error", error.to_string())],
+                ),
+                Err(error) => crate::perftrace::diagnostic(
+                    "network.refresh",
+                    &[
+                        ("status", "join_error".to_owned()),
+                        ("error", error.to_string()),
+                    ],
+                ),
             }
         }
         NetworkSnapshot {
@@ -77,11 +110,13 @@ impl NetworkMonitor {
 }
 
 impl MonitorState {
-    fn update(&mut self, selection: EgressSelection) {
+    fn update(&mut self, selection: EgressSelection) -> bool {
         if self.selection != selection {
             self.selection = selection;
             self.generation = self.generation.wrapping_add(1).max(1);
+            return true;
         }
+        false
     }
 }
 
@@ -97,6 +132,47 @@ impl EgressSelection {
 
     fn has_address(&self) -> bool {
         self.ipv4.is_some() || self.ipv6.is_some()
+    }
+
+    fn diagnostic_fields(
+        &self,
+        generation: u64,
+        pinned_ip: Option<IpAddr>,
+    ) -> Vec<(&'static str, String)> {
+        vec![
+            ("generation", generation.to_string()),
+            (
+                "mode",
+                if pinned_ip.is_some() {
+                    "pinned"
+                } else {
+                    "automatic"
+                }
+                .to_owned(),
+            ),
+            (
+                "interface",
+                self.interface_name.as_deref().unwrap_or("none").to_owned(),
+            ),
+            (
+                "interface_index",
+                self.interface_index
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_owned()),
+            ),
+            (
+                "ipv4",
+                self.ipv4
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_owned()),
+            ),
+            (
+                "ipv6",
+                self.ipv6
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_owned()),
+            ),
+        ]
     }
 
     #[cfg(target_os = "linux")]
@@ -132,6 +208,11 @@ impl NetworkSnapshot {
 
     pub fn interface_name(&self) -> Option<&str> {
         self.selection.interface_name.as_deref()
+    }
+
+    pub fn diagnostic_fields(&self) -> Vec<(&'static str, String)> {
+        self.selection
+            .diagnostic_fields(self.generation, self.pinned_ip)
     }
 
     fn source_for(&self, destination: SocketAddr) -> Option<IpAddr> {
