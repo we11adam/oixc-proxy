@@ -11,7 +11,7 @@ use base64::Engine as _;
 use rustls::client::{EchConfig, EchMode};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{EchConfigListBytes, ServerName};
-use rustls::{ClientConfig, ProtocolVersion, RootCertStore};
+use rustls::{CertificateError, ClientConfig, ProtocolVersion};
 use tokio::net::{TcpSocket, TcpStream, lookup_host};
 use tokio::task::JoinSet;
 use tokio::time::{Instant as TokioInstant, sleep, timeout};
@@ -23,6 +23,7 @@ use crate::nodes::Proxy;
 use crate::snell::Exporter;
 
 use super::PrivateDnsResolver;
+use super::trust::{TrustSnapshot, TrustStore};
 
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-Dler-Snell-Identity-v2";
 const MAX_ECH_CONFIG_LENGTH: usize = 64 << 10;
@@ -35,10 +36,15 @@ pub struct EchConnection {
 }
 
 pub struct TransportContext {
-    roots: Arc<RootCertStore>,
+    roots: Arc<TrustStore>,
     provider: Arc<CryptoProvider>,
     resolver: PrivateDnsResolver,
     network: NetworkMonitor,
+}
+
+struct CachedTlsConfig {
+    generation: u64,
+    config: Arc<ClientConfig>,
 }
 
 #[derive(Clone)]
@@ -48,7 +54,9 @@ pub struct EchDialer {
     port: u16,
     alpn: Vec<u8>,
     timeout: Duration,
-    tls_config: Arc<ClientConfig>,
+    tls_config: Arc<Mutex<Option<CachedTlsConfig>>>,
+    ech: Arc<EchConfig>,
+    context: Arc<TransportContext>,
     resolver: PrivateDnsResolver,
     network: NetworkMonitor,
     last_success: Arc<Mutex<Option<(u64, SocketAddr)>>>,
@@ -60,16 +68,8 @@ impl TransportContext {
     }
 
     pub fn built_in_with_network(network: NetworkMonitor) -> Result<Self> {
-        let mut roots = RootCertStore::empty();
-        let native = rustls_native_certs::load_native_certs();
-        for certificate in native.certs {
-            let _ = roots.add(certificate);
-        }
-        if roots.is_empty() {
-            bail!("load system TLS root certificates");
-        }
         Ok(Self {
-            roots: Arc::new(roots),
+            roots: Arc::new(TrustStore::new()?),
             provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
             resolver: PrivateDnsResolver::built_in()?,
             network,
@@ -110,23 +110,18 @@ impl EchDialer {
             rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES,
         )
         .map_err(|_| anyhow::anyhow!("ECH config list is unsupported"))?;
-        let mut tls_config = ClientConfig::builder_with_provider(context.provider.clone())
-            .with_ech(EchMode::Enable(ech))
-            .map_err(|_| anyhow::anyhow!("configure ECH-TLS"))?
-            .with_root_certificates(context.roots.clone())
-            .with_no_client_auth();
-        tls_config.alpn_protocols = vec![proxy.obfs.alpn.as_bytes().to_vec()];
-
         Ok(Self {
             server: proxy.server.clone(),
             sni: proxy.obfs.sni.clone(),
             port: proxy.port,
             alpn: proxy.obfs.alpn.as_bytes().to_vec(),
             timeout: dial_timeout,
-            tls_config: Arc::new(tls_config),
+            tls_config: Arc::new(Mutex::new(None)),
+            ech: Arc::new(ech),
             resolver: context.resolver.clone(),
             network: context.network.clone(),
             last_success: Arc::new(Mutex::new(None)),
+            context,
         })
     }
 
@@ -140,6 +135,52 @@ impl EchDialer {
     }
 
     async fn dial_inner(&self) -> Result<EchConnection> {
+        let trust = self.context.roots.snapshot().await;
+        match self.dial_with_trust(&trust).await {
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(unknown_issuer)
+                }) =>
+            {
+                let refreshed = self.context.roots.refresh(trust.generation).await;
+                if refreshed.generation != trust.generation {
+                    // Retry only the handshake, before any application payload is sent.
+                    self.dial_with_trust(&refreshed).await
+                } else {
+                    Err(error)
+                }
+            }
+            result => result,
+        }
+    }
+
+    fn config_for(&self, trust: &TrustSnapshot) -> Result<Arc<ClientConfig>> {
+        let mut cached = self
+            .tls_config
+            .lock()
+            .map_err(|_| anyhow::anyhow!("TLS configuration lock poisoned"))?;
+        if let Some(cached) = &*cached {
+            if cached.generation == trust.generation {
+                return Ok(cached.config.clone());
+            }
+        }
+        let mut config = ClientConfig::builder_with_provider(self.context.provider.clone())
+            .with_ech(EchMode::Enable((*self.ech).clone()))
+            .map_err(|_| anyhow::anyhow!("configure ECH-TLS"))?
+            .with_root_certificates(trust.roots.clone())
+            .with_no_client_auth();
+        config.alpn_protocols = vec![self.alpn.clone()];
+        let config = Arc::new(config);
+        *cached = Some(CachedTlsConfig {
+            generation: trust.generation,
+            config: config.clone(),
+        });
+        Ok(config)
+    }
+
+    async fn dial_with_trust(&self, trust: &TrustSnapshot) -> Result<EchConnection> {
         let tcp_started = Instant::now();
         let raw = self.dial_tcp().await;
         crate::perftrace::stage("ech.tcp_connect", tcp_started, raw.is_ok(), &[]);
@@ -147,12 +188,29 @@ impl EchDialer {
         raw.set_nodelay(true).ok();
         let server_name = ServerName::try_from(self.sni.clone())
             .map_err(|_| anyhow::anyhow!("ECH-TLS server name is invalid"))?;
-        let connector = TlsConnector::from(self.tls_config.clone());
+        let connector = TlsConnector::from(self.config_for(trust)?);
         let handshake_started = Instant::now();
-        let stream = connector.connect(server_name, raw).await.map_err(|_| {
-            anyhow::anyhow!("perform ECH-TLS handshake: TLS verification or negotiation failed")
-        });
+        let stream = connector.connect(server_name, raw).await;
         crate::perftrace::stage("ech.tls_handshake", handshake_started, stream.is_ok(), &[]);
+        if let Err(error) = &stream {
+            // Fixed categories avoid leaking hostnames or certificate contents.
+            crate::perftrace::event(
+                "ech.tls_error",
+                &[
+                    (
+                        "reason",
+                        if unknown_issuer(error) {
+                            "unknown_issuer"
+                        } else {
+                            "tls_or_io"
+                        }
+                        .to_owned(),
+                    ),
+                    ("roots", trust.roots.len().to_string()),
+                    ("trust_generation", trust.generation.to_string()),
+                ],
+            );
+        }
         let stream = stream?;
         let connection = stream.get_ref().1;
         if connection.protocol_version() != Some(ProtocolVersion::TLSv1_3) {
@@ -258,6 +316,17 @@ impl EchDialer {
         }
         Ok((stream, network.generation()))
     }
+}
+
+fn unknown_issuer(error: &io::Error) -> bool {
+    matches!(
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<rustls::Error>()),
+        Some(rustls::Error::InvalidCertificate(
+            CertificateError::UnknownIssuer
+        ))
+    )
 }
 
 fn interleave_addresses(
@@ -394,6 +463,71 @@ fn validate_profile(proxy: &Proxy) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reload_is_only_triggered_by_unknown_issuer() {
+        assert!(unknown_issuer(&io::Error::other(
+            rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer,)
+        )));
+        for error in [CertificateError::Expired, CertificateError::BadSignature] {
+            assert!(!unknown_issuer(&io::Error::other(
+                rustls::Error::InvalidCertificate(error)
+            )));
+        }
+        assert!(!unknown_issuer(&io::Error::other("unknown issuer")));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires OIXC_TLS_TEST_CACHE and live managed HK node"]
+    async fn live_recovers_incomplete_trust_without_restart() {
+        let path = std::env::var("OIXC_TLS_TEST_CACHE").unwrap();
+        let value: serde_yaml::Value =
+            serde_yaml::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let managed: crate::nodes::ManagedConfig =
+            serde_yaml::from_value(value["managed"].clone()).unwrap();
+        let proxy = managed
+            .proxies
+            .iter()
+            .find(|p| p.name.contains("香港 Fusion 01"))
+            .unwrap();
+        let context = Arc::new(TransportContext::built_in().unwrap());
+        let mut incomplete = rustls::RootCertStore::empty();
+        // Keep a real but unrelated local CA, reproducing the captured process.
+        let roots = context.roots.snapshot().await;
+        incomplete.roots = roots
+            .roots
+            .roots
+            .iter()
+            .filter(|root| {
+                root.subject
+                    .as_ref()
+                    .windows(5)
+                    .any(|part| part == b"Surge")
+            })
+            .cloned()
+            .collect();
+        assert!(!incomplete.is_empty(), "test requires the local Surge CA");
+        context.roots.replace_for_test(incomplete).await;
+        let dialer =
+            EchDialer::new_with_context(proxy, Duration::from_secs(15), context.clone()).unwrap();
+        let before = context.roots.snapshot().await;
+        let error = match dialer.dial_with_trust(&before).await {
+            Err(error) => error,
+            Ok(_) => panic!("incomplete trust unexpectedly accepted server"),
+        };
+        assert!(
+            error
+                .downcast_ref::<io::Error>()
+                .is_some_and(unknown_issuer)
+        );
+        dialer
+            .dial()
+            .await
+            .expect("must reload trust and retry successfully");
+        let after = context.roots.snapshot().await;
+        assert!(after.generation > before.generation);
+        assert!(after.roots.len() > before.roots.len());
+    }
 
     #[test]
     fn happy_eyeballs_order_interleaves_families_and_prefers_last_success() {
