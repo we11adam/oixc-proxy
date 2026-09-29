@@ -20,7 +20,7 @@ sh install.sh
 安装脚本会检测主机目标平台，用 Release 中的 `SHA256SUMS` 验证压缩包，检查二进制版本，并以原子方式安装到 `/usr/local/bin/oixc-proxy`。可通过以下命令安装指定版本或安装到用户可写目录：
 
 ```sh
-sh install.sh --version v0.2.1
+sh install.sh --version v0.2.2
 sh install.sh --install-dir "$HOME/.local/bin"
 ```
 
@@ -35,7 +35,7 @@ sh install.sh --install-dir "$HOME/.local/bin"
 ```text
 使用 $oixc-proxy-deploy 将最新 Release 安装到本机，并验证版本和健康状态。
 
-使用 $oixc-proxy-deploy 将 v0.2.1 更新到 root@router.lan，保留现有配置和服务方式，
+使用 $oixc-proxy-deploy 将 v0.2.2 更新到 root@router.lan，保留现有配置和服务方式，
 并验证新 PID、监听端口、/healthz 与 provider 端点；失败时回滚。
 
 使用 $oixc-proxy-deploy 发布 Cargo.toml 中的当前版本，
