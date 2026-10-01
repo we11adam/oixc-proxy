@@ -1,13 +1,20 @@
-use std::time::Instant;
+use std::io::Cursor;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use base64::Engine as _;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use url::Url;
 
+use crate::snell::{SnellSession, SnellSessionWriter};
 use crate::socks5::{self, Mode, Options};
+
+const BODY_BATCH_SIZE: usize = 32 << 10;
+const CHUNK_LINE_LIMIT: usize = 4 << 10;
+const TRAILER_LIMIT: usize = 8 << 10;
+const LINGER_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub async fn serve(mut client: TcpStream, options: Options, first_byte: u8) -> Result<()> {
     let session_started = Instant::now();
@@ -76,27 +83,252 @@ pub async fn serve(mut client: TcpStream, options: Options, first_byte: u8) -> R
     };
     crate::perftrace::stage("http.upstream", started, true, &[]);
 
-    if parsed.connect {
-        write_raw(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
-    } else if let Some(head) = parsed.forwarded_head.as_ref() {
-        session.write(head).await?;
-        if !parsed.leftover.is_empty() {
-            session.write(&parsed.leftover).await?;
+    let result = match parsed.forwarded {
+        None => {
+            write_raw(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+            socks5::relay(client, session).await
         }
-    }
-
-    let result = socks5::relay(client, session).await;
+        Some(forwarded) if forwarded.upgrade => {
+            // After a protocol switch the connection no longer carries HTTP
+            // requests, so relay it as an opaque tunnel.
+            session.write(&forwarded.head).await?;
+            if !parsed.leftover.is_empty() {
+                session.write(&parsed.leftover).await?;
+            }
+            socks5::relay(client, session).await
+        }
+        Some(forwarded) => relay_one_request(client, session, forwarded, parsed.leftover).await,
+    };
     crate::perftrace::stage("http.session", session_started, result.is_ok(), &[]);
     result
 }
 
+/// Forwards exactly one request and its response.
+///
+/// The client chose the upstream for this connection through the first
+/// request only. Later keep-alive requests may target other hosts and would
+/// carry `Proxy-Authorization`, so they must never reach this upstream.
+/// The rewritten request asks the origin to close after responding, and any
+/// client bytes after the request body are discarded.
+async fn relay_one_request(
+    client: TcpStream,
+    mut session: SnellSession,
+    forwarded: ForwardedRequest,
+    leftover: Vec<u8>,
+) -> Result<()> {
+    let started = Instant::now();
+    let (client_read, client_write) = client.into_split();
+    let mut request =
+        BufReader::with_capacity(BODY_BATCH_SIZE, Cursor::new(leftover).chain(client_read));
+    let clean = {
+        let (remote_read, mut remote_write) = session.split();
+        let upload = forward_body(
+            &mut request,
+            &mut remote_write,
+            forwarded.framing,
+            forwarded.head,
+        );
+        let download = socks5::download(client_write, remote_read);
+        tokio::pin!(upload, download);
+        tokio::select! {
+            upload_result = &mut upload => upload_result.is_ok() && download.await.is_ok(),
+            download_result = &mut download => {
+                let _ = download_result;
+                false
+            }
+        }
+    };
+    session.finish(clean, false).await;
+    crate::perftrace::stage("http.relay", started, clean, &[]);
+    if !clean {
+        bail!("HTTP proxy relay ended with an error");
+    }
+    // Closing a socket with unread input makes the kernel send RST, which can
+    // destroy response bytes the client has not read yet.
+    let _ = timeout(LINGER_TIMEOUT, discard_until_eof(&mut request)).await;
+    Ok(())
+}
+
+async fn discard_until_eof<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) {
+    let mut buffer = [0u8; 4096];
+    while matches!(reader.read(&mut buffer).await, Ok(read) if read != 0) {}
+}
+
+trait BodySink {
+    async fn send(&mut self, content: &[u8]) -> Result<()>;
+}
+
+impl BodySink for SnellSessionWriter<'_> {
+    async fn send(&mut self, content: &[u8]) -> Result<()> {
+        self.write(content).await.map(|_| ())
+    }
+}
+
+/// Sends `head` followed by exactly one request body read from `reader`.
+async fn forward_body<R, S>(
+    reader: &mut BufReader<R>,
+    sink: &mut S,
+    framing: BodyFraming,
+    head: Vec<u8>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    S: BodySink,
+{
+    let mut output = head;
+    match framing {
+        BodyFraming::Empty => {}
+        BodyFraming::Length(length) => copy_body_bytes(reader, sink, &mut output, length).await?,
+        BodyFraming::Chunked => loop {
+            let line = read_body_line(reader, sink, &mut output, CHUNK_LINE_LIMIT).await?;
+            let size = parse_chunk_size(&line)?;
+            output.extend_from_slice(&line);
+            if size == 0 {
+                let mut trailer_bytes = 0;
+                loop {
+                    let line = read_body_line(reader, sink, &mut output, TRAILER_LIMIT).await?;
+                    trailer_bytes += line.len();
+                    if trailer_bytes > TRAILER_LIMIT {
+                        bail!("HTTP request trailers are too large");
+                    }
+                    output.extend_from_slice(&line);
+                    if line == b"\r\n" {
+                        break;
+                    }
+                }
+                break;
+            }
+            copy_body_bytes(reader, sink, &mut output, size).await?;
+            let line = read_body_line(reader, sink, &mut output, 2).await?;
+            if line != b"\r\n" {
+                bail!("HTTP request chunk is malformed");
+            }
+            output.extend_from_slice(&line);
+        },
+    }
+    if !output.is_empty() {
+        sink.send(&output).await?;
+    }
+    Ok(())
+}
+
+/// Returns buffered request bytes, first sending pending output when the next
+/// read has to wait on the client so streamed bodies are not held back.
+async fn fill_body<'a, R, S>(
+    reader: &'a mut BufReader<R>,
+    sink: &mut S,
+    output: &mut Vec<u8>,
+) -> Result<&'a [u8]>
+where
+    R: AsyncRead + Unpin,
+    S: BodySink,
+{
+    if reader.buffer().is_empty() && !output.is_empty() {
+        sink.send(output).await?;
+        output.clear();
+    }
+    let buffered = reader.fill_buf().await?;
+    if buffered.is_empty() {
+        bail!("unexpected EOF in HTTP request body");
+    }
+    Ok(buffered)
+}
+
+async fn copy_body_bytes<R, S>(
+    reader: &mut BufReader<R>,
+    sink: &mut S,
+    output: &mut Vec<u8>,
+    mut remaining: u64,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    S: BodySink,
+{
+    while remaining != 0 {
+        let buffered = fill_body(reader, sink, output).await?;
+        let take = buffered
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        output.extend_from_slice(&buffered[..take]);
+        reader.consume(take);
+        remaining -= take as u64;
+        if output.len() >= BODY_BATCH_SIZE {
+            sink.send(output).await?;
+            output.clear();
+        }
+    }
+    Ok(())
+}
+
+async fn read_body_line<R, S>(
+    reader: &mut BufReader<R>,
+    sink: &mut S,
+    output: &mut Vec<u8>,
+    limit: usize,
+) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+    S: BodySink,
+{
+    let mut line = Vec::new();
+    loop {
+        let buffered = fill_body(reader, sink, output).await?;
+        let (take, done) = match buffered.iter().position(|value| *value == b'\n') {
+            Some(index) => (index + 1, true),
+            None => (buffered.len(), false),
+        };
+        if line.len() + take > limit {
+            bail!("HTTP request chunk line is too long");
+        }
+        line.extend_from_slice(&buffered[..take]);
+        reader.consume(take);
+        if done {
+            if !line.ends_with(b"\r\n") {
+                bail!("HTTP request chunk line is malformed");
+            }
+            return Ok(line);
+        }
+    }
+}
+
+fn parse_chunk_size(line: &[u8]) -> Result<u64> {
+    let line = &line[..line.len() - 2];
+    let size = match line.iter().position(|value| *value == b';') {
+        Some(index) => &line[..index],
+        None => line,
+    };
+    let end = size
+        .iter()
+        .rposition(|value| !matches!(value, b' ' | b'\t'))
+        .map_or(0, |index| index + 1);
+    let size = &size[..end];
+    if size.is_empty() || size.len() > 15 || !size.iter().all(u8::is_ascii_hexdigit) {
+        bail!("HTTP request chunk size is invalid");
+    }
+    let size = std::str::from_utf8(size).expect("hex digits are ASCII");
+    Ok(u64::from_str_radix(size, 16).expect("validated hex chunk size"))
+}
+
 struct ParsedRequest {
-    connect: bool,
     host: String,
     port: u16,
     credentials: Option<(String, String)>,
-    forwarded_head: Option<Vec<u8>>,
+    /// `None` for CONNECT.
+    forwarded: Option<ForwardedRequest>,
     leftover: Vec<u8>,
+}
+
+struct ForwardedRequest {
+    head: Vec<u8>,
+    framing: BodyFraming,
+    upgrade: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BodyFraming {
+    Empty,
+    Length(u64),
+    Chunked,
 }
 
 async fn read_proxy_request(client: &mut TcpStream, first_byte: u8) -> Result<ParsedRequest> {
@@ -150,21 +382,19 @@ fn parse_request_line(
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = parse_connect_target(target)?;
         return Ok(ParsedRequest {
-            connect: true,
             host,
             port,
             credentials,
-            forwarded_head: None,
+            forwarded: None,
             leftover: Vec::new(),
         });
     }
-    let (host, port, forwarded_head) = rewrite_absolute_request(request_line, headers)?;
+    let (host, port, forwarded) = rewrite_absolute_request(request_line, headers)?;
     Ok(ParsedRequest {
-        connect: false,
         host,
         port,
         credentials,
-        forwarded_head: Some(forwarded_head),
+        forwarded: Some(forwarded),
         leftover: Vec::new(),
     })
 }
@@ -222,7 +452,7 @@ fn parse_basic_proxy_auth(headers: &[&str]) -> Option<(String, String)> {
 fn rewrite_absolute_request(
     request_line: &str,
     headers: &[&str],
-) -> Result<(String, u16, Vec<u8>)> {
+) -> Result<(String, u16, ForwardedRequest)> {
     let mut fields = request_line.splitn(3, ' ');
     let method = fields
         .next()
@@ -252,21 +482,136 @@ fn rewrite_absolute_request(
         Some(query) => format!("{path}?{query}"),
         None => path.to_owned(),
     };
-    let mut forwarded = format!("{method} {origin} {version}\r\n");
+
+    let mut fields = Vec::with_capacity(headers.len());
     for header in headers {
-        let Some((name, _)) = header.split_once(':') else {
+        if header.starts_with([' ', '\t']) {
+            bail!("HTTP request header line folding is not supported");
+        }
+        let Some((name, value)) = header.split_once(':') else {
             continue;
         };
-        if name.eq_ignore_ascii_case("proxy-authorization")
-            || name.eq_ignore_ascii_case("proxy-connection")
+        if name.is_empty() || name.ends_with([' ', '\t']) {
+            bail!("HTTP request header name is invalid");
+        }
+        fields.push((*header, name, value.trim_matches([' ', '\t'])));
+    }
+    // Keeps empty list elements so that an empty framing header is rejected
+    // instead of being read as absent.
+    let named = |wanted: &'static str| -> Vec<&str> {
+        fields
+            .iter()
+            .filter(|(_, name, _)| name.eq_ignore_ascii_case(wanted))
+            .flat_map(|(_, _, value)| value.split(','))
+            .map(|token| token.trim_matches([' ', '\t']))
+            .collect()
+    };
+    let framing = request_framing(version, named("content-length"), named("transfer-encoding"))?;
+    let connection_options = named("connection");
+    let upgrade = connection_options
+        .iter()
+        .any(|option| option.eq_ignore_ascii_case("upgrade"))
+        && fields
+            .iter()
+            .any(|(_, name, _)| name.eq_ignore_ascii_case("upgrade"));
+
+    let mut forwarded = format!("{method} {origin} {version}\r\n");
+    for (header, name, _) in &fields {
+        let keep_upgrade = upgrade && name.eq_ignore_ascii_case("upgrade");
+        if is_hop_by_hop(name, upgrade)
+            || (!keep_upgrade
+                && !is_framing_header(name)
+                && connection_options
+                    .iter()
+                    .any(|option| option.eq_ignore_ascii_case(name)))
         {
             continue;
         }
         forwarded.push_str(header);
         forwarded.push_str("\r\n");
     }
-    forwarded.push_str("\r\n");
-    Ok((host, port, forwarded.into_bytes()))
+    forwarded.push_str(if upgrade {
+        "Connection: Upgrade, close\r\n\r\n"
+    } else {
+        "Connection: close\r\n\r\n"
+    });
+    Ok((
+        host,
+        port,
+        ForwardedRequest {
+            head: forwarded.into_bytes(),
+            framing,
+            upgrade,
+        },
+    ))
+}
+
+fn is_hop_by_hop(name: &str, upgrade: bool) -> bool {
+    [
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "proxy-authorization",
+        "te",
+    ]
+    .iter()
+    .any(|hop| name.eq_ignore_ascii_case(hop))
+        || (!upgrade && name.eq_ignore_ascii_case("upgrade"))
+}
+
+/// The proxy and the origin must agree on where the request body ends, so
+/// a `Connection` option may never remove these headers.
+fn is_framing_header(name: &str) -> bool {
+    ["host", "content-length", "transfer-encoding"]
+        .iter()
+        .any(|framing| name.eq_ignore_ascii_case(framing))
+}
+
+/// Rejects every ambiguous framing that could let the origin see a different
+/// request boundary than the proxy (RFC 9112 section 6.3).
+fn request_framing(
+    version: &str,
+    content_lengths: Vec<&str>,
+    transfer_codings: Vec<&str>,
+) -> Result<BodyFraming> {
+    if !transfer_codings.is_empty() {
+        if !content_lengths.is_empty() {
+            bail!("HTTP request has both Transfer-Encoding and Content-Length");
+        }
+        if !version.eq_ignore_ascii_case("HTTP/1.1") {
+            bail!("HTTP/1.0 request uses Transfer-Encoding");
+        }
+        if transfer_codings.iter().any(|coding| coding.is_empty()) {
+            bail!("HTTP request Transfer-Encoding is invalid");
+        }
+        let chunked = transfer_codings
+            .iter()
+            .filter(|coding| coding.eq_ignore_ascii_case("chunked"))
+            .count();
+        if chunked != 1
+            || !transfer_codings[transfer_codings.len() - 1].eq_ignore_ascii_case("chunked")
+        {
+            bail!("HTTP request transfer coding is unsupported");
+        }
+        return Ok(BodyFraming::Chunked);
+    }
+    let Some(first) = content_lengths.first() else {
+        return Ok(BodyFraming::Empty);
+    };
+    if first.is_empty()
+        || !first.bytes().all(|value| value.is_ascii_digit())
+        || content_lengths.iter().any(|value| value != first)
+    {
+        bail!("HTTP request Content-Length is invalid");
+    }
+    let length: u64 = first
+        .parse()
+        .map_err(|_| anyhow::anyhow!("HTTP request Content-Length is invalid"))?;
+    Ok(if length == 0 {
+        BodyFraming::Empty
+    } else {
+        BodyFraming::Length(length)
+    })
 }
 
 async fn write_http_status(
@@ -327,7 +672,7 @@ mod tests {
 
     #[test]
     fn rewrites_absolute_form_http_request() {
-        let (host, port, head) = rewrite_absolute_request(
+        let (host, port, forwarded) = rewrite_absolute_request(
             "GET http://example.com:8080/foo?x=1 HTTP/1.1",
             &[
                 "Host: example.com:8080",
@@ -339,10 +684,174 @@ mod tests {
         .unwrap();
         assert_eq!(host, "example.com");
         assert_eq!(port, 8080);
-        let head = String::from_utf8(head).unwrap();
+        assert_eq!(forwarded.framing, BodyFraming::Empty);
+        assert!(!forwarded.upgrade);
+        let head = String::from_utf8(forwarded.head).unwrap();
         assert_eq!(
             head,
-            "GET /foo?x=1 HTTP/1.1\r\nHost: example.com:8080\r\nAccept: */*\r\n\r\n"
+            "GET /foo?x=1 HTTP/1.1\r\nHost: example.com:8080\r\nAccept: */*\r\nConnection: close\r\n\r\n"
         );
+    }
+
+    #[test]
+    fn rewrite_disables_keep_alive_and_strips_hop_by_hop_headers() {
+        let (_, _, forwarded) = rewrite_absolute_request(
+            "POST http://example.com/ HTTP/1.1",
+            &[
+                "Host: example.com",
+                "Connection: keep-alive, X-Hop, Content-Length",
+                "Keep-Alive: timeout=5",
+                "X-Hop: 1",
+                "TE: trailers",
+                "Upgrade: h2c",
+                "Content-Length: 3",
+            ],
+        )
+        .unwrap();
+        assert_eq!(forwarded.framing, BodyFraming::Length(3));
+        assert!(!forwarded.upgrade);
+        assert_eq!(
+            String::from_utf8(forwarded.head).unwrap(),
+            "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 3\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn rewrite_keeps_upgrade_handshake() {
+        let (_, _, forwarded) = rewrite_absolute_request(
+            "GET http://example.com/ws HTTP/1.1",
+            &[
+                "Host: example.com",
+                "Connection: keep-alive, Upgrade",
+                "Upgrade: websocket",
+            ],
+        )
+        .unwrap();
+        assert!(forwarded.upgrade);
+        assert_eq!(
+            String::from_utf8(forwarded.head).unwrap(),
+            "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade, close\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_request_framing() {
+        let rewrite = |headers: &[&str]| {
+            rewrite_absolute_request("POST http://example.com/ HTTP/1.1", headers)
+                .map(|(_, _, forwarded)| forwarded.framing)
+        };
+        assert!(rewrite(&["Transfer-Encoding: chunked", "Content-Length: 5"]).is_err());
+        assert!(rewrite(&["Content-Length: 5", "Content-Length: 6"]).is_err());
+        assert!(rewrite(&["Content-Length: +5"]).is_err());
+        assert!(rewrite(&["Content-Length:"]).is_err());
+        assert!(rewrite(&["Transfer-Encoding:"]).is_err());
+        assert!(rewrite(&["Transfer-Encoding: gzip"]).is_err());
+        assert!(rewrite(&["Transfer-Encoding: chunked, chunked"]).is_err());
+        assert!(rewrite(&["Host: example.com", " folded"]).is_err());
+        assert_eq!(
+            rewrite(&["Content-Length: 5, 5"]).unwrap(),
+            BodyFraming::Length(5)
+        );
+        assert_eq!(rewrite(&["Content-Length: 0"]).unwrap(), BodyFraming::Empty);
+        assert_eq!(
+            rewrite(&["Transfer-Encoding: gzip", "Transfer-Encoding: Chunked"]).unwrap(),
+            BodyFraming::Chunked
+        );
+        assert!(
+            rewrite_absolute_request(
+                "POST http://example.com/ HTTP/1.0",
+                &["Transfer-Encoding: chunked"]
+            )
+            .is_err()
+        );
+    }
+
+    impl BodySink for Vec<u8> {
+        async fn send(&mut self, content: &[u8]) -> Result<()> {
+            self.extend_from_slice(content);
+            Ok(())
+        }
+    }
+
+    async fn forward(input: &[u8], framing: BodyFraming) -> Result<(Vec<u8>, Vec<u8>)> {
+        let mut reader = BufReader::with_capacity(7, input);
+        let mut sink = Vec::new();
+        forward_body(&mut reader, &mut sink, framing, b"HEAD|".to_vec()).await?;
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).await?;
+        Ok((sink, rest))
+    }
+
+    #[tokio::test]
+    async fn forwards_only_the_first_request_body() {
+        let next =
+            b"GET http://other.example/ HTTP/1.1\r\nProxy-Authorization: Basic c2VjcmV0\r\n\r\n";
+
+        let mut input = b"hello world".to_vec();
+        input.extend_from_slice(next);
+        let (sent, rest) = forward(&input, BodyFraming::Length(11)).await.unwrap();
+        assert_eq!(sent, b"HEAD|hello world");
+        assert_eq!(rest, next);
+
+        let body = b"5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nX-Trailer: 1\r\n\r\n";
+        let mut input = body.to_vec();
+        input.extend_from_slice(next);
+        let (sent, rest) = forward(&input, BodyFraming::Chunked).await.unwrap();
+        assert_eq!(&sent[..5], b"HEAD|");
+        assert_eq!(&sent[5..], body);
+        assert_eq!(rest, next);
+
+        let (sent, rest) = forward(next, BodyFraming::Empty).await.unwrap();
+        assert_eq!(sent, b"HEAD|");
+        assert_eq!(rest, next);
+    }
+
+    struct ChannelSink(tokio::sync::mpsc::UnboundedSender<Vec<u8>>);
+
+    impl BodySink for ChannelSink {
+        async fn send(&mut self, content: &[u8]) -> Result<()> {
+            self.0.send(content.to_vec())?;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn sends_head_before_waiting_for_the_body() {
+        // `Expect: 100-continue` clients wait for the origin before sending
+        // the body, so the head must not be held back until the body arrives.
+        let (mut client, proxy) = tokio::io::duplex(1024);
+        let (sender, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let forwarding = tokio::spawn(async move {
+            let mut reader = BufReader::new(proxy);
+            forward_body(
+                &mut reader,
+                &mut ChannelSink(sender),
+                BodyFraming::Length(5),
+                b"HEAD|".to_vec(),
+            )
+            .await
+        });
+        assert_eq!(sent.recv().await.unwrap(), b"HEAD|");
+        client.write_all(b"hello").await.unwrap();
+        forwarding.await.unwrap().unwrap();
+        assert_eq!(sent.recv().await.unwrap(), b"hello");
+        assert!(sent.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_chunked_bodies() {
+        for body in [
+            &b"z\r\nhello\r\n0\r\n\r\n"[..],
+            b"5\r\nhelloXX0\r\n\r\n",
+            b"5\nhello\r\n0\r\n\r\n",
+            b"10000000000000000\r\n",
+            b"5\r\nhel",
+        ] {
+            assert!(
+                forward(body, BodyFraming::Chunked).await.is_err(),
+                "{body:?}"
+            );
+        }
+        assert!(forward(b"short", BodyFraming::Length(6)).await.is_err());
     }
 }

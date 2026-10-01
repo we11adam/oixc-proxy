@@ -410,7 +410,10 @@ async fn upload(mut client: OwnedReadHalf, mut session: SnellSessionWriter<'_>) 
     }
 }
 
-async fn download(mut client: OwnedWriteHalf, mut session: SnellSessionReader<'_>) -> Result<()> {
+pub(crate) async fn download(
+    mut client: OwnedWriteHalf,
+    mut session: SnellSessionReader<'_>,
+) -> Result<()> {
     let mut buffer = vec![0u8; DOWNLOAD_BUFFER_SIZE];
     let mut first_data = true;
     loop {
