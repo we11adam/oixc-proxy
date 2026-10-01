@@ -10,6 +10,9 @@ use tokio::net::{TcpSocket, UdpSocket};
 use tokio::sync::Mutex;
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// Upper bound on how long a default-route answer is reused while the
+/// interface addresses stay the same.
+const DEFAULT_ROUTE_RECHECK: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct NetworkMonitor {
@@ -21,6 +24,36 @@ struct MonitorState {
     selection: EgressSelection,
     generation: u64,
     checked_at: Instant,
+    default_route: DefaultRouteCache,
+}
+
+/// Looking up the default route may spawn processes, which is too costly for
+/// every refresh. Address changes accompany nearly every route change, so the
+/// answer is reused until they change or the recheck interval passes.
+#[derive(Default)]
+struct DefaultRouteCache {
+    addresses: Vec<InterfaceAddress>,
+    interface: Option<String>,
+    checked_at: Option<Instant>,
+}
+
+impl DefaultRouteCache {
+    fn interface(
+        &mut self,
+        addresses: &[InterfaceAddress],
+        lookup: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
+        let current = self.addresses == addresses
+            && self
+                .checked_at
+                .is_some_and(|checked| checked.elapsed() < DEFAULT_ROUTE_RECHECK);
+        if !current {
+            self.interface = lookup();
+            self.addresses = addresses.to_vec();
+            self.checked_at = Some(Instant::now());
+        }
+        self.interface.clone()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -38,7 +71,7 @@ pub struct NetworkSnapshot {
     generation: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct InterfaceAddress {
     name: String,
     index: u32,
@@ -47,7 +80,8 @@ struct InterfaceAddress {
 
 impl NetworkMonitor {
     pub fn new(pinned_ip: Option<IpAddr>) -> Self {
-        let detected = detect_egress(pinned_ip);
+        let mut default_route = DefaultRouteCache::default();
+        let detected = detect_egress(pinned_ip, &mut default_route);
         let selection = detected
             .as_ref()
             .cloned()
@@ -67,6 +101,7 @@ impl NetworkMonitor {
                 selection,
                 generation: 1,
                 checked_at: Instant::now(),
+                default_route,
             })),
         }
     }
@@ -75,7 +110,16 @@ impl NetworkMonitor {
         let mut state = self.state.lock().await;
         if state.checked_at.elapsed() >= REFRESH_INTERVAL {
             let pinned_ip = self.pinned_ip;
-            let detected = tokio::task::spawn_blocking(move || detect_egress(pinned_ip)).await;
+            let mut default_route = std::mem::take(&mut state.default_route);
+            let detected = tokio::task::spawn_blocking(move || {
+                let detected = detect_egress(pinned_ip, &mut default_route);
+                (detected, default_route)
+            })
+            .await
+            .map(|(detected, default_route)| {
+                state.default_route = default_route;
+                detected
+            });
             state.checked_at = Instant::now();
             match detected {
                 Ok(Ok(selection)) => {
@@ -296,13 +340,19 @@ pub async fn bind_udp_socket(
     Ok(socket)
 }
 
-fn detect_egress(pinned_ip: Option<IpAddr>) -> io::Result<EgressSelection> {
-    detect_egress_from_addresses(interface_addresses(), pinned_ip)
+fn detect_egress(
+    pinned_ip: Option<IpAddr>,
+    default_route: &mut DefaultRouteCache,
+) -> io::Result<EgressSelection> {
+    detect_egress_from_addresses(interface_addresses(), pinned_ip, |addresses| {
+        default_route.interface(addresses, default_physical_interface)
+    })
 }
 
 fn detect_egress_from_addresses(
     addresses: io::Result<Vec<InterfaceAddress>>,
     pinned_ip: Option<IpAddr>,
+    default_interface: impl FnOnce(&[InterfaceAddress]) -> Option<String>,
 ) -> io::Result<EgressSelection> {
     let addresses = match addresses {
         Ok(addresses) => addresses,
@@ -325,7 +375,7 @@ fn detect_egress_from_addresses(
         ));
     }
 
-    let preferred = default_physical_interface();
+    let preferred = default_interface(&addresses);
     let selected = addresses
         .iter()
         .filter(|entry| !is_virtual_interface(&entry.name))
@@ -546,6 +596,7 @@ mod tests {
             selection: first.clone(),
             generation: 7,
             checked_at: Instant::now(),
+            default_route: DefaultRouteCache::default(),
         };
         state.update(first);
         assert_eq!(state.generation, 7);
@@ -584,6 +635,7 @@ mod tests {
                 "AF_NETLINK is restricted",
             )),
             Some(address),
+            |_| None,
         )
         .unwrap();
         assert_eq!(selection.interface_name, None);
@@ -610,5 +662,30 @@ mod tests {
             physical_default_from_netstat(routes).as_deref(),
             Some("en7")
         );
+    }
+
+    #[test]
+    fn default_route_lookup_is_reused_until_addresses_change() {
+        let wifi = InterfaceAddress {
+            name: "en0".to_owned(),
+            index: 4,
+            address: "192.0.2.10".parse().unwrap(),
+        };
+        let mut cache = DefaultRouteCache::default();
+        let mut lookups = 0;
+        let mut lookup = |addresses: &[InterfaceAddress]| {
+            cache.interface(addresses, || {
+                lookups += 1;
+                Some("en0".to_owned())
+            })
+        };
+        assert_eq!(lookup(std::slice::from_ref(&wifi)).as_deref(), Some("en0"));
+        assert_eq!(lookup(std::slice::from_ref(&wifi)).as_deref(), Some("en0"));
+        let moved = InterfaceAddress {
+            address: "198.51.100.10".parse().unwrap(),
+            ..wifi
+        };
+        lookup(&[moved]);
+        assert_eq!(lookups, 2);
     }
 }
