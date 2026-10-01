@@ -372,10 +372,7 @@ async fn serve_socks_listener(
     slots: Arc<Semaphore>,
 ) -> Result<()> {
     loop {
-        let (connection, _) = listener
-            .accept()
-            .await
-            .map_err(|_| anyhow::anyhow!("accept local SOCKS5 connection"))?;
+        let connection = crate::accept::accept(&listener, "local proxy").await;
         let permit = slots
             .clone()
             .acquire_owned()

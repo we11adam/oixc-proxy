@@ -10,10 +10,7 @@ use crate::gateway::{CLASH_PROVIDER_PATH, GatewayManager, HEALTH_PATH, PROVIDER_
 
 pub async fn serve(listener: TcpListener, manager: Arc<GatewayManager>) -> Result<()> {
     loop {
-        let (connection, _) = listener
-            .accept()
-            .await
-            .map_err(|_| anyhow::anyhow!("accept nodelist HTTP connection"))?;
+        let connection = crate::accept::accept(&listener, "nodelist HTTP").await;
         let manager = manager.clone();
         tokio::spawn(async move {
             let _ = serve_connection(connection, manager).await;
