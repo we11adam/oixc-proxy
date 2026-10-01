@@ -27,6 +27,9 @@ const INITIAL_FRAME_BUDGET: usize = 0x491;
 // input for several records so header and payload reads do not alternate
 // between small transport reads at record boundaries.
 const READ_BUFFER_SIZE: usize = 64 << 10;
+/// Bounds the TLS close_notify and FIN, which block when the peer stops
+/// reading and the send buffer is full.
+const RETIRE_TIMEOUT: Duration = Duration::from_secs(2);
 type TransportReadHalf = BufReader<ReadHalf<ClientTransportStream>>;
 type TransportWriteHalf = WriteHalf<ClientTransportStream>;
 
@@ -383,8 +386,10 @@ impl SnellClient {
             return;
         }
         let idle = std::mem::take(&mut *self.inner.idle.lock().await);
+        // Closing runs during catalog replacement; do not hold it up while
+        // each idle connection says goodbye.
         for entry in idle {
-            entry.physical.retire().await;
+            tokio::spawn(entry.physical.retire());
         }
     }
 
@@ -533,7 +538,7 @@ impl PhysicalConnection {
     }
 
     async fn retire(mut self: Box<Self>) {
-        let _ = self.writer.shutdown().await;
+        let _ = timeout(RETIRE_TIMEOUT, self.writer.shutdown()).await;
     }
 }
 
