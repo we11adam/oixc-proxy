@@ -1,0 +1,107 @@
+# Changelog
+
+[中文](CHANGELOG.md) | **English**
+
+Notable changes to `oixc-proxy` are recorded in this file. Versions follow [Semantic Versioning](https://semver.org/).
+
+## [0.4.0] - 2026-10-01
+
+### Added
+
+- `tcp-idle-timeout` closes TCP tunnels with no data moving in either direction. It defaults to 1 hour, accepts 1 minute through 24 hours, and applies to SOCKS5, HTTP CONNECT and plain HTTP forwarding.
+- serve-map refreshes node routes in place every hour, so a node that rotates its address, PSK or ECH configuration no longer needs a restart. Ports stay bound to node names; added or removed nodes are only logged.
+
+### Changed
+
+- A plain HTTP proxy connection now forwards exactly one request, and the final response head always carries `Connection: close`. Later keep-alive requests can no longer reach the wrong upstream along with their `Proxy-Authorization`. Requests with ambiguous framing are rejected before dialing, `Expect: 100-continue` is supported, interim 1xx responses are passed through, and Upgrade requests are still relayed as an opaque tunnel.
+- Listeners no longer stop on a per-connection accept error. Resource exhaustion (EMFILE, ENFILE, ENOBUFS, ENOMEM) is retried after a backoff, and any other unrecoverable error exits the process so the service manager can restart it.
+- IPv6 source selection skips tentative and DAD-failed addresses and ranks global before ULA, preferred before deprecated, and stable before temporary. A non-loopback `outbound-ip` is still used as configured.
+
+### Fixed
+
+- Snell: flush after every record write, fixing relays that stalled with data buffered in TLS.
+- Snell: probe idle connections before reuse; bound connection retirement to 2 seconds, and stop retiring idle connections one by one when a client closes.
+- ECH: retry the handshake with retry configs provided by the server.
+- SOCKS5: keep waiting for the response after the client half-closes instead of truncating it at the 2-second close timeout; an upstream that finishes first is a clean end, so its Snell connection returns to the pool.
+- SOCKS5: a bad datagram is dropped instead of ending the whole UDP association; idle time counts traffic in both directions; a SOCKS5 failure reply is sent when the association cannot be set up.
+- HTTP: forward bytes sent together with a CONNECT request; keep scanning headers for proxy credentials; dial IPv6 literals in absolute-form requests.
+- DNS: ignore replies from the wrong source or for the wrong question, retry on SERVFAIL and truncated replies, and cache a lookup in full only when both A and AAAA succeeded; partial results are cached briefly.
+- TLS: reload incomplete system trust stores in the background without blocking dials.
+- Node catalog: unknown top-level keys are ignored, and unusable nodes are skipped and logged instead of rejecting the whole catalog.
+- API: truncate error bodies on character boundaries, fixing a crash on multi-byte text such as Chinese.
+
+### Performance
+
+- Snell downloads are written straight from decrypted records, saving one copy.
+- When an ECH connection attempt fails, the next address starts immediately (RFC 8305) instead of waiting for the 250ms stagger.
+- On macOS, default-route lookups are reused and rechecked at most every 30 seconds, so dials no longer queue behind a `route` process.
+- Trace fields are no longer built while tracing is off.
+
+### Documentation
+
+- IXP is no longer listed in the node filter description.
+
+## [0.3.0] - 2026-10-01
+
+### Performance
+
+- Snell record AES-128-GCM now uses `ring`. Throughput is about 1.95–1.99× for 1 KiB records and about 2.8–2.94× for maximum-size records; 64-byte frames are slightly slower, and end-to-end throughput shows no stable measurable gain.
+
+## [0.2.2] - 2026-09-29
+
+### Fixed
+
+- TLS: when an incomplete system trust store causes `UnknownIssuer`, refresh the store and retry once, with a 30-second cooldown between refreshes.
+
+### Diagnostics
+
+- Trace physical egress selection.
+
+## [0.2.1] - 2026-09-15
+
+### Fixed
+
+- Keep the pinned `outbound-ip` when interface discovery (`getifaddrs`) is denied in restricted Linux environments; systemd units allow `AF_NETLINK`.
+
+## [0.2.0] - 2026-09-15
+
+### Added
+
+- `udp-port-range` and `udp-advertise-address` pin the UDP relay port range and the advertised address.
+- Bind to and track the physical egress: macOS binds the interface to bypass tunnel interfaces, a non-loopback `outbound-ip` is a strict source address, and network changes invalidate DNS caches, address preference and idle connections.
+- The API User-Agent is derived from the Cargo package version.
+
+### Fixed
+
+- The node catalog cache is bound to the account (HMAC fingerprint and a versioned envelope); legacy, oversized and other accounts' caches are rejected.
+
+### Documentation
+
+- Chinese and English READMEs and deployment skill docs, plus notes on UDP defaults.
+
+## [0.1.0] - 2026-09-01
+
+First Rust release.
+
+### Added
+
+- A mixed HTTP/SOCKS5 inbound listener; `socks5-listen` is renamed to `listen`, with the old name kept as an alias.
+- The node filter publishes only nodes whose names contain `Fusion` or a standalone `CIA` token; `--disable-node-filter` or `?all=1` turns it off.
+- Node lists advertise HTTP proxies by default and SOCKS5 with `socks=1`; a Clash provider at `/clash-proxies.yaml`; the Surge provider no longer includes test-timeout.
+- Start from the node cache.
+- A `version` subcommand that prints the version, commit and build time.
+- Raise `RLIMIT_NOFILE` at startup.
+- A release pipeline for macOS and Linux musl (x86_64/aarch64) with `install.sh`, and the `DEPLOY.md` deployment guide.
+
+### Performance
+
+- Snell hot path: in-place AES-GCM, buffered reads and batched writes, ARMv8 crypto instructions, and no async mutexes.
+- DNS and TCP racing: a shared transport context, coalesced signed DNS queries, concurrent A/AAAA lookups and staggered connection attempts.
+- Dial time budgets, sampled performance tracing and connection reuse tuning.
+
+[0.4.0]: https://github.com/we11adam/oixc-proxy/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/we11adam/oixc-proxy/compare/v0.2.2...v0.3.0
+[0.2.2]: https://github.com/we11adam/oixc-proxy/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/we11adam/oixc-proxy/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/we11adam/oixc-proxy/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/we11adam/oixc-proxy/releases/tag/v0.1.0
