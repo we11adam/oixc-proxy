@@ -1,6 +1,6 @@
 [package]
 name = "oixc-proxy"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Named-node SOCKS5 gateway for OIX Cloud managed Snell ECH nodes"
