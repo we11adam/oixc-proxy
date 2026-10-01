@@ -76,6 +76,20 @@ struct InterfaceAddress {
     name: String,
     index: u32,
     address: IpAddr,
+    state: AddressState,
+}
+
+/// IPv6 address state that matters for source selection. IPv4 addresses,
+/// and IPv6 addresses whose state cannot be read, use the default.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AddressState {
+    /// A privacy address that the host replaces regularly.
+    temporary: bool,
+    /// Past its preferred lifetime and kept only for existing connections.
+    deprecated: bool,
+    /// Still in, or failed, duplicate address detection, so it cannot be
+    /// bound yet.
+    unassignable: bool,
 }
 
 impl NetworkMonitor {
@@ -393,27 +407,34 @@ fn selection_for_interface(
 ) -> EgressSelection {
     let mut selection = EgressSelection::empty();
     selection.interface_name = Some(name.to_owned());
+    let mut best_ipv6 = None;
     for entry in addresses.iter().filter(|entry| entry.name == name) {
         selection.interface_index = Some(entry.index);
+        if pinned_ip.is_some_and(|pinned| pinned != entry.address) {
+            continue;
+        }
         match entry.address {
-            IpAddr::V4(address)
-                if pinned_ip.is_none() || pinned_ip == Some(IpAddr::V4(address)) =>
-            {
+            IpAddr::V4(address) => {
                 selection.ipv4.get_or_insert(address);
             }
-            // A unique local address only reaches the site, so a global
-            // address on the same interface is the usable egress source.
-            IpAddr::V6(address)
-                if (pinned_ip.is_none() || pinned_ip == Some(IpAddr::V6(address)))
-                    && selection.ipv6.is_none_or(|current| {
-                        current.is_unique_local() && !address.is_unique_local()
-                    }) =>
-            {
-                selection.ipv6 = Some(address);
+            // A pinned address is used as configured. Otherwise prefer an
+            // address that lasts: a unique local address only reaches the
+            // site, a deprecated one is going away, and a temporary one is
+            // replaced regularly, which would keep moving the egress.
+            IpAddr::V6(address) if pinned_ip.is_some() || !entry.state.unassignable => {
+                let rank = (
+                    address.is_unique_local(),
+                    entry.state.deprecated,
+                    entry.state.temporary,
+                );
+                if best_ipv6.is_none_or(|(best, _)| rank < best) {
+                    best_ipv6 = Some((rank, address));
+                }
             }
-            _ => {}
+            IpAddr::V6(_) => {}
         }
     }
+    selection.ipv6 = best_ipv6.map(|(_, address)| address);
     selection
 }
 
@@ -522,6 +543,7 @@ fn interface_addresses() -> io::Result<Vec<InterfaceAddress>> {
     if unsafe { libc::getifaddrs(&mut head) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    let states = Ipv6States::load();
     let mut result = Vec::new();
     let mut current = head;
     while !current.is_null() {
@@ -548,10 +570,15 @@ fn interface_addresses() -> io::Result<Vec<InterfaceAddress>> {
             if let Some(address) = address.filter(is_usable_address) {
                 let index = unsafe { libc::if_nametoindex(item.ifa_name) };
                 if index != 0 {
+                    let state = match address {
+                        IpAddr::V6(address) => states.get(&name, address),
+                        IpAddr::V4(_) => AddressState::default(),
+                    };
                     result.push(InterfaceAddress {
                         name,
                         index,
                         address,
+                        state,
                     });
                 }
             }
@@ -560,6 +587,119 @@ fn interface_addresses() -> io::Result<Vec<InterfaceAddress>> {
     }
     unsafe { libc::freeifaddrs(head) };
     Ok(result)
+}
+
+/// Reads IPv6 address flags with `SIOCGIFAFLAG_IN6`.
+#[cfg(target_os = "macos")]
+struct Ipv6States(Option<std::os::fd::OwnedFd>);
+
+#[cfg(target_os = "macos")]
+impl Ipv6States {
+    fn load() -> Self {
+        use std::os::fd::FromRawFd;
+
+        let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
+        Self((fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }))
+    }
+
+    fn get(&self, name: &str, address: Ipv6Addr) -> AddressState {
+        use std::os::fd::AsRawFd;
+
+        let Some(socket) = &self.0 else {
+            return AddressState::default();
+        };
+        let mut request: libc::in6_ifreq = unsafe { std::mem::zeroed() };
+        if name.len() >= request.ifr_name.len() {
+            return AddressState::default();
+        }
+        for (target, byte) in request.ifr_name.iter_mut().zip(name.bytes()) {
+            *target = byte as libc::c_char;
+        }
+        let mut socket_address: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        socket_address.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+        socket_address.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        socket_address.sin6_addr.s6_addr = address.octets();
+        request.ifr_ifru.ifru_addr = socket_address;
+        if unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFAFLAG_IN6, &mut request) } != 0 {
+            return AddressState::default();
+        }
+        let flags = unsafe { request.ifr_ifru.ifru_flags6 };
+        AddressState {
+            temporary: flags & libc::IN6_IFF_TEMPORARY != 0,
+            deprecated: flags & libc::IN6_IFF_DEPRECATED != 0,
+            unassignable: flags & libc::IN6_IFF_OPTIMISTIC == 0
+                && flags
+                    & (libc::IN6_IFF_TENTATIVE | libc::IN6_IFF_DUPLICATED | libc::IN6_IFF_DETACHED)
+                    != 0,
+        }
+    }
+}
+
+/// Reads IPv6 address flags from `/proc/net/if_inet6`.
+#[cfg(target_os = "linux")]
+struct Ipv6States(Vec<(String, Ipv6Addr, AddressState)>);
+
+#[cfg(target_os = "linux")]
+impl Ipv6States {
+    fn load() -> Self {
+        Self(
+            std::fs::read_to_string("/proc/net/if_inet6")
+                .map(|content| parse_if_inet6(&content))
+                .unwrap_or_default(),
+        )
+    }
+
+    fn get(&self, name: &str, address: Ipv6Addr) -> AddressState {
+        self.0
+            .iter()
+            .find(|(entry_name, entry_address, _)| entry_name == name && *entry_address == address)
+            .map(|(_, _, state)| *state)
+            .unwrap_or_default()
+    }
+}
+
+/// Parses lines of `address index prefix scope flags name`, where flags are
+/// the low byte of the kernel `IFA_F_*` address flags.
+#[cfg(any(target_os = "linux", test))]
+fn parse_if_inet6(content: &str) -> Vec<(String, Ipv6Addr, AddressState)> {
+    const TEMPORARY: u8 = 0x01;
+    const OPTIMISTIC: u8 = 0x04;
+    const DAD_FAILED: u8 = 0x08;
+    const DEPRECATED: u8 = 0x20;
+    const TENTATIVE: u8 = 0x40;
+
+    content
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let [address, _, _, _, flags, name] = fields[..] else {
+                return None;
+            };
+            let address = u128::from_str_radix(address, 16).ok()?;
+            let flags = u8::from_str_radix(flags, 16).ok()?;
+            let state = AddressState {
+                temporary: flags & TEMPORARY != 0,
+                deprecated: flags & DEPRECATED != 0,
+                unassignable: flags & DAD_FAILED != 0
+                    || (flags & TENTATIVE != 0 && flags & OPTIMISTIC == 0),
+            };
+            Some((name.to_owned(), Ipv6Addr::from(address), state))
+        })
+        .collect()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+struct Ipv6States;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl Ipv6States {
+    fn load() -> Self {
+        Self
+    }
+
+    fn get(&self, _name: &str, _address: Ipv6Addr) -> AddressState {
+        AddressState::default()
+    }
 }
 
 fn is_usable_address(address: &IpAddr) -> bool {
@@ -675,6 +815,7 @@ mod tests {
             name: "en0".to_owned(),
             index: 4,
             address: "192.0.2.10".parse().unwrap(),
+            state: AddressState::default(),
         };
         let mut cache = DefaultRouteCache::default();
         let mut lookups = 0;
@@ -700,6 +841,7 @@ mod tests {
             name: "en0".to_owned(),
             index: 4,
             address: address.parse().unwrap(),
+            state: AddressState::default(),
         };
         let addresses = [
             entry("fd00::10"),
@@ -711,5 +853,80 @@ mod tests {
         assert_eq!(selection.ipv6, Some("2001:db8::10".parse().unwrap()));
         let selection = selection_for_interface(&addresses[..2], "en0", None);
         assert_eq!(selection.ipv6, Some("fd00::10".parse().unwrap()));
+    }
+
+    #[test]
+    fn stable_ipv6_is_preferred_and_unassignable_is_skipped() {
+        let entry = |address: &str, state: AddressState| InterfaceAddress {
+            name: "en0".to_owned(),
+            index: 4,
+            address: address.parse().unwrap(),
+            state,
+        };
+        let temporary = AddressState {
+            temporary: true,
+            ..AddressState::default()
+        };
+        let deprecated = AddressState {
+            deprecated: true,
+            ..AddressState::default()
+        };
+        let tentative = AddressState {
+            unassignable: true,
+            ..AddressState::default()
+        };
+        let addresses = [
+            entry("2001:db8::1", tentative),
+            entry("2001:db8::2", deprecated),
+            entry("2001:db8::3", temporary),
+            entry("2001:db8::4", AddressState::default()),
+        ];
+        let best = |addresses: &[InterfaceAddress]| {
+            selection_for_interface(addresses, "en0", None)
+                .ipv6
+                .map(|address| address.to_string())
+        };
+        assert_eq!(best(&addresses).as_deref(), Some("2001:db8::4"));
+        assert_eq!(best(&addresses[..3]).as_deref(), Some("2001:db8::3"));
+        assert_eq!(best(&addresses[..2]).as_deref(), Some("2001:db8::2"));
+        assert_eq!(best(&addresses[..1]), None);
+
+        let pinned = "2001:db8::1".parse().unwrap();
+        let selection = selection_for_interface(&addresses, "en0", Some(pinned));
+        assert_eq!(selection.ipv6.map(IpAddr::V6), Some(pinned));
+    }
+
+    #[test]
+    fn proc_if_inet6_flags_are_parsed() {
+        let content = concat!(
+            "20010db8000000000000000000000001 02 40 00 80     eth0\n",
+            "20010db8000000000000000000000002 02 40 00 01     eth0\n",
+            "20010db8000000000000000000000003 02 40 00 a0     eth0\n",
+            "20010db8000000000000000000000004 02 40 00 40     eth0\n",
+            "20010db8000000000000000000000005 02 40 00 44     eth0\n",
+            "malformed\n",
+        );
+        let states: Vec<_> = parse_if_inet6(content)
+            .into_iter()
+            .map(|(name, address, state)| {
+                assert_eq!(name, "eth0");
+                (address.segments()[7], state)
+            })
+            .collect();
+        let state = |temporary, deprecated, unassignable| AddressState {
+            temporary,
+            deprecated,
+            unassignable,
+        };
+        assert_eq!(
+            states,
+            [
+                (1, state(false, false, false)),
+                (2, state(true, false, false)),
+                (3, state(false, true, false)),
+                (4, state(false, false, true)),
+                (5, state(false, false, false)),
+            ]
+        );
     }
 }
