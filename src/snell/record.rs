@@ -149,11 +149,7 @@ impl<W: AsyncWrite + Unpin> RecordWriter<W> {
         frame.clear();
         let encoded = self.encode_frame_append(&mut frame, payload, padding_length);
         let result = match encoded {
-            Ok(()) => self
-                .writer
-                .write_all(&frame)
-                .await
-                .map_err(|error| anyhow::anyhow!("write Snell record: {error}")),
+            Ok(()) => self.write_and_flush(&frame, "write Snell record").await,
             Err(error) => Err(error),
         };
         self.scratch = frame;
@@ -177,22 +173,31 @@ impl<W: AsyncWrite + Unpin> RecordWriter<W> {
                 frame.clear();
             }
         }
-        if result.is_ok() && !frame.is_empty() {
-            result = self
-                .writer
-                .write_all(&frame)
-                .await
-                .map_err(|error| anyhow::anyhow!("write Snell record: {error}"));
+        if result.is_ok() {
+            result = self.write_and_flush(&frame, "write Snell record").await;
         }
         self.scratch = frame;
         result
     }
 
     pub async fn write_raw_all(&mut self, content: &[u8]) -> Result<()> {
-        self.writer
-            .write_all(content)
+        self.write_and_flush(content, "write Snell initial flight")
             .await
-            .map_err(|error| anyhow::anyhow!("write Snell initial flight: {error}"))
+    }
+
+    // Buffered transports such as TLS may accept bytes without sending them.
+    // Snell is request/response, so every logical write must reach the peer.
+    async fn write_and_flush(&mut self, content: &[u8], context: &str) -> Result<()> {
+        if !content.is_empty() {
+            self.writer
+                .write_all(content)
+                .await
+                .map_err(|error| anyhow::anyhow!("{context}: {error}"))?;
+        }
+        self.writer
+            .flush()
+            .await
+            .map_err(|error| anyhow::anyhow!("{context}: {error}"))
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
@@ -346,6 +351,65 @@ mod tests {
         let payload = b"authenticated test payload";
         writer.write_frame(payload, 17).await.unwrap();
         assert_eq!(reader.read_frame().await.unwrap(), payload);
+    }
+
+    /// Accepts writes into a private buffer and only exposes them on flush,
+    /// like a TLS stream whose socket send buffer is full.
+    #[derive(Default)]
+    struct FlushGatedWriter {
+        pending: Vec<u8>,
+        committed: Vec<u8>,
+    }
+
+    impl AsyncWrite for FlushGatedWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buffer: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.pending.extend_from_slice(buffer);
+            std::task::Poll::Ready(Ok(buffer.len()))
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = &mut *self;
+            this.committed.append(&mut this.pending);
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.poll_flush(context)
+        }
+    }
+
+    #[tokio::test]
+    async fn every_write_is_flushed_to_the_transport() {
+        let salt = [5u8; 16];
+        let mut writer =
+            RecordWriter::new(FlushGatedWriter::default(), "test-psk-2026", salt).unwrap();
+
+        writer.write_raw_all(b"initial").await.unwrap();
+        assert!(writer.writer.pending.is_empty());
+        let after_raw = writer.writer.committed.len();
+        assert_eq!(after_raw, 7);
+
+        writer.write_frame(b"frame", 3).await.unwrap();
+        assert!(writer.writer.pending.is_empty());
+        let after_frame = writer.writer.committed.len();
+        assert!(after_frame > after_raw);
+
+        writer.write_payload(&vec![1u8; 70_000]).await.unwrap();
+        assert!(writer.writer.pending.is_empty());
+        assert!(writer.writer.committed.len() > after_frame + 70_000);
+
+        writer.write_frame(&[], 0).await.unwrap();
+        assert!(writer.writer.pending.is_empty());
     }
 
     #[tokio::test]
