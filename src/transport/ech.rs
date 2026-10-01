@@ -248,7 +248,9 @@ impl EchDialer {
 
     async fn dial_tcp(&self) -> Result<(TcpStream, u64)> {
         let network = self.network.snapshot().await;
-        crate::perftrace::event("network.snapshot", &network.diagnostic_fields());
+        if crate::perftrace::enabled() {
+            crate::perftrace::event("network.snapshot", &network.diagnostic_fields());
+        }
         let dns_started = Instant::now();
         let addresses = match self.resolver.lookup(&self.server, &network).await {
             Ok(Some(addresses)) => Ok(addresses
