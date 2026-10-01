@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 use tokio::time::timeout;
 
 use crate::config::UdpPortRange;
@@ -350,11 +350,15 @@ pub(crate) async fn relay(client: TcpStream, mut session: SnellSession) -> Resul
     let started = Instant::now();
     crate::perftrace::event("socks.relay_start", &[]);
     let (client_read, client_write) = client.into_split();
+    let stop_timeout = session.close_timeout();
     let (clean, close_write_sent) = {
         let (remote_read, remote_write) = session.split();
+        let (stop, stopped) = oneshot::channel();
         drive_relay(
-            upload(client_read, remote_write),
+            upload(client_read, remote_write, stopped),
             download(client_write, remote_read),
+            stop,
+            stop_timeout,
         )
         .await
     };
@@ -367,15 +371,25 @@ pub(crate) async fn relay(client: TcpStream, mut session: SnellSession) -> Resul
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum UploadEnd {
+    /// The client half-closed and the close was forwarded upstream.
+    ClientEof,
+    /// The relay asked the upload to stop between writes.
+    Stopped,
+}
+
 /// Returns `(clean, close_write_sent)`.
 async fn drive_relay(
-    upload: impl Future<Output = Result<()>>,
+    upload: impl Future<Output = Result<UploadEnd>>,
     download: impl Future<Output = Result<()>>,
+    stop: oneshot::Sender<()>,
+    stop_timeout: Duration,
 ) -> (bool, bool) {
     tokio::pin!(upload, download);
     tokio::select! {
         upload_result = &mut upload => {
-            if upload_result.is_ok() {
+            if matches!(upload_result, Ok(UploadEnd::ClientEof)) {
                 // A client half-close only ends the request direction. The
                 // response may legitimately take much longer, so wait for it
                 // without a deadline.
@@ -385,20 +399,37 @@ async fn drive_relay(
             }
         }
         download_result = &mut download => {
-            let _ = download_result;
-            (false, false)
+            if download_result.is_err() {
+                return (false, false);
+            }
+            // The upstream finished first, which is a normal end of the
+            // tunnel. Dropping the upload mid-write would leave a partial
+            // record and spoil the connection, so let it stop between writes.
+            let _ = stop.send(());
+            match timeout(stop_timeout, upload).await {
+                Ok(Ok(UploadEnd::ClientEof)) => (true, true),
+                Ok(Ok(UploadEnd::Stopped)) => (true, false),
+                Ok(Err(_)) | Err(_) => (false, false),
+            }
         }
     }
 }
 
-async fn upload(mut client: OwnedReadHalf, mut session: SnellSessionWriter<'_>) -> Result<()> {
+async fn upload(
+    mut client: OwnedReadHalf,
+    mut session: SnellSessionWriter<'_>,
+    mut stop: oneshot::Receiver<()>,
+) -> Result<UploadEnd> {
     let mut buffer = vec![0u8; 32 << 10];
     let mut first_data = true;
     loop {
-        let read = client.read(&mut buffer).await?;
+        let read = tokio::select! {
+            read = client.read(&mut buffer) => read?,
+            _ = &mut stop => return Ok(UploadEnd::Stopped),
+        };
         if read == 0 {
             session.close_write().await?;
-            return Ok(());
+            return Ok(UploadEnd::ClientEof);
         }
         if first_data {
             if crate::perftrace::enabled() {
@@ -622,26 +653,63 @@ fn constant_time_equal(first: &[u8], second: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    const STOP_TIMEOUT: Duration = Duration::from_secs(2);
+
+    async fn drive(
+        upload: impl FnOnce(
+            oneshot::Receiver<()>,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<UploadEnd>>>>,
+        download: impl Future<Output = Result<()>>,
+    ) -> (bool, bool) {
+        let (stop, stopped) = oneshot::channel();
+        drive_relay(upload(stopped), download, stop, STOP_TIMEOUT).await
+    }
+
     #[tokio::test(start_paused = true)]
     async fn relay_waits_for_slow_response_after_client_half_close() {
-        let (clean, close_write_sent) = drive_relay(async { Ok(()) }, async {
+        let result = drive(|_| Box::pin(async { Ok(UploadEnd::ClientEof) }), async {
             tokio::time::sleep(Duration::from_secs(300)).await;
             Ok(())
         })
         .await;
-        assert!(clean);
-        assert!(close_write_sent);
+        assert_eq!(result, (true, true));
     }
 
     #[tokio::test]
     async fn relay_upload_error_is_not_clean() {
-        let (clean, close_write_sent) = drive_relay(
-            async { bail!("client read failed") },
+        let result = drive(
+            |_| Box::pin(async { bail!("client read failed") }),
             std::future::pending::<Result<()>>(),
         )
         .await;
-        assert!(!clean);
-        assert!(!close_write_sent);
+        assert_eq!(result, (false, false));
+    }
+
+    #[tokio::test]
+    async fn relay_upstream_finishing_first_is_clean() {
+        let result = drive(
+            |stopped| {
+                Box::pin(async move {
+                    stopped.await.unwrap();
+                    Ok(UploadEnd::Stopped)
+                })
+            },
+            async { Ok(()) },
+        )
+        .await;
+        assert_eq!(result, (true, false));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_gives_up_on_a_stuck_upload_write() {
+        let result = drive(|_| Box::pin(std::future::pending()), async { Ok(()) }).await;
+        assert_eq!(result, (false, false));
+
+        let result = drive(|_| Box::pin(std::future::pending()), async {
+            bail!("upstream read failed")
+        })
+        .await;
+        assert_eq!(result, (false, false));
     }
 
     #[tokio::test]
