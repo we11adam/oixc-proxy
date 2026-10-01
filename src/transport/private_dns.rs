@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use base64::Engine as _;
 use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::{Signer, SigningKey};
-use hickory_proto::op::{Message, MessageType, OpCode, Query};
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -127,39 +127,11 @@ impl PrivateDnsResolver {
     }
 
     async fn query_dual_stack(&self, name: &str, network: &NetworkSnapshot) -> (Vec<IpAddr>, bool) {
-        let ipv4 = self.query(name, RecordType::A, network);
-        let ipv6 = self.query(name, RecordType::AAAA, network);
-        tokio::pin!(ipv4, ipv6);
-        tokio::select! {
-            result = &mut ipv4 => {
-                let mut addresses = result.unwrap_or_default();
-                if addresses.is_empty() {
-                    addresses.extend(ipv6.await.unwrap_or_default());
-                    (addresses, true)
-                } else {
-                    match timeout(FAMILY_GRACE, &mut ipv6).await {
-                        Ok(Ok(other)) => addresses.extend(other),
-                        Ok(Err(_)) => {}
-                        Err(_) => return (addresses, false),
-                    }
-                    (addresses, true)
-                }
-            }
-            result = &mut ipv6 => {
-                let mut addresses = result.unwrap_or_default();
-                if addresses.is_empty() {
-                    addresses.extend(ipv4.await.unwrap_or_default());
-                    (addresses, true)
-                } else {
-                    match timeout(FAMILY_GRACE, &mut ipv4).await {
-                        Ok(Ok(other)) => addresses.extend(other),
-                        Ok(Err(_)) => {}
-                        Err(_) => return (addresses, false),
-                    }
-                    (addresses, true)
-                }
-            }
-        }
+        merge_families(
+            self.query(name, RecordType::A, network),
+            self.query(name, RecordType::AAAA, network),
+        )
+        .await
     }
 
     async fn query_once(
@@ -171,17 +143,19 @@ impl PrivateDnsResolver {
         let mut id_bytes = [0u8; 2];
         getrandom::fill(&mut id_bytes)
             .map_err(|_| anyhow::anyhow!("generate private DNS query ID"))?;
+        let id = u16::from_be_bytes(id_bytes);
+        let query = Query::query(
+            Name::from_ascii(format!("{name}."))
+                .map_err(|_| anyhow::anyhow!("private DNS name is invalid"))?,
+            record_type,
+        );
         let mut message = Message::new();
         message
-            .set_id(u16::from_be_bytes(id_bytes))
+            .set_id(id)
             .set_message_type(MessageType::Query)
             .set_op_code(OpCode::Query)
             .set_recursion_desired(true)
-            .add_query(Query::query(
-                Name::from_ascii(name)
-                    .map_err(|_| anyhow::anyhow!("private DNS name is invalid"))?,
-                record_type,
-            ));
+            .add_query(query.clone());
         let request = message
             .to_vec()
             .map_err(|_| anyhow::anyhow!("encode private DNS query"))?;
@@ -193,24 +167,18 @@ impl PrivateDnsResolver {
             .await
             .map_err(|_| anyhow::anyhow!("resolve ECH-TLS node"))?;
         let mut response = [0u8; 4096];
-        let (length, _) = socket
-            .recv_from(&mut response)
-            .await
-            .map_err(|_| anyhow::anyhow!("resolve ECH-TLS node"))?;
-        let response = Message::from_vec(&response[..length])
-            .map_err(|_| anyhow::anyhow!("resolve ECH-TLS node"))?;
-        if response.id() != u16::from_be_bytes(id_bytes) {
-            bail!("resolve ECH-TLS node");
+        loop {
+            let (length, source) = socket
+                .recv_from(&mut response)
+                .await
+                .map_err(|_| anyhow::anyhow!("resolve ECH-TLS node"))?;
+            if source != self.server {
+                continue;
+            }
+            if let Some(addresses) = parse_response(&response[..length], id, &query)? {
+                return Ok(addresses);
+            }
         }
-        Ok(response
-            .answers()
-            .iter()
-            .filter_map(|record| match record.data() {
-                RData::A(address) => Some(IpAddr::V4((*address).into())),
-                RData::AAAA(address) => Some(IpAddr::V6((*address).into())),
-                _ => None,
-            })
-            .collect())
     }
 
     async fn cached(&self, host: &str, network_generation: u64) -> Option<Vec<IpAddr>> {
@@ -224,6 +192,67 @@ impl PrivateDnsResolver {
         cache.remove(host);
         None
     }
+}
+
+/// Waits for both address families, giving the slower one a short grace
+/// period once the other has produced addresses. The result is complete only
+/// when both lookups succeeded, so a failed family is retried soon instead of
+/// being cached for the full TTL.
+async fn merge_families<F>(ipv4: F, ipv6: F) -> (Vec<IpAddr>, bool)
+where
+    F: Future<Output = Result<Vec<IpAddr>>>,
+{
+    tokio::pin!(ipv4, ipv6);
+    let (first, second) = tokio::select! {
+        result = &mut ipv4 => (result, ipv6),
+        result = &mut ipv6 => (result, ipv4),
+    };
+    match first {
+        Ok(mut addresses) if !addresses.is_empty() => match timeout(FAMILY_GRACE, second).await {
+            Ok(Ok(other)) => {
+                addresses.extend(other);
+                (addresses, true)
+            }
+            Ok(Err(_)) | Err(_) => (addresses, false),
+        },
+        first => match second.await {
+            Ok(addresses) => (addresses, first.is_ok()),
+            Err(_) => (Vec::new(), false),
+        },
+    }
+}
+
+/// Parses a reply to `query`. `Ok(None)` means the packet does not answer
+/// this query and should be ignored; errors are failures worth retrying.
+fn parse_response(response: &[u8], id: u16, query: &Query) -> Result<Option<Vec<IpAddr>>> {
+    let Ok(response) = Message::from_vec(response) else {
+        return Ok(None);
+    };
+    if response.id() != id
+        || response.message_type() != MessageType::Response
+        || response.queries() != std::slice::from_ref(query)
+    {
+        return Ok(None);
+    }
+    if response.truncated() {
+        bail!("resolve ECH-TLS node");
+    }
+    match response.response_code() {
+        ResponseCode::NoError => {}
+        ResponseCode::NXDomain => return Ok(Some(Vec::new())),
+        _ => bail!("resolve ECH-TLS node"),
+    }
+    Ok(Some(
+        response
+            .answers()
+            .iter()
+            .filter_map(|record| match (query.query_type(), record.data()) {
+                (RecordType::A, RData::A(address)) => Some(IpAddr::V4((*address).into())),
+                (RecordType::AAAA, RData::AAAA(address)) => Some(IpAddr::V6((*address).into())),
+                _ => None,
+            })
+            .collect(),
+    ))
 }
 
 pub fn signed_dns_name(host: &str, unix_seconds: i64, seed: &[u8]) -> Result<String> {
@@ -297,5 +326,108 @@ mod tests {
         );
         assert!(resolver.cached("node.cloud-nodes.com", 7).await.is_some());
         assert!(resolver.cached("node.cloud-nodes.com", 8).await.is_none());
+    }
+
+    async fn family(delay_ms: u64, result: Option<&str>) -> Result<Vec<IpAddr>> {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        match result {
+            Some(address) => Ok(vec![address.parse().unwrap()]),
+            None => bail!("lookup failed"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_family_is_never_reported_complete() {
+        let both = merge_families(
+            family(10, Some("192.0.2.1")),
+            family(20, Some("2001:db8::1")),
+        );
+        assert!(both.await.1);
+
+        let ipv4_failed = merge_families(family(10, None), family(20, Some("2001:db8::1")));
+        let (addresses, complete) = ipv4_failed.await;
+        assert_eq!(addresses, ["2001:db8::1".parse::<IpAddr>().unwrap()]);
+        assert!(!complete);
+
+        let ipv6_failed = merge_families(family(10, Some("192.0.2.1")), family(20, None));
+        let (addresses, complete) = ipv6_failed.await;
+        assert_eq!(addresses, ["192.0.2.1".parse::<IpAddr>().unwrap()]);
+        assert!(!complete);
+
+        let ipv6_slow = merge_families(family(10, Some("192.0.2.1")), family(5_000, None));
+        assert!(!ipv6_slow.await.1);
+
+        let both_failed = merge_families(family(10, None), family(20, None));
+        assert_eq!(both_failed.await, (Vec::new(), false));
+    }
+
+    fn response_to(query: &Query, id: u16, edit: impl FnOnce(&mut Message)) -> Vec<u8> {
+        let mut message = Message::new();
+        message
+            .set_id(id)
+            .set_message_type(MessageType::Response)
+            .set_op_code(OpCode::Query)
+            .add_query(query.clone());
+        message.add_answer(hickory_proto::rr::Record::from_rdata(
+            query.name().clone(),
+            60,
+            RData::A("192.0.2.1".parse().unwrap()),
+        ));
+        message.add_answer(hickory_proto::rr::Record::from_rdata(
+            query.name().clone(),
+            60,
+            RData::AAAA("2001:db8::1".parse().unwrap()),
+        ));
+        edit(&mut message);
+        message.to_vec().unwrap()
+    }
+
+    #[test]
+    fn responses_must_answer_the_sent_question() {
+        let query = Query::query(
+            Name::from_ascii("a.node.cloud-nodes.com.").unwrap(),
+            RecordType::A,
+        );
+        let ok = response_to(&query, 7, |_| {});
+        assert_eq!(
+            parse_response(&ok, 7, &query).unwrap(),
+            Some(vec!["192.0.2.1".parse().unwrap()])
+        );
+
+        assert_eq!(parse_response(&ok, 8, &query).unwrap(), None);
+        assert_eq!(parse_response(b"garbage", 7, &query).unwrap(), None);
+        let request = response_to(&query, 7, |message| {
+            message.set_message_type(MessageType::Query);
+        });
+        assert_eq!(parse_response(&request, 7, &query).unwrap(), None);
+        let other_name = Query::query(
+            Name::from_ascii("b.node.cloud-nodes.com.").unwrap(),
+            RecordType::A,
+        );
+        let other = response_to(&other_name, 7, |_| {});
+        assert_eq!(parse_response(&other, 7, &query).unwrap(), None);
+
+        let upper = Query::query(
+            Name::from_ascii("A.Node.Cloud-Nodes.Com.").unwrap(),
+            RecordType::A,
+        );
+        let upper = response_to(&upper, 7, |_| {});
+        assert!(parse_response(&upper, 7, &query).unwrap().is_some());
+
+        let failed = response_to(&query, 7, |message| {
+            message.set_response_code(ResponseCode::ServFail);
+        });
+        assert!(parse_response(&failed, 7, &query).is_err());
+        let missing = response_to(&query, 7, |message| {
+            message.set_response_code(ResponseCode::NXDomain);
+        });
+        assert_eq!(
+            parse_response(&missing, 7, &query).unwrap(),
+            Some(Vec::new())
+        );
+        let truncated = response_to(&query, 7, |message| {
+            message.set_truncated(true);
+        });
+        assert!(parse_response(&truncated, 7, &query).is_err());
     }
 }
