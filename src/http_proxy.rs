@@ -3,17 +3,18 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use base64::Engine as _;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use url::{Host, Url};
 
-use crate::snell::{SnellSession, SnellSessionWriter};
+use crate::snell::{SnellSession, SnellSessionReader, SnellSessionWriter};
 use crate::socks5::{self, Activity, Mode, Options};
 
 const BODY_BATCH_SIZE: usize = 32 << 10;
 const CHUNK_LINE_LIMIT: usize = 4 << 10;
 const TRAILER_LIMIT: usize = 8 << 10;
+const RESPONSE_HEAD_LIMIT: usize = 64 << 10;
 const LINGER_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub async fn serve(mut client: TcpStream, options: Options, first_byte: u8) -> Result<()> {
@@ -122,8 +123,9 @@ pub async fn serve(mut client: TcpStream, options: Options, first_byte: u8) -> R
 /// The client chose the upstream for this connection through the first
 /// request only. Later keep-alive requests may target other hosts and would
 /// carry `Proxy-Authorization`, so they must never reach this upstream.
-/// The rewritten request asks the origin to close after responding, and any
-/// client bytes after the request body are discarded.
+/// The rewritten request asks the origin to close after responding, the
+/// response tells the client the same, and any client bytes after the request
+/// body are discarded.
 async fn relay_one_request(
     client: TcpStream,
     mut session: SnellSession,
@@ -143,7 +145,11 @@ async fn relay_one_request(
             activity: &activity,
         };
         let upload = forward_body(&mut request, &mut sink, forwarded.framing, forwarded.head);
-        let download = socks5::download(client_write, remote_read, &activity);
+        let download = async {
+            let (mut client_write, mut remote_read) = (client_write, remote_read);
+            forward_response_head(&mut remote_read, &mut client_write, &activity).await?;
+            socks5::download(client_write, remote_read, &activity).await
+        };
         let relay = async {
             tokio::pin!(upload, download);
             tokio::select! {
@@ -167,6 +173,145 @@ async fn relay_one_request(
     // destroy response bytes the client has not read yet.
     let _ = timeout(LINGER_TIMEOUT, discard_until_eof(&mut request)).await;
     Ok(())
+}
+
+trait ChunkSource {
+    async fn read_chunk(&mut self) -> Result<&[u8]>;
+}
+
+impl ChunkSource for SnellSessionReader<'_> {
+    async fn read_chunk(&mut self) -> Result<&[u8]> {
+        SnellSessionReader::read_chunk(self).await
+    }
+}
+
+/// Forwards response heads up to and including the final one.
+///
+/// The request asked the origin to close, but an origin only should repeat
+/// that in its response. A client that is not told may reuse the connection
+/// and send another request, which would be discarded, so the final head
+/// always carries `Connection: close`. Interim 1xx heads pass through as is.
+async fn forward_response_head<S, W>(
+    source: &mut S,
+    client: &mut W,
+    activity: &Activity,
+) -> Result<()>
+where
+    S: ChunkSource,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = Vec::new();
+    let mut searched = 0;
+    loop {
+        let Some(end) = find_head_end(&buffer, searched) else {
+            if buffer.len() > RESPONSE_HEAD_LIMIT {
+                bail!("HTTP response header is too large");
+            }
+            searched = buffer.len().saturating_sub(2);
+            let chunk = source.read_chunk().await?;
+            activity.touch();
+            if chunk.is_empty() {
+                bail!("HTTP response ended inside its header");
+            }
+            buffer.extend_from_slice(chunk);
+            continue;
+        };
+        if is_interim_response(&buffer[..end])? {
+            client.write_all(&buffer[..end]).await?;
+            buffer.drain(..end);
+            searched = 0;
+            continue;
+        }
+        client
+            .write_all(&close_response_head(&buffer[..end]))
+            .await?;
+        client.write_all(&buffer[end..]).await?;
+        return Ok(());
+    }
+}
+
+/// Returns the length of the head ending in an empty line, accepting bare LF
+/// line endings as RFC 9112 allows.
+fn find_head_end(buffer: &[u8], from: usize) -> Option<usize> {
+    (from..buffer.len()).find_map(|index| {
+        if buffer[index] != b'\n' {
+            return None;
+        }
+        match buffer.get(index + 1..) {
+            Some([b'\n', ..]) => Some(index + 2),
+            Some([b'\r', b'\n', ..]) => Some(index + 3),
+            _ => None,
+        }
+    })
+}
+
+fn is_interim_response(head: &[u8]) -> Result<bool> {
+    let status = match head {
+        [
+            b'H',
+            b'T',
+            b'T',
+            b'P',
+            b'/',
+            major,
+            b'.',
+            minor,
+            b' ',
+            status @ ..,
+        ] if major.is_ascii_digit()
+            && minor.is_ascii_digit()
+            && status.len() >= 3
+            && status[..3].iter().all(u8::is_ascii_digit) =>
+        {
+            &status[..3]
+        }
+        _ => bail!("HTTP response status line is invalid"),
+    };
+    // 101 switches protocols and is final; it is never requested here.
+    Ok(status[0] == b'1' && status != b"101")
+}
+
+/// Rewrites a final response head to close the connection. Connection
+/// options are hop-by-hop, so the headers they name are dropped as well,
+/// except those that frame the body.
+fn close_response_head(head: &[u8]) -> Vec<u8> {
+    let lines: Vec<&[u8]> = head
+        .split(|value| *value == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .filter(|line| !line.is_empty())
+        .collect();
+    let name_of = |line: &[u8]| -> Option<Vec<u8>> {
+        let colon = line.iter().position(|value| *value == b':')?;
+        Some(line[..colon].to_ascii_lowercase())
+    };
+    let options: Vec<Vec<u8>> = lines[1..]
+        .iter()
+        .filter(|line| name_of(line).as_deref() == Some(b"connection"))
+        .flat_map(|line| line["connection:".len()..].split(|value| *value == b','))
+        .map(|option| option.trim_ascii().to_ascii_lowercase())
+        .collect();
+    let dropped = |name: &[u8]| {
+        matches!(name, b"connection" | b"keep-alive" | b"proxy-connection")
+            || (!matches!(name, b"content-length" | b"transfer-encoding")
+                && options.iter().any(|option| option == name))
+    };
+
+    let mut output = Vec::with_capacity(head.len() + 19);
+    output.extend_from_slice(lines[0]);
+    output.extend_from_slice(b"\r\n");
+    let mut keep = true;
+    for line in &lines[1..] {
+        // A folded line continues the previous header.
+        if !line.starts_with(b" ") && !line.starts_with(b"\t") {
+            keep = name_of(line).is_none_or(|name| !dropped(&name));
+        }
+        if keep {
+            output.extend_from_slice(line);
+            output.extend_from_slice(b"\r\n");
+        }
+    }
+    output.extend_from_slice(b"Connection: close\r\n\r\n");
+    output
 }
 
 async fn discard_until_eof<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) {
@@ -673,6 +818,69 @@ async fn write_raw(client: &mut TcpStream, payload: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Chunks(std::collections::VecDeque<Vec<u8>>, Vec<u8>);
+
+    impl Chunks {
+        fn new(chunks: &[&[u8]]) -> Self {
+            Self(
+                chunks.iter().map(|chunk| chunk.to_vec()).collect(),
+                Vec::new(),
+            )
+        }
+    }
+
+    impl ChunkSource for Chunks {
+        async fn read_chunk(&mut self) -> Result<&[u8]> {
+            self.1 = self.0.pop_front().unwrap_or_default();
+            Ok(&self.1)
+        }
+    }
+
+    async fn forwarded_head(chunks: &[&[u8]]) -> Result<Vec<u8>> {
+        let mut client = Vec::new();
+        forward_response_head(&mut Chunks::new(chunks), &mut client, &Activity::new()).await?;
+        Ok(client)
+    }
+
+    #[tokio::test]
+    async fn final_response_head_always_closes() {
+        let output = forwarded_head(&[
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nConnection: keep-",
+            b"alive, X-Hop, Content-Length\r\nKeep-Alive: timeout=5\r\nX-Hop: 1\r\n",
+            b"Content-Length: 5\r\nX-Folded: a\r\n b\r\n\r\nhello",
+        ])
+        .await
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            concat!(
+                "HTTP/1.1 100 Continue\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-Folded: a\r\n b\r\n",
+                "Connection: close\r\n\r\nhello",
+            )
+        );
+
+        let output = forwarded_head(&[b"HTTP/1.0 204 No Content\nServer: x\n\n"])
+            .await
+            .unwrap();
+        assert_eq!(
+            output,
+            b"HTTP/1.0 204 No Content\r\nServer: x\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_or_truncated_response_heads_fail() {
+        assert!(forwarded_head(&[b"garbage\r\n\r\n"]).await.is_err());
+        assert!(forwarded_head(&[b"HTTP/1.1 200 OK\r\n"]).await.is_err());
+        let large = vec![b'x'; RESPONSE_HEAD_LIMIT + 1];
+        assert!(
+            forwarded_head(&[b"HTTP/1.1 200 OK\r\nX: ", &large])
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn parses_connect_targets() {
