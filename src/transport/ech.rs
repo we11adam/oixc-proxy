@@ -1,6 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -15,7 +16,7 @@ use rustls::pki_types::{EchConfigListBytes, ServerName};
 use rustls::{CertificateError, ClientConfig, PeerIncompatible, ProtocolVersion};
 use tokio::net::{TcpSocket, TcpStream, lookup_host};
 use tokio::task::JoinSet;
-use tokio::time::{Instant as TokioInstant, sleep, timeout};
+use tokio::time::{Instant as TokioInstant, Sleep, sleep, timeout};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
@@ -405,18 +406,45 @@ async fn connect_happy_eyeballs(
     addresses: Vec<SocketAddr>,
     network: NetworkSnapshot,
 ) -> io::Result<(TcpStream, SocketAddr)> {
+    race_connects(addresses, move |address| {
+        connect_from(address, network.clone())
+    })
+    .await
+}
+
+/// Starts an attempt per address, staggered by the Happy Eyeballs delay. A
+/// failed attempt starts the next one at once (RFC 8305, section 5) while
+/// slower attempts keep running.
+async fn race_connects<T, F, C>(
+    addresses: Vec<SocketAddr>,
+    connect: C,
+) -> io::Result<(T, SocketAddr)>
+where
+    T: Send + 'static,
+    F: Future<Output = io::Result<T>> + Send + 'static,
+    C: Fn(SocketAddr) -> F,
+{
     let mut pending = VecDeque::from(addresses);
-    let Some(first) = pending.pop_front() else {
+    let mut attempts = JoinSet::new();
+    let launch_delay = sleep(HAPPY_EYEBALLS_DELAY);
+    tokio::pin!(launch_delay);
+    let mut launch_next = |attempts: &mut JoinSet<_>, launch_delay: Pin<&mut Sleep>| {
+        let Some(address) = pending.pop_front() else {
+            return false;
+        };
+        let attempt = connect(address);
+        attempts.spawn(async move { attempt.await.map(|stream| (stream, address)) });
+        launch_delay.reset(TokioInstant::now() + HAPPY_EYEBALLS_DELAY);
+        true
+    };
+    if !launch_next(&mut attempts, launch_delay.as_mut()) {
         return Err(io::Error::new(
             io::ErrorKind::AddrNotAvailable,
             "no resolved addresses",
         ));
-    };
-    let mut attempts = JoinSet::new();
-    spawn_connect(&mut attempts, first, network.clone());
-    let launch_delay = sleep(HAPPY_EYEBALLS_DELAY);
-    tokio::pin!(launch_delay);
+    }
     let mut last_error = None;
+    let mut exhausted = false;
 
     loop {
         tokio::select! {
@@ -427,47 +455,28 @@ async fn connect_happy_eyeballs(
                     Some(Err(error)) => last_error = Some(io::Error::other(error)),
                     None => {}
                 }
-                if attempts.is_empty() {
-                    if let Some(address) = pending.pop_front() {
-                        spawn_connect(&mut attempts, address, network.clone());
-                        launch_delay
-                            .as_mut()
-                            .reset(TokioInstant::now() + HAPPY_EYEBALLS_DELAY);
-                    } else {
-                        return Err(last_error.unwrap_or_else(|| {
-                            io::Error::new(io::ErrorKind::AddrNotAvailable, "no resolved addresses")
-                        }));
-                    }
+                exhausted = !launch_next(&mut attempts, launch_delay.as_mut());
+                if exhausted && attempts.is_empty() {
+                    return Err(last_error.unwrap_or_else(|| {
+                        io::Error::new(io::ErrorKind::AddrNotAvailable, "no resolved addresses")
+                    }));
                 }
             }
-            _ = &mut launch_delay, if !pending.is_empty() => {
-                let address = pending.pop_front().expect("guarded above");
-                spawn_connect(&mut attempts, address, network.clone());
-                launch_delay
-                    .as_mut()
-                    .reset(TokioInstant::now() + HAPPY_EYEBALLS_DELAY);
+            _ = &mut launch_delay, if !exhausted => {
+                exhausted = !launch_next(&mut attempts, launch_delay.as_mut());
             }
         }
     }
 }
 
-fn spawn_connect(
-    attempts: &mut JoinSet<io::Result<(TcpStream, SocketAddr)>>,
-    address: SocketAddr,
-    network: NetworkSnapshot,
-) {
-    attempts.spawn(async move {
-        let socket = if address.is_ipv4() {
-            TcpSocket::new_v4()?
-        } else {
-            TcpSocket::new_v6()?
-        };
-        network.bind_tcp(&socket, address)?;
-        socket
-            .connect(address)
-            .await
-            .map(|stream| (stream, address))
-    });
+async fn connect_from(address: SocketAddr, network: NetworkSnapshot) -> io::Result<TcpStream> {
+    let socket = if address.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    network.bind_tcp(&socket, address)?;
+    socket.connect(address).await
 }
 
 pub(crate) fn parse_ech_config(encoded: &str) -> Result<EchConfig> {
@@ -609,6 +618,57 @@ mod tests {
         let after = context.roots.snapshot().await;
         assert!(after.generation > before.generation);
         assert!(after.roots.len() > before.roots.len());
+    }
+
+    /// Port 1 never answers, port 2 fails after 10ms, other ports connect.
+    async fn fake_connect(address: SocketAddr) -> io::Result<u16> {
+        match address.port() {
+            1 => std::future::pending().await,
+            2 => {
+                sleep(Duration::from_millis(10)).await;
+                Err(io::ErrorKind::ConnectionRefused.into())
+            }
+            port => Ok(port),
+        }
+    }
+
+    fn ports(ports: &[u16]) -> Vec<SocketAddr> {
+        ports
+            .iter()
+            .map(|port| SocketAddr::from(([192, 0, 2, 1], *port)))
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_attempt_starts_the_next_one_immediately() {
+        let started = TokioInstant::now();
+        let (port, _) = race_connects(ports(&[1, 2, 3]), fake_connect)
+            .await
+            .unwrap();
+        assert_eq!(port, 3);
+        assert_eq!(
+            started.elapsed(),
+            HAPPY_EYEBALLS_DELAY + Duration::from_millis(10)
+        );
+
+        let started = TokioInstant::now();
+        let (port, _) = race_connects(ports(&[2, 2, 3]), fake_connect)
+            .await
+            .unwrap();
+        assert_eq!(port, 3);
+        assert_eq!(started.elapsed(), Duration::from_millis(20));
+
+        let error = race_connects(ports(&[2, 2]), fake_connect)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(
+            race_connects(Vec::new(), fake_connect)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AddrNotAvailable
+        );
     }
 
     #[test]
