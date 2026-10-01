@@ -86,6 +86,11 @@ pub async fn serve(mut client: TcpStream, options: Options, first_byte: u8) -> R
     let result = match parsed.forwarded {
         None => {
             write_raw(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+            // Clients may send tunnelled bytes, such as a TLS ClientHello,
+            // together with the CONNECT request.
+            if !parsed.leftover.is_empty() {
+                session.write(&parsed.leftover).await?;
+            }
             socks5::relay(client, session).await
         }
         Some(forwarded) if forwarded.upgrade => {
