@@ -293,7 +293,11 @@ fn safe_error_body(body: &[u8]) -> String {
     let value = String::from_utf8_lossy(body);
     let trimmed = value.trim();
     if trimmed.len() > 512 {
-        format!("{}...", &trimmed[..512])
+        let mut end = 512;
+        while !trimmed.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &trimmed[..end])
     } else {
         trimmed.to_owned()
     }
@@ -325,6 +329,17 @@ fn describe_json_fields(body: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_error_body_truncates_on_a_character_boundary() {
+        // 171 three-byte characters put byte 512 inside a character.
+        let body = "错".repeat(171);
+        let message = safe_error_body(body.as_bytes());
+        assert_eq!(message, format!("{}...", "错".repeat(170)));
+
+        let short = safe_error_body("  错误  ".as_bytes());
+        assert_eq!(short, "错误");
+    }
 
     #[test]
     fn request_signature_matches_go_known_vector() {
