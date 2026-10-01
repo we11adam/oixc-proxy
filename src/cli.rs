@@ -22,8 +22,10 @@ use crate::network::NetworkMonitor;
 use crate::nodes::{ManagedConfig, Proxy};
 use crate::rlimit;
 use crate::snell::{SnellClient, SnellClientOptions};
-use crate::socks5::{self, Credentials, Mode, UdpRelay};
+use crate::socks5::{self, Credentials, FixedRoute, Mode, UdpRelay};
 use crate::transport::{EchDialer, TransportContext};
+
+const SERVE_MAP_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
 
 const USAGE: &str = "Usage:
   oixc-proxy information [--config PATH] --output PATH
@@ -303,11 +305,11 @@ async fn run_serve_map(args: &[String]) -> Result<()> {
     };
     let network = NetworkMonitor::new(None);
     let managed = load_managed_nodes(&runtime, disable_node_filter, &network).await?;
-    if base_port as usize + managed.proxies.len() - 1 > u16::MAX as usize {
+    if base_port as usize + managed.proxies.len() > u16::MAX as usize + 1 {
         bail!("SOCKS5 map port range exceeds 65535");
     }
 
-    let transport = Arc::new(TransportContext::built_in_with_network(network)?);
+    let transport = Arc::new(TransportContext::built_in_with_network(network.clone())?);
     let dial_limit = Arc::new(Semaphore::new(runtime.dial_concurrency));
     let connection_limit = Arc::new(Semaphore::new(runtime.max_client_connections));
     let mut listeners = Vec::with_capacity(managed.proxies.len());
@@ -319,12 +321,12 @@ async fn run_serve_map(args: &[String]) -> Result<()> {
                 .await
                 .with_context(|| format!("listen on local SOCKS5 map port {port}"))?,
         );
-        routes.push(build_fixed_route(
+        routes.push(FixedRoute::new(build_fixed_route(
             proxy,
             &runtime,
             transport.clone(),
             dial_limit.clone(),
-        )?);
+        )?));
     }
     let credentials = if runtime.socks_username.is_empty() {
         None
@@ -342,7 +344,7 @@ async fn run_serve_map(args: &[String]) -> Result<()> {
         listeners.len()
     );
     let (error_tx, mut error_rx) = tokio::sync::mpsc::channel(1);
-    for (listener, route) in listeners.into_iter().zip(routes) {
+    for (listener, route) in listeners.into_iter().zip(routes.iter().cloned()) {
         let sender = error_tx.clone();
         let connection_limit = connection_limit.clone();
         let options = socks5::Options {
@@ -360,10 +362,86 @@ async fn run_serve_map(args: &[String]) -> Result<()> {
         });
     }
     drop(error_tx);
-    error_rx
-        .recv()
-        .await
-        .context("SOCKS5 map listener stopped")?
+
+    let mut mapped = managed.proxies;
+    let mut refresh = tokio::time::interval(SERVE_MAP_REFRESH_INTERVAL);
+    refresh.tick().await;
+    loop {
+        tokio::select! {
+            error = error_rx.recv() => {
+                return error.context("SOCKS5 map listener stopped")?;
+            }
+            _ = refresh.tick() => {
+                let refreshed = match load_managed_nodes(&runtime, disable_node_filter, &network).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        eprintln!("node catalog refresh failed: {error:#}");
+                        continue;
+                    }
+                };
+                let plan = plan_map_refresh(&mapped, &refreshed.proxies);
+                let mut updated = 0;
+                for (index, proxy) in plan.updates {
+                    let route = match build_fixed_route(
+                        &proxy,
+                        &runtime,
+                        transport.clone(),
+                        dial_limit.clone(),
+                    ) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            eprintln!("node catalog refresh failed for port {}: {error:#}", base_port as usize + index);
+                            continue;
+                        }
+                    };
+                    routes[index].replace(route).client.close().await;
+                    mapped[index] = proxy;
+                    updated += 1;
+                }
+                if updated > 0 {
+                    println!("Refreshed SOCKS5 map ({updated} nodes updated)");
+                }
+                if plan.added > 0 || plan.removed > 0 {
+                    eprintln!(
+                        "node catalog has {} new and {} removed nodes; restart serve-map to remap ports",
+                        plan.added, plan.removed
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Changes a refreshed catalog makes to a running SOCKS5 map.
+#[derive(Debug, PartialEq)]
+struct MapRefresh {
+    /// Ports, by index, whose node keeps its name but changed connection details.
+    updates: Vec<(usize, Proxy)>,
+    added: usize,
+    removed: usize,
+}
+
+/// Ports stay bound to node names, so nodes that appear or disappear are only
+/// reported: renumbering ports would silently send clients to other nodes.
+fn plan_map_refresh(mapped: &[Proxy], refreshed: &[Proxy]) -> MapRefresh {
+    let mut updates = Vec::new();
+    let mut removed = 0;
+    for (index, current) in mapped.iter().enumerate() {
+        match refreshed.iter().find(|proxy| proxy.name == current.name) {
+            Some(proxy) if proxy != current => updates.push((index, proxy.clone())),
+            Some(_) => {}
+            None => removed += 1,
+        }
+    }
+    let added = refreshed
+        .iter()
+        .filter(|proxy| !mapped.iter().any(|current| current.name == proxy.name))
+        .count();
+    MapRefresh {
+        updates,
+        added,
+        removed,
+    }
 }
 
 async fn serve_socks_listener(
@@ -842,6 +920,62 @@ fn format_duration(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn node(name: &str) -> Proxy {
+        let yaml = format!(
+            "proxies:
+  - name: {name}
+    type: snell
+    server: node.cloud-nodes.com
+    port: 443
+    psk: secret
+    version: 4
+    udp: true
+    tfo: false
+    reuse: true
+    identity: true
+    obfs-opts:
+      mode: ech-tls
+      sni: example.com
+      path: /
+      alpn: snell-ech/1
+      ech-config: {}
+      identity-version: 2
+      legacy-fallback: false
+      skip-cert-verify: false
+      preconnect: 0
+",
+            crate::nodes::TEST_ECH_CONFIG
+        );
+        ManagedConfig::parse(yaml.as_bytes())
+            .unwrap()
+            .proxies
+            .remove(0)
+    }
+
+    #[test]
+    fn map_refresh_updates_ports_in_place_and_reports_membership_changes() {
+        let mapped = vec![node("A Fusion"), node("B Fusion"), node("C Fusion")];
+        let mut rotated = node("B Fusion");
+        rotated.psk = "rotated".to_owned();
+        let refreshed = vec![node("D Fusion"), rotated.clone(), node("A Fusion")];
+        assert_eq!(
+            plan_map_refresh(&mapped, &refreshed),
+            MapRefresh {
+                updates: vec![(1, rotated)],
+                added: 1,
+                removed: 1,
+            }
+        );
+        assert_eq!(
+            plan_map_refresh(&mapped, &mapped),
+            MapRefresh {
+                updates: Vec::new(),
+                added: 0,
+                removed: 0,
+            }
+        );
+    }
 
     #[test]
     fn removed_config_flag_for_serve_map_is_rejected() {

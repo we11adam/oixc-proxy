@@ -242,7 +242,10 @@ port. It also serves `GET`/`HEAD` for `/surge-proxies.conf`,
 `serve-map` fetches the same Fusion/CIA catalog itself, then gives each
 node one loopback SOCKS5 port beginning at 7200 by default. Its default
 protected token file is `token.txt`. It does not provide the HTTP nodelist
-endpoint.
+endpoint. The catalog is refreshed hourly: a node whose address, PSK or ECH
+configuration changed is updated on its existing port, while added or removed
+nodes are only logged, because renumbering ports would send clients to other
+nodes; restart `serve-map` to remap them.
 
 `version` prints the package version, the git commit id the binary was built
 from (short hash, suffixed `-dirty` when the working tree had uncommitted

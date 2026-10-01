@@ -29,9 +29,38 @@ const DOWNLOAD_BUFFER_SIZE: usize = (1 << 14) - 1;
 pub enum Mode {
     Dynamic(Arc<GatewayManager>),
     Fixed {
-        route: Route,
+        route: FixedRoute,
         credentials: Option<Credentials>,
     },
+}
+
+/// The route behind a dedicated listener. A catalog refresh can replace it
+/// without rebinding the port; established sessions keep the old one.
+#[derive(Clone)]
+pub struct FixedRoute(Arc<std::sync::RwLock<Route>>);
+
+impl FixedRoute {
+    pub fn new(route: Route) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(route)))
+    }
+
+    pub fn get(&self) -> Route {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Installs `route` and returns the one it replaced.
+    pub fn replace(&self, route: Route) -> Route {
+        std::mem::replace(
+            &mut self
+                .0
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            route,
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -159,12 +188,12 @@ pub(crate) async fn authenticate(mode: &Mode, username: &str, password: &str) ->
             {
                 bail!("gateway authentication failed");
             }
-            Ok(route.clone())
+            Ok(route.get())
         }
         Mode::Fixed {
             route,
             credentials: None,
-        } => Ok(route.clone()),
+        } => Ok(route.get()),
     }
 }
 
@@ -251,7 +280,7 @@ async fn negotiate_and_read_request(
         }
     } else {
         match mode {
-            Mode::Fixed { route, .. } => route.clone(),
+            Mode::Fixed { route, .. } => route.get(),
             Mode::Dynamic(_) => unreachable!(),
         }
     };

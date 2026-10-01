@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use oixc_proxy::gateway::Route;
 use oixc_proxy::perftrace;
 use oixc_proxy::snell::{SnellClient, SnellClientOptions, SnellDialer};
-use oixc_proxy::socks5::{self, Mode};
+use oixc_proxy::socks5::{self, FixedRoute, Mode};
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -231,7 +231,7 @@ async fn start_gateway(client: SnellClient, sample_every: usize) -> Result<Socke
         udp_idle_timeout: Duration::from_secs(30),
         udp_relay: oixc_proxy::socks5::UdpRelay::ephemeral("127.0.0.1".parse().unwrap()),
         mode: Mode::Fixed {
-            route: Route { client, udp: false },
+            route: FixedRoute::new(Route { client, udp: false }),
             credentials: None,
         },
     };

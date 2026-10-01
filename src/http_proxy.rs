@@ -65,7 +65,7 @@ pub async fn serve(mut client: TcpStream, options: Options, first_byte: u8) -> R
         }
     } else {
         match &options.mode {
-            Mode::Fixed { route, .. } => route.clone(),
+            Mode::Fixed { route, .. } => route.get(),
             Mode::Dynamic(_) => unreachable!(),
         }
     };

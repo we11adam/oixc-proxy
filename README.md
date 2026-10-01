@@ -154,7 +154,7 @@ oixc-proxy install-systemd [--config PATH]
 
 `serve` 是常规命名节点网关。生成的 provider 中，不同用户名/密码组合会在同一个混合 HTTP/SOCKS5 端口选择不同托管节点。它还会为 `/surge-proxies.conf`、`/clash-proxies.yaml` 和 `/healthz` 提供 `GET`/`HEAD`。附加 `?all=1` 可列出所有节点，附加 `?socks=1` 可将代理声明为 SOCKS5 而非 HTTP。
 
-`serve-map` 自行获取相同的 Fusion/CIA 目录，然后为每个节点分配一个回环 SOCKS5 端口，默认从 7200 开始。其默认受保护 token 文件为 `token.txt`。该命令不提供 HTTP 节点列表端点。
+`serve-map` 自行获取相同的 Fusion/CIA 目录，然后为每个节点分配一个回环 SOCKS5 端口，默认从 7200 开始。其默认受保护 token 文件为 `token.txt`。该命令不提供 HTTP 节点列表端点。目录每小时刷新一次：地址、PSK 或 ECH 配置变化的节点会在原端口上原地更新；新增或移除的节点只记录日志，因为重新编号端口会把客户端导向其他节点，需要重启 `serve-map` 才能重新映射。
 
 `version` 会输出包版本、构建二进制时的 Git commit id（短 hash；工作区存在未提交变更时追加 `-dirty`）以及 UTC 构建时间。元数据由 `build.rs` 在编译时捕获；如果不在 Git checkout 中，则 commit id 显示为 `unknown`。
 
