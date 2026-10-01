@@ -6,7 +6,9 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadBuf, ReadHalf, WriteHalf};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader, ReadBuf, ReadHalf, WriteHalf,
+};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::timeout;
@@ -514,6 +516,12 @@ impl PhysicalConnection {
         if self.reader.buffered_remaining() != 0 || !self.reader.server_eof {
             bail!("Snell connection is not ready for reuse");
         }
+        // The CONNECT reply is read lazily, so a connection the server closed
+        // while idle would otherwise be handed out and fail only after the
+        // client has been told the tunnel is open.
+        if input_ready(self.reader.records.get_mut()).await {
+            bail!("Snell idle connection was closed by the server");
+        }
         self.reader.server_eof = false;
         self.reader.reply_pending = false;
         self.reader.reply_error = None;
@@ -743,6 +751,13 @@ impl SnellReader {
     }
 }
 
+/// Polls once without waiting. An idle connection must have no input, so any
+/// data, EOF, TLS close_notify or reset means it is no longer usable.
+async fn input_ready<R: AsyncBufRead + Unpin>(reader: &mut R) -> bool {
+    let mut fill = std::pin::pin!(reader.fill_buf());
+    std::future::poll_fn(|context| Poll::Ready(fill.as_mut().poll(context).is_ready())).await
+}
+
 fn initial_padding_length(payload_length: usize) -> Result<usize> {
     let Some(available) = INITIAL_FRAME_BUDGET.checked_sub(payload_length) else {
         return Ok(0);
@@ -762,4 +777,25 @@ async fn write_application(
 ) -> Result<usize> {
     writer.write_payload(content).await?;
     Ok(content.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn idle_probe_detects_closed_and_dirty_connections() {
+        let (mut server, client) = tokio::io::duplex(64);
+        let mut client = BufReader::new(client);
+        assert!(!input_ready(&mut client).await);
+
+        server.write_all(b"x").await.unwrap();
+        assert!(input_ready(&mut client).await);
+        client.consume(1);
+        assert!(!input_ready(&mut client).await);
+
+        drop(server);
+        assert!(input_ready(&mut client).await);
+    }
 }

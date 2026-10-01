@@ -240,6 +240,10 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
         })
     }
 
+    pub(crate) fn get_mut(&mut self) -> &mut R {
+        &mut self.reader
+    }
+
     pub async fn read_frame(&mut self) -> Result<Vec<u8>> {
         let mut frame = Vec::new();
         match self.read_frame_into(&mut frame).await? {
