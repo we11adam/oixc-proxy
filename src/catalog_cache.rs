@@ -162,7 +162,7 @@ proxies:
       sni: example.com
       path: /
       alpn: snell-ech/1
-      ech-config: AAAA
+      ech-config: AEX+DQBBBwAgACABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fIAAEAAEAAQAScHVibGljLmV4YW1wbGUuY29tAAA=
       identity-version: 2
       legacy-fallback: false
       skip-cert-verify: false

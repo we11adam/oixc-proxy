@@ -52,6 +52,14 @@ pub struct ObfsOptions {
     pub preconnect: u8,
 }
 
+/// The API document is parsed per node so that one node the client cannot
+/// use, for example after the server adds a field, does not take every other
+/// node offline. Each node is still validated strictly.
+#[derive(Deserialize)]
+struct RemoteManagedConfig {
+    proxies: Vec<serde_yaml::Value>,
+}
+
 impl ManagedConfig {
     pub fn parse(content: &[u8]) -> Result<Self> {
         if content.is_empty() || content.len() > MAX_MANAGED_CONFIG_BYTES {
@@ -62,12 +70,23 @@ impl ManagedConfig {
         let first = documents
             .next()
             .context("managed config does not match the expected YAML schema")?;
-        let config = Self::deserialize(first).map_err(|_| {
+        let remote = RemoteManagedConfig::deserialize(first).map_err(|_| {
             anyhow::anyhow!("managed config does not match the expected YAML schema")
         })?;
         if documents.next().is_some() {
             bail!("managed config contains multiple YAML documents");
         }
+        let mut proxies = Vec::with_capacity(remote.proxies.len());
+        let mut names = HashSet::with_capacity(remote.proxies.len());
+        for (index, value) in remote.proxies.into_iter().enumerate() {
+            let label = proxy_label(index, &value);
+            match Proxy::from_value(value) {
+                Ok(proxy) if names.insert(proxy.name.clone()) => proxies.push(proxy),
+                Ok(_) => eprintln!("skipping {label}: duplicate name"),
+                Err(error) => eprintln!("skipping {label}: {error:#}"),
+            }
+        }
+        let config = Self { proxies };
         config.validate()?;
         Ok(config)
     }
@@ -113,7 +132,22 @@ fn is_allowed_node_name(name: &str) -> bool {
         .any(|token| token.eq_ignore_ascii_case("cia"))
 }
 
+fn proxy_label(index: usize, value: &serde_yaml::Value) -> String {
+    match value.get("name").and_then(serde_yaml::Value::as_str) {
+        Some(name) => format!("proxy at index {index} ({name})"),
+        None => format!("proxy at index {index}"),
+    }
+}
+
 impl Proxy {
+    fn from_value(value: serde_yaml::Value) -> Result<Self> {
+        // serde errors can quote field values such as the PSK.
+        let proxy: Self = serde_yaml::from_value(value)
+            .map_err(|_| anyhow::anyhow!("does not match the expected schema"))?;
+        proxy.validate()?;
+        Ok(proxy)
+    }
+
     fn validate(&self) -> Result<()> {
         if self.name.trim().is_empty() {
             bail!("name is required");
@@ -139,9 +173,14 @@ impl Proxy {
         {
             bail!("SNI, path, and ECH config are required");
         }
+        crate::transport::parse_ech_config(&self.obfs.ech_config)?;
+        crate::surge::node_selector(&self.name)?;
         Ok(())
     }
 }
+
+#[cfg(test)]
+pub(crate) const TEST_ECH_CONFIG: &str = "AEX+DQBBBwAgACABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fIAAEAAEAAQAScHVibGljLmV4YW1wbGUuY29tAAA=";
 
 #[cfg(test)]
 mod tests {
@@ -164,7 +203,7 @@ proxies:
       sni: example.com
       path: /
       alpn: snell-ech/1
-      ech-config: AAAA
+      ech-config: AEX+DQBBBwAgACABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fIAAEAAEAAQAScHVibGljLmV4YW1wbGUuY29tAAA=
       identity-version: 2
       legacy-fallback: false
       skip-cert-verify: false
@@ -219,9 +258,50 @@ proxies:
         assert!(managed.filter_allowed_nodes().is_err());
     }
 
+    fn with_second_proxy(second: &str) -> String {
+        let first = YAML.trim_start_matches("\nproxies:\n");
+        format!("proxies:\n{first}{second}")
+    }
+
     #[test]
-    fn rejects_unknown_yaml_fields() {
+    fn skips_unusable_proxies_and_keeps_the_rest() {
+        let valid_second = YAML
+            .trim_start_matches("\nproxies:\n")
+            .replace("Hong Kong Fusion 01", "Japan Fusion 02");
+        for second in [
+            valid_second.replace("    udp: true", "    unexpected: true"),
+            valid_second.replace("port: 443", "port: not-a-port"),
+            valid_second.replace("mode: ech-tls", "mode: tls"),
+            valid_second.replace("Japan Fusion 02", "Hong Kong Fusion 01"),
+            "  - just a string\n".to_owned(),
+            valid_second.replace(TEST_ECH_CONFIG, "AAAA"),
+            valid_second.replace("Japan Fusion 02", &"x".repeat(200)),
+        ] {
+            let managed = ManagedConfig::parse(with_second_proxy(&second).as_bytes()).unwrap();
+            assert_eq!(managed.proxies.len(), 1, "{second}");
+            assert_eq!(managed.proxies[0].name, "Hong Kong Fusion 01");
+        }
+        let managed = ManagedConfig::parse(with_second_proxy(&valid_second).as_bytes()).unwrap();
+        assert_eq!(managed.proxies.len(), 2);
+    }
+
+    #[test]
+    fn ignores_unknown_top_level_keys() {
+        let content = format!("{YAML}rules: []\n");
+        assert_eq!(
+            ManagedConfig::parse(content.as_bytes())
+                .unwrap()
+                .proxies
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn rejects_catalog_without_usable_proxies() {
         let content = YAML.replace("    udp: true", "    unexpected: true");
         assert!(ManagedConfig::parse(content.as_bytes()).is_err());
+        assert!(ManagedConfig::parse(b"proxies: []\n").is_err());
+        assert!(ManagedConfig::parse(b"other: true\n").is_err());
     }
 }

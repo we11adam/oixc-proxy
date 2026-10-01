@@ -91,25 +91,7 @@ impl EchDialer {
             bail!("ECH dial timeout must be between 1ns and 2m");
         }
         validate_profile(proxy)?;
-        let encoded = &proxy.obfs.ech_config;
-        if encoded.is_empty() || encoded.len() > MAX_ECH_CONFIG_LENGTH.div_ceil(3) * 4 {
-            bail!("ECH config size is invalid");
-        }
-        let ech_bytes = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|_| anyhow::anyhow!("ECH config is not valid Base64"))?;
-        if ech_bytes.len() < 4 || ech_bytes.len() > MAX_ECH_CONFIG_LENGTH {
-            bail!("ECH config list size is invalid");
-        }
-        if u16::from_be_bytes([ech_bytes[0], ech_bytes[1]]) as usize != ech_bytes.len() - 2 {
-            bail!("ECH config list length does not match");
-        }
-
-        let ech = EchConfig::new(
-            EchConfigListBytes::from(ech_bytes),
-            rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES,
-        )
-        .map_err(|_| anyhow::anyhow!("ECH config list is unsupported"))?;
+        let ech = parse_ech_config(&proxy.obfs.ech_config)?;
         Ok(Self {
             server: proxy.server.clone(),
             sni: proxy.obfs.sni.clone(),
@@ -441,6 +423,26 @@ fn spawn_connect(
     });
 }
 
+pub(crate) fn parse_ech_config(encoded: &str) -> Result<EchConfig> {
+    if encoded.is_empty() || encoded.len() > MAX_ECH_CONFIG_LENGTH.div_ceil(3) * 4 {
+        bail!("ECH config size is invalid");
+    }
+    let ech_bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| anyhow::anyhow!("ECH config is not valid Base64"))?;
+    if ech_bytes.len() < 4 || ech_bytes.len() > MAX_ECH_CONFIG_LENGTH {
+        bail!("ECH config list size is invalid");
+    }
+    if u16::from_be_bytes([ech_bytes[0], ech_bytes[1]]) as usize != ech_bytes.len() - 2 {
+        bail!("ECH config list length does not match");
+    }
+    EchConfig::new(
+        EchConfigListBytes::from(ech_bytes),
+        rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES,
+    )
+    .map_err(|_| anyhow::anyhow!("ECH config list is unsupported"))
+}
+
 fn validate_profile(proxy: &Proxy) -> Result<()> {
     if proxy.proxy_type != "snell"
         || proxy.version != 4
@@ -463,6 +465,14 @@ fn validate_profile(proxy: &Proxy) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_only_supported_ech_config_lists() {
+        assert!(parse_ech_config(crate::nodes::TEST_ECH_CONFIG).is_ok());
+        assert!(parse_ech_config("AAAA").is_err());
+        assert!(parse_ech_config("not base64").is_err());
+        assert!(parse_ech_config("").is_err());
+    }
 
     #[test]
     fn reload_is_only_triggered_by_unknown_issuer() {
