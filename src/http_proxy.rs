@@ -6,7 +6,7 @@ use base64::Engine as _;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use url::Url;
+use url::{Host, Url};
 
 use crate::snell::{SnellSession, SnellSessionWriter};
 use crate::socks5::{self, Mode, Options};
@@ -472,10 +472,14 @@ fn rewrite_absolute_request(
     if url.scheme() != "http" {
         bail!("HTTP proxy only forwards http:// URLs");
     }
-    let host = url
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("HTTP proxy URL is missing a host"))?
-        .to_owned();
+    // `host_str` keeps the brackets around IPv6 literals, which the dialer
+    // would treat as part of a host name.
+    let host = match url.host() {
+        Some(Host::Domain(domain)) => domain.to_owned(),
+        Some(Host::Ipv4(address)) => address.to_string(),
+        Some(Host::Ipv6(address)) => address.to_string(),
+        None => bail!("HTTP proxy URL is missing a host"),
+    };
     let port = url.port().unwrap_or(80);
     if port == 0 {
         bail!("HTTP proxy port is invalid");
@@ -685,6 +689,21 @@ mod tests {
         assert_eq!(
             parse_basic_proxy_auth(&refs).unwrap(),
             ("name-abc".to_owned(), "secret-1".to_owned())
+        );
+    }
+
+    #[test]
+    fn rewrites_ipv6_literal_without_brackets() {
+        let (host, port, forwarded) = rewrite_absolute_request(
+            "GET http://[2001:db8::1]:8080/ HTTP/1.1",
+            &["Host: [2001:db8::1]:8080"],
+        )
+        .unwrap();
+        assert_eq!((host.as_str(), port), ("2001:db8::1", 8080));
+        assert!(
+            forwarded
+                .head
+                .starts_with(b"GET / HTTP/1.1\r\nHost: [2001:db8::1]:8080\r\n")
         );
     }
 
