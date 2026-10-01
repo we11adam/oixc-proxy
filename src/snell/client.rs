@@ -18,7 +18,7 @@ use crate::transport::EchDialer;
 
 use super::record::{RecordKind, ZeroRecord};
 use super::{
-    Exporter, IdentityV2Key, RecordReader, RecordWriter, build_connect_request,
+    DatagramError, Exporter, IdentityV2Key, RecordReader, RecordWriter, build_connect_request,
     build_udp_associate_request, decode_udp_response, encode_udp_request,
 };
 
@@ -614,7 +614,8 @@ impl SnellPacketSession {
     pub async fn write_to_host(&self, payload: &[u8], host: &str, port: u16) -> Result<usize> {
         let mut writer = self.writer.lock().await;
         let PacketWriter { records, frame } = &mut *writer;
-        encode_udp_request(frame, host, port, payload)?;
+        encode_udp_request(frame, host, port, payload)
+            .map_err(|error| error.context(DatagramError))?;
         records.write_frame(frame, 0).await?;
         Ok(payload.len())
     }
@@ -627,7 +628,8 @@ impl SnellPacketSession {
             reader.ensure_reply().await?;
             reader.read_packet_frame(frame).await?;
         }
-        let (address, payload) = decode_udp_response(frame)?;
+        let (address, payload) =
+            decode_udp_response(frame).map_err(|error| error.context(DatagramError))?;
         Ok((address, frame.len() - payload.len()))
     }
 

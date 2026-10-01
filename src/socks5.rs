@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -13,7 +13,9 @@ use tokio::time::timeout;
 
 use crate::config::UdpPortRange;
 use crate::gateway::{GatewayManager, Route};
-use crate::snell::{SnellPacketSession, SnellSession, SnellSessionReader, SnellSessionWriter};
+use crate::snell::{
+    DatagramError, SnellPacketSession, SnellSession, SnellSessionReader, SnellSessionWriter,
+};
 
 const VERSION: u8 = 5;
 const METHOD_NO_AUTH: u8 = 0;
@@ -467,28 +469,39 @@ pub(crate) async fn download(
 }
 
 async fn serve_udp_associate(mut client: TcpStream, route: Route, options: Options) -> Result<()> {
-    let (local, advertised) = options.udp_relay.bind().await?;
+    let (local, advertised) = match options.udp_relay.bind().await {
+        Ok(bound) => bound,
+        Err(error) => {
+            write_reply(&mut client, 1, None).await?;
+            return Err(error);
+        }
+    };
     let local = Arc::new(local);
-    let upstream = Arc::new(
-        route
-            .client
-            .dial_udp()
-            .await
-            .map_err(|_| anyhow::anyhow!("open upstream UDP association"))?,
-    );
+    let upstream = match route.client.dial_udp().await {
+        Ok(upstream) => Arc::new(upstream),
+        Err(_) => {
+            write_reply(&mut client, 1, None).await?;
+            bail!("open upstream UDP association");
+        }
+    };
     write_reply(&mut client, 0, Some(advertised)).await?;
     let control_ip = client.peer_addr().ok().map(|address| address.ip());
     let client_address = Arc::new(Mutex::new(None::<SocketAddr>));
+    let activity = Activity::new();
 
     let local_to_upstream = udp_client_loop(
         local.clone(),
         upstream.clone(),
         client_address.clone(),
         control_ip,
-        options.udp_idle_timeout,
+        &activity,
     );
-    let upstream_to_local =
-        udp_upstream_loop(local.clone(), upstream.clone(), client_address.clone());
+    let upstream_to_local = udp_upstream_loop(
+        local.clone(),
+        upstream.clone(),
+        client_address.clone(),
+        &activity,
+    );
     let control = async {
         let mut discard = [0u8; 1024];
         while client.read(&mut discard).await? != 0 {}
@@ -498,6 +511,7 @@ async fn serve_udp_associate(mut client: TcpStream, route: Route, options: Optio
         _ = local_to_upstream => {}
         _ = upstream_to_local => {}
         _ = control => {}
+        _ = activity.idle(options.udp_idle_timeout) => {}
     }
     if let Ok(upstream) = Arc::try_unwrap(upstream) {
         upstream.close().await;
@@ -505,18 +519,55 @@ async fn serve_udp_associate(mut client: TcpStream, route: Route, options: Optio
     Ok(())
 }
 
+/// Tracks the last datagram relayed in either direction, so an association
+/// that only receives is not mistaken for an idle one.
+struct Activity {
+    started: tokio::time::Instant,
+    last_millis: AtomicU64,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            started: tokio::time::Instant::now(),
+            last_millis: AtomicU64::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        let elapsed = self.started.elapsed().as_millis();
+        self.last_millis.store(
+            u64::try_from(elapsed).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    async fn idle(&self, idle_timeout: Duration) {
+        loop {
+            let last = Duration::from_millis(self.last_millis.load(Ordering::Relaxed));
+            let deadline = self.started + last + idle_timeout;
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep_until(deadline).await;
+        }
+    }
+}
+
+fn is_datagram_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<DatagramError>().is_some()
+}
+
 async fn udp_client_loop(
     local: Arc<UdpSocket>,
     upstream: Arc<SnellPacketSession>,
     client_address: Arc<Mutex<Option<SocketAddr>>>,
     control_ip: Option<IpAddr>,
-    idle_timeout: Duration,
+    activity: &Activity,
 ) -> Result<()> {
     let mut buffer = vec![0u8; 64 << 10];
     loop {
-        let (length, source) = timeout(idle_timeout, local.recv_from(&mut buffer))
-            .await
-            .map_err(|_| anyhow::anyhow!("SOCKS5 UDP relay idle timeout"))??;
+        let (length, source) = local.recv_from(&mut buffer).await?;
         if control_ip.is_some_and(|ip| source.ip() != ip) {
             continue;
         }
@@ -526,8 +577,16 @@ async fn udp_client_loop(
             continue;
         }
         drop(allowed);
-        let (host, port, payload) = decode_datagram(&buffer[..length])?;
-        upstream.write_to_host(payload, &host, port).await?;
+        // A malformed or oversized datagram is the client's problem alone;
+        // dropping it keeps the rest of the association alive.
+        let Ok((host, port, payload)) = decode_datagram(&buffer[..length]) else {
+            continue;
+        };
+        match upstream.write_to_host(payload, &host, port).await {
+            Ok(_) => activity.touch(),
+            Err(error) if is_datagram_error(&error) => {}
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -535,16 +594,25 @@ async fn udp_upstream_loop(
     local: Arc<UdpSocket>,
     upstream: Arc<SnellPacketSession>,
     client_address: Arc<Mutex<Option<SocketAddr>>>,
+    activity: &Activity,
 ) -> Result<()> {
     let mut frame = Vec::new();
     let mut encoded = Vec::new();
     loop {
-        let (source, payload_offset) = upstream.read_from(&mut frame).await?;
+        let (source, payload_offset) = match upstream.read_from(&mut frame).await {
+            Ok(datagram) => datagram,
+            Err(error) if is_datagram_error(&error) => continue,
+            Err(error) => return Err(error),
+        };
         let Some(destination) = *client_address.lock().await else {
             continue;
         };
         encode_datagram(&mut encoded, source, &frame[payload_offset..]);
-        local.send_to(&encoded, destination).await?;
+        // UDP delivery is best effort; one failed send must not end the
+        // association.
+        if local.send_to(&encoded, destination).await.is_ok() {
+            activity.touch();
+        }
     }
 }
 
@@ -654,6 +722,40 @@ mod tests {
     use super::*;
 
     const STOP_TIMEOUT: Duration = Duration::from_secs(2);
+
+    #[tokio::test(start_paused = true)]
+    async fn udp_idle_timer_counts_activity_in_either_direction() {
+        let idle_timeout = Duration::from_secs(60);
+        let activity = Activity::new();
+        let idle = activity.idle(idle_timeout);
+        tokio::pin!(idle);
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_secs(45)).await;
+            activity.touch();
+            assert!(poll_once(idle.as_mut()).await.is_none());
+        }
+        let started = tokio::time::Instant::now();
+        idle.await;
+        assert_eq!(started.elapsed(), idle_timeout);
+    }
+
+    async fn poll_once<F: Future + Unpin>(future: F) -> Option<F::Output> {
+        let mut future = future;
+        std::future::poll_fn(|context| {
+            std::task::Poll::Ready(match std::pin::Pin::new(&mut future).poll(context) {
+                std::task::Poll::Ready(value) => Some(value),
+                std::task::Poll::Pending => None,
+            })
+        })
+        .await
+    }
+
+    #[test]
+    fn datagram_errors_are_recognised_through_context() {
+        let dropped = anyhow::anyhow!("Snell UDP datagram is too large").context(DatagramError);
+        assert!(is_datagram_error(&dropped));
+        assert!(!is_datagram_error(&anyhow::anyhow!("write Snell record")));
+    }
 
     async fn drive(
         upload: impl FnOnce(

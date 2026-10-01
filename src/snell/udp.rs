@@ -4,6 +4,12 @@ use anyhow::{Result, bail};
 
 const MAX_RECORD_PAYLOAD_SIZE: usize = (1 << 14) - 1;
 
+/// Marks an error that only affects one datagram. The packet session is
+/// still usable and the relay should drop the datagram and carry on.
+#[derive(Debug, thiserror::Error)]
+#[error("Snell UDP datagram was dropped")]
+pub struct DatagramError;
+
 pub fn encode_udp_request(
     frame: &mut Vec<u8>,
     host: &str,
