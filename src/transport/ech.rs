@@ -10,8 +10,9 @@ use anyhow::{Result, bail};
 use base64::Engine as _;
 use rustls::client::{EchConfig, EchMode};
 use rustls::crypto::CryptoProvider;
+use rustls::internal::msgs::codec::Codec as _;
 use rustls::pki_types::{EchConfigListBytes, ServerName};
-use rustls::{CertificateError, ClientConfig, ProtocolVersion};
+use rustls::{CertificateError, ClientConfig, PeerIncompatible, ProtocolVersion};
 use tokio::net::{TcpSocket, TcpStream, lookup_host};
 use tokio::task::JoinSet;
 use tokio::time::{Instant as TokioInstant, sleep, timeout};
@@ -44,6 +45,7 @@ pub struct TransportContext {
 
 struct CachedTlsConfig {
     generation: u64,
+    ech: Arc<EchConfig>,
     config: Arc<ClientConfig>,
 }
 
@@ -55,7 +57,8 @@ pub struct EchDialer {
     alpn: Vec<u8>,
     timeout: Duration,
     tls_config: Arc<Mutex<Option<CachedTlsConfig>>>,
-    ech: Arc<EchConfig>,
+    /// Starts from the catalog and follows retry configs from the server.
+    ech: Arc<Mutex<Arc<EchConfig>>>,
     context: Arc<TransportContext>,
     resolver: PrivateDnsResolver,
     network: NetworkMonitor,
@@ -99,7 +102,7 @@ impl EchDialer {
             alpn: proxy.obfs.alpn.as_bytes().to_vec(),
             timeout: dial_timeout,
             tls_config: Arc::new(Mutex::new(None)),
-            ech: Arc::new(ech),
+            ech: Arc::new(Mutex::new(Arc::new(ech))),
             resolver: context.resolver.clone(),
             network: context.network.clone(),
             last_success: Arc::new(Mutex::new(None)),
@@ -138,18 +141,26 @@ impl EchDialer {
         }
     }
 
+    fn current_ech(&self) -> Result<Arc<EchConfig>> {
+        self.ech
+            .lock()
+            .map(|ech| ech.clone())
+            .map_err(|_| anyhow::anyhow!("ECH configuration lock poisoned"))
+    }
+
     fn config_for(&self, trust: &TrustSnapshot) -> Result<Arc<ClientConfig>> {
+        let ech = self.current_ech()?;
         let mut cached = self
             .tls_config
             .lock()
             .map_err(|_| anyhow::anyhow!("TLS configuration lock poisoned"))?;
         if let Some(cached) = &*cached {
-            if cached.generation == trust.generation {
+            if cached.generation == trust.generation && Arc::ptr_eq(&cached.ech, &ech) {
                 return Ok(cached.config.clone());
             }
         }
         let mut config = ClientConfig::builder_with_provider(self.context.provider.clone())
-            .with_ech(EchMode::Enable((*self.ech).clone()))
+            .with_ech(EchMode::Enable((*ech).clone()))
             .map_err(|_| anyhow::anyhow!("configure ECH-TLS"))?
             .with_root_certificates(trust.roots.clone())
             .with_no_client_auth();
@@ -157,12 +168,31 @@ impl EchDialer {
         let config = Arc::new(config);
         *cached = Some(CachedTlsConfig {
             generation: trust.generation,
+            ech,
             config: config.clone(),
         });
         Ok(config)
     }
 
     async fn dial_with_trust(&self, trust: &TrustSnapshot) -> Result<EchConnection> {
+        match self.dial_once(trust).await {
+            Err(error) => match ech_retry_config(&error) {
+                Some(retry) => {
+                    // The server authenticated itself for its public name
+                    // before offering these; RFC 9849 allows one retry.
+                    if let Ok(mut ech) = self.ech.lock() {
+                        *ech = Arc::new(retry);
+                    }
+                    crate::perftrace::event("ech.retry_config", &[]);
+                    self.dial_once(trust).await
+                }
+                None => Err(error),
+            },
+            result => result,
+        }
+    }
+
+    async fn dial_once(&self, trust: &TrustSnapshot) -> Result<EchConnection> {
         let tcp_started = Instant::now();
         let raw = self.dial_tcp().await;
         crate::perftrace::stage("ech.tcp_connect", tcp_started, raw.is_ok(), &[]);
@@ -311,6 +341,23 @@ fn unknown_issuer(error: &io::Error) -> bool {
     )
 }
 
+/// Returns the replacement ECH configuration a server sent while rejecting
+/// the one it was offered.
+fn ech_retry_config(error: &anyhow::Error) -> Option<EchConfig> {
+    error.chain().find_map(|cause| {
+        let rustls::Error::PeerIncompatible(PeerIncompatible::ServerRejectedEncryptedClientHello(
+            Some(configs),
+        )) = cause
+            .downcast_ref::<io::Error>()?
+            .get_ref()?
+            .downcast_ref::<rustls::Error>()?
+        else {
+            return None;
+        };
+        ech_config_from_list(configs.get_encoding()).ok()
+    })
+}
+
 fn interleave_addresses(
     addresses: Vec<SocketAddr>,
     preferred: Option<SocketAddr>,
@@ -430,6 +477,10 @@ pub(crate) fn parse_ech_config(encoded: &str) -> Result<EchConfig> {
     let ech_bytes = base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .map_err(|_| anyhow::anyhow!("ECH config is not valid Base64"))?;
+    ech_config_from_list(ech_bytes)
+}
+
+fn ech_config_from_list(ech_bytes: Vec<u8>) -> Result<EchConfig> {
     if ech_bytes.len() < 4 || ech_bytes.len() > MAX_ECH_CONFIG_LENGTH {
         bail!("ECH config list size is invalid");
     }
@@ -472,6 +523,27 @@ mod tests {
         assert!(parse_ech_config("AAAA").is_err());
         assert!(parse_ech_config("not base64").is_err());
         assert!(parse_ech_config("").is_err());
+    }
+
+    #[test]
+    fn recovers_retry_configs_from_ech_rejection() {
+        use rustls::internal::msgs::codec::Reader;
+        use rustls::internal::msgs::handshake::EchConfigPayload;
+
+        let list = base64::engine::general_purpose::STANDARD
+            .decode(crate::nodes::TEST_ECH_CONFIG)
+            .unwrap();
+        let configs = Vec::<EchConfigPayload>::read(&mut Reader::init(&list)).unwrap();
+        let rejected = |configs| {
+            anyhow::Error::from(io::Error::other(rustls::Error::PeerIncompatible(
+                PeerIncompatible::ServerRejectedEncryptedClientHello(configs),
+            )))
+            .context("ECH-TLS handshake")
+        };
+        assert!(ech_retry_config(&rejected(Some(configs))).is_some());
+        assert!(ech_retry_config(&rejected(None)).is_none());
+        assert!(ech_retry_config(&rejected(Some(Vec::new()))).is_none());
+        assert!(ech_retry_config(&anyhow::anyhow!("handshake failed")).is_none());
     }
 
     #[test]
