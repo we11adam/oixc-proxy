@@ -350,30 +350,13 @@ pub(crate) async fn relay(client: TcpStream, mut session: SnellSession) -> Resul
     let started = Instant::now();
     crate::perftrace::event("socks.relay_start", &[]);
     let (client_read, client_write) = client.into_split();
-    let close_timeout = session.close_timeout();
     let (clean, close_write_sent) = {
         let (remote_read, remote_write) = session.split();
-        let upload = upload(client_read, remote_write);
-        let download = download(client_write, remote_read);
-        tokio::pin!(upload, download);
-        let mut close_write_sent = false;
-        let clean = tokio::select! {
-            upload_result = &mut upload => {
-                close_write_sent = upload_result.is_ok();
-                if upload_result.is_ok() {
-                    timeout(close_timeout, &mut download)
-                        .await
-                        .is_ok_and(|result| result.is_ok())
-                } else {
-                    false
-                }
-            }
-            download_result = &mut download => {
-                let _ = download_result;
-                false
-            }
-        };
-        (clean, close_write_sent)
+        drive_relay(
+            upload(client_read, remote_write),
+            download(client_write, remote_read),
+        )
+        .await
     };
     session.finish(clean, close_write_sent).await;
     crate::perftrace::stage("socks.relay", started, clean, &[]);
@@ -381,6 +364,30 @@ pub(crate) async fn relay(client: TcpStream, mut session: SnellSession) -> Resul
         Ok(())
     } else {
         bail!("SOCKS5 relay ended with an error");
+    }
+}
+
+/// Returns `(clean, close_write_sent)`.
+async fn drive_relay(
+    upload: impl Future<Output = Result<()>>,
+    download: impl Future<Output = Result<()>>,
+) -> (bool, bool) {
+    tokio::pin!(upload, download);
+    tokio::select! {
+        upload_result = &mut upload => {
+            if upload_result.is_ok() {
+                // A client half-close only ends the request direction. The
+                // response may legitimately take much longer, so wait for it
+                // without a deadline.
+                (download.await.is_ok(), true)
+            } else {
+                (false, false)
+            }
+        }
+        download_result = &mut download => {
+            let _ = download_result;
+            (false, false)
+        }
     }
 }
 
@@ -611,6 +618,28 @@ fn constant_time_equal(first: &[u8], second: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_waits_for_slow_response_after_client_half_close() {
+        let (clean, close_write_sent) = drive_relay(async { Ok(()) }, async {
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            Ok(())
+        })
+        .await;
+        assert!(clean);
+        assert!(close_write_sent);
+    }
+
+    #[tokio::test]
+    async fn relay_upload_error_is_not_clean() {
+        let (clean, close_write_sent) = drive_relay(
+            async { bail!("client read failed") },
+            std::future::pending::<Result<()>>(),
+        )
+        .await;
+        assert!(!clean);
+        assert!(!close_write_sent);
+    }
 
     #[tokio::test]
     async fn fixed_udp_relay_advertises_configured_address_and_reuses_ports() {

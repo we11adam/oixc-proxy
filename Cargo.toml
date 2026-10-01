@@ -40,6 +40,7 @@ url = "2.5.7"
 [dev-dependencies]
 aes-gcm = "0.10.3"
 tempfile = "3.23.0"
+tokio = { version = "1.48.0", features = ["full", "test-util"] }
 
 [profile.release]
 codegen-units = 1
