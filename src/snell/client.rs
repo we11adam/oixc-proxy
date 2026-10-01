@@ -232,8 +232,8 @@ struct PhysicalConnection {
     network_generation: u64,
 }
 
-struct SnellReader {
-    records: RecordReader<TransportReadHalf>,
+struct SnellReader<R = TransportReadHalf> {
+    records: RecordReader<R>,
     buffered: Vec<u8>,
     buffered_offset: usize,
     server_eof: bool,
@@ -598,8 +598,10 @@ impl SnellSession {
 }
 
 impl SnellSessionReader<'_> {
-    pub async fn read(&mut self, destination: &mut [u8]) -> Result<usize> {
-        self.reader.read_application(destination).await
+    /// Returns the next chunk of server data, borrowed from the decrypted
+    /// record. An empty slice means the server finished sending.
+    pub async fn read_chunk(&mut self) -> Result<&[u8]> {
+        self.reader.read_application_chunk().await
     }
 }
 
@@ -650,31 +652,44 @@ impl SnellPacketSession {
     }
 }
 
-impl SnellReader {
+impl<R: AsyncRead + Unpin> SnellReader<R> {
     fn buffered_remaining(&self) -> usize {
         self.buffered.len() - self.buffered_offset
     }
 
     pub async fn read_application(&mut self, destination: &mut [u8]) -> Result<usize> {
         self.ensure_reply().await?;
-        if destination.is_empty() {
+        if destination.is_empty() || !self.wait_payload().await? {
             return Ok(0);
-        }
-        while self.buffered_remaining() == 0 {
-            match self.fill_buffer().await {
-                Ok(RecordKind::Payload) => {}
-                Ok(RecordKind::Zero) => {
-                    self.server_eof = true;
-                    return Ok(0);
-                }
-                Err(error) => return Err(error),
-            }
         }
         let length = destination.len().min(self.buffered_remaining());
         destination[..length]
             .copy_from_slice(&self.buffered[self.buffered_offset..self.buffered_offset + length]);
         self.buffered_offset += length;
         Ok(length)
+    }
+
+    /// Returns the rest of the current decrypted record without copying it.
+    /// An empty slice means the server finished sending.
+    async fn read_application_chunk(&mut self) -> Result<&[u8]> {
+        self.ensure_reply().await?;
+        if !self.wait_payload().await? {
+            return Ok(&[]);
+        }
+        let start = self.buffered_offset;
+        self.buffered_offset = self.buffered.len();
+        Ok(&self.buffered[start..])
+    }
+
+    /// Reads records until payload is buffered. Returns false at server EOF.
+    async fn wait_payload(&mut self) -> Result<bool> {
+        while self.buffered_remaining() == 0 {
+            if self.fill_buffer().await? == RecordKind::Zero {
+                self.server_eof = true;
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     async fn read_frame(&mut self) -> Result<Vec<u8>> {
@@ -810,5 +825,27 @@ mod tests {
 
         drop(server);
         assert!(input_ready(&mut client).await);
+    }
+
+    #[tokio::test]
+    async fn chunks_are_borrowed_from_whole_records() {
+        let (server, client) = tokio::io::duplex(1024);
+        let mut writer = RecordWriter::new(server, "psk", [7; 16]).unwrap();
+        let mut reader = SnellReader {
+            records: RecordReader::new(client, "psk"),
+            buffered: Vec::new(),
+            buffered_offset: 0,
+            server_eof: false,
+            reply_pending: true,
+            reply_error: None,
+        };
+        writer.write_frame(b"\0hello", 0).await.unwrap();
+        writer.write_frame(b"world", 0).await.unwrap();
+        writer.write_frame(&[], 0).await.unwrap();
+
+        assert_eq!(reader.read_application_chunk().await.unwrap(), b"hello");
+        assert_eq!(reader.read_application_chunk().await.unwrap(), b"world");
+        assert!(reader.read_application_chunk().await.unwrap().is_empty());
+        assert!(reader.server_eof);
     }
 }

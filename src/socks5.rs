@@ -23,7 +23,6 @@ const METHOD_USERNAME_PASSWORD: u8 = 2;
 const METHOD_UNAVAILABLE: u8 = 0xff;
 const COMMAND_CONNECT: u8 = 1;
 const COMMAND_UDP_ASSOCIATE: u8 = 3;
-const DOWNLOAD_BUFFER_SIZE: usize = (1 << 14) - 1;
 
 #[derive(Clone)]
 pub enum Mode {
@@ -476,11 +475,10 @@ pub(crate) async fn download(
     mut client: OwnedWriteHalf,
     mut session: SnellSessionReader<'_>,
 ) -> Result<()> {
-    let mut buffer = vec![0u8; DOWNLOAD_BUFFER_SIZE];
     let mut first_data = true;
     loop {
-        let read = session.read(&mut buffer).await?;
-        if read == 0 {
+        let chunk = session.read_chunk().await?;
+        if chunk.is_empty() {
             client.shutdown().await?;
             return Ok(());
         }
@@ -488,12 +486,12 @@ pub(crate) async fn download(
             if crate::perftrace::enabled() {
                 crate::perftrace::event(
                     "socks.first_upstream_data",
-                    &[("bytes", read.to_string())],
+                    &[("bytes", chunk.len().to_string())],
                 );
             }
             first_data = false;
         }
-        client.write_all(&buffer[..read]).await?;
+        client.write_all(chunk).await?;
     }
 }
 
