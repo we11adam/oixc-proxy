@@ -433,7 +433,9 @@ fn parse_connect_target(target: &str) -> Result<(String, u16)> {
 
 fn parse_basic_proxy_auth(headers: &[&str]) -> Option<(String, String)> {
     for header in headers {
-        let (name, value) = header.split_once(':')?;
+        let Some((name, value)) = header.split_once(':') else {
+            continue;
+        };
         if !name.eq_ignore_ascii_case("proxy-authorization") {
             continue;
         }
@@ -668,6 +670,17 @@ mod tests {
     fn parses_basic_proxy_authorization() {
         let encoded = base64::engine::general_purpose::STANDARD.encode("name-abc:secret-1");
         let headers = [format!("Proxy-Authorization: Basic {encoded}")];
+        let refs: Vec<&str> = headers.iter().map(String::as_str).collect();
+        assert_eq!(
+            parse_basic_proxy_auth(&refs).unwrap(),
+            ("name-abc".to_owned(), "secret-1".to_owned())
+        );
+
+        let headers = [
+            "Host: example.com:443".to_owned(),
+            "malformed header without a colon".to_owned(),
+            format!("Proxy-Authorization: Basic {encoded}"),
+        ];
         let refs: Vec<&str> = headers.iter().map(String::as_str).collect();
         assert_eq!(
             parse_basic_proxy_auth(&refs).unwrap(),
