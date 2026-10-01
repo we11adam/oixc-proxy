@@ -401,10 +401,15 @@ fn selection_for_interface(
             {
                 selection.ipv4.get_or_insert(address);
             }
+            // A unique local address only reaches the site, so a global
+            // address on the same interface is the usable egress source.
             IpAddr::V6(address)
-                if pinned_ip.is_none() || pinned_ip == Some(IpAddr::V6(address)) =>
+                if (pinned_ip.is_none() || pinned_ip == Some(IpAddr::V6(address)))
+                    && selection.ipv6.is_none_or(|current| {
+                        current.is_unique_local() && !address.is_unique_local()
+                    }) =>
             {
-                selection.ipv6.get_or_insert(address);
+                selection.ipv6 = Some(address);
             }
             _ => {}
         }
@@ -687,5 +692,24 @@ mod tests {
         };
         lookup(&[moved]);
         assert_eq!(lookups, 2);
+    }
+
+    #[test]
+    fn global_ipv6_is_preferred_over_unique_local() {
+        let entry = |address: &str| InterfaceAddress {
+            name: "en0".to_owned(),
+            index: 4,
+            address: address.parse().unwrap(),
+        };
+        let addresses = [
+            entry("fd00::10"),
+            entry("192.0.2.10"),
+            entry("2001:db8::10"),
+            entry("2001:db8::11"),
+        ];
+        let selection = selection_for_interface(&addresses, "en0", None);
+        assert_eq!(selection.ipv6, Some("2001:db8::10".parse().unwrap()));
+        let selection = selection_for_interface(&addresses[..2], "en0", None);
+        assert_eq!(selection.ipv6, Some("fd00::10".parse().unwrap()));
     }
 }
