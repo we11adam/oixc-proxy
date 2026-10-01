@@ -1400,6 +1400,7 @@ dependencies = [
  "hmac",
  "libc",
  "reqwest",
+ "ring",
  "rustls",
  "rustls-native-certs",
  "serde",

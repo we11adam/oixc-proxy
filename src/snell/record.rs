@@ -1,7 +1,6 @@
-use aes_gcm::aead::{AeadInPlace, KeyInit};
-use aes_gcm::{Aes128Gcm, Nonce, Tag};
 use anyhow::{Result, bail};
 use argon2::{Algorithm, Argon2, Params, Version};
+use ring::aead::{AES_128_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::IdentityNonce;
@@ -38,9 +37,15 @@ pub fn derive_record_key(psk: &str, salt: &IdentityNonce) -> Result<[u8; 16]> {
     Ok(key)
 }
 
+fn record_aead(key: &[u8; 16]) -> Result<LessSafeKey> {
+    let key =
+        UnboundKey::new(&AES_128_GCM, key).map_err(|_| anyhow::anyhow!("create Snell AES-GCM"))?;
+    Ok(LessSafeKey::new(key))
+}
+
 pub struct RecordWriter<W> {
     writer: W,
-    aead: Aes128Gcm,
+    aead: LessSafeKey,
     salt: IdentityNonce,
     salt_sent: bool,
     nonce: [u8; RECORD_NONCE_SIZE],
@@ -52,8 +57,7 @@ impl<W: AsyncWrite + Unpin> RecordWriter<W> {
         let key = derive_record_key(psk, &salt)?;
         Ok(Self {
             writer,
-            aead: Aes128Gcm::new_from_slice(&key)
-                .map_err(|_| anyhow::anyhow!("create Snell AES-GCM"))?,
+            aead: record_aead(&key)?,
             salt,
             salt_sent: false,
             nonce: [0; RECORD_NONCE_SIZE],
@@ -106,10 +110,14 @@ impl<W: AsyncWrite + Unpin> RecordWriter<W> {
         header[5..7].copy_from_slice(&(payload.len() as u16).to_be_bytes());
         let tag = self
             .aead
-            .encrypt_in_place_detached(Nonce::from_slice(&self.nonce), &[], header)
+            .seal_in_place_separate_tag(
+                Nonce::assume_unique_for_key(self.nonce),
+                Aad::empty(),
+                header,
+            )
             .map_err(|_| anyhow::anyhow!("encrypt Snell record header"))?;
         increment_nonce(&mut self.nonce);
-        frame.extend_from_slice(&tag);
+        frame.extend_from_slice(tag.as_ref());
 
         let padding_start = frame.len();
         frame.resize(padding_start + padding_length, 0);
@@ -122,14 +130,14 @@ impl<W: AsyncWrite + Unpin> RecordWriter<W> {
             frame.extend_from_slice(payload);
             let tag = self
                 .aead
-                .encrypt_in_place_detached(
-                    Nonce::from_slice(&self.nonce),
-                    &[],
+                .seal_in_place_separate_tag(
+                    Nonce::assume_unique_for_key(self.nonce),
+                    Aad::empty(),
                     &mut frame[payload_start..],
                 )
                 .map_err(|_| anyhow::anyhow!("encrypt Snell record payload"))?;
             increment_nonce(&mut self.nonce);
-            frame.extend_from_slice(&tag);
+            frame.extend_from_slice(tag.as_ref());
         }
         let (before_payload, payload_ciphertext) = frame.split_at_mut(payload_start);
         swap_padding(&mut before_payload[padding_start..], payload_ciphertext);
@@ -202,7 +210,7 @@ impl<W: AsyncWrite + Unpin> RecordWriter<W> {
 pub struct RecordReader<R> {
     reader: R,
     psk: String,
-    aead: Option<Aes128Gcm>,
+    aead: Option<LessSafeKey>,
     nonce: [u8; RECORD_NONCE_SIZE],
 }
 
@@ -222,10 +230,7 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
         Ok(Self {
             reader,
             psk,
-            aead: Some(
-                Aes128Gcm::new_from_slice(&key)
-                    .map_err(|_| anyhow::anyhow!("create Snell AES-GCM"))?,
-            ),
+            aead: Some(record_aead(&key)?),
             nonce: [0; RECORD_NONCE_SIZE],
         })
     }
@@ -247,10 +252,7 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
                 .await
                 .map_err(|error| anyhow::anyhow!("read Snell record salt: {error}"))?;
             let key = derive_record_key(&self.psk, &salt)?;
-            self.aead = Some(
-                Aes128Gcm::new_from_slice(&key)
-                    .map_err(|_| anyhow::anyhow!("create Snell AES-GCM"))?,
-            );
+            self.aead = Some(record_aead(&key)?);
         }
         let aead = self.aead.as_ref().expect("initialized above");
         let mut encrypted_header = [0u8; RECORD_HEADER_CIPHER_SIZE];
@@ -258,14 +260,13 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
             .read_exact(&mut encrypted_header)
             .await
             .map_err(|error| anyhow::anyhow!("read Snell record header: {error}"))?;
-        let (header, header_tag) = encrypted_header.split_at_mut(RECORD_HEADER_PLAIN_SIZE);
-        aead.decrypt_in_place_detached(
-            Nonce::from_slice(&self.nonce),
-            &[],
-            header,
-            Tag::from_slice(header_tag),
-        )
-        .map_err(|_| anyhow::anyhow!("authenticate Snell record header"))?;
+        let header = aead
+            .open_in_place(
+                Nonce::assume_unique_for_key(self.nonce),
+                Aad::empty(),
+                &mut encrypted_header,
+            )
+            .map_err(|_| anyhow::anyhow!("authenticate Snell record header"))?;
         increment_nonce(&mut self.nonce);
         if header[0] != 4 {
             bail!("Snell record header is invalid");
@@ -289,12 +290,10 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
             .map_err(|error| anyhow::anyhow!("read Snell record payload: {error}"))?;
         let (padding, encrypted_payload) = frame.split_at_mut(padding_length);
         swap_padding(padding, encrypted_payload);
-        let (payload, payload_tag) = encrypted_payload.split_at_mut(payload_length);
-        aead.decrypt_in_place_detached(
-            Nonce::from_slice(&self.nonce),
-            &[],
-            payload,
-            Tag::from_slice(payload_tag),
+        aead.open_in_place(
+            Nonce::assume_unique_for_key(self.nonce),
+            Aad::empty(),
+            encrypted_payload,
         )
         .map_err(|_| anyhow::anyhow!("authenticate Snell record payload"))?;
         increment_nonce(&mut self.nonce);
@@ -379,5 +378,121 @@ mod tests {
         );
         assert!(output.is_empty());
         assert_eq!(output.capacity(), capacity);
+    }
+}
+
+#[cfg(test)]
+mod backend_compatibility_tests {
+    use super::*;
+    use aes_gcm::{
+        Aes128Gcm,
+        aead::{Aead, KeyInit},
+    };
+
+    fn seal(cipher: &Aes128Gcm, counter: u64, bytes: &[u8]) -> Vec<u8> {
+        let mut nonce = [0u8; 12];
+        nonce[..8].copy_from_slice(&counter.to_le_bytes());
+        cipher.encrypt((&nonce).into(), bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rustcrypto_wire_matches_both_directions_across_nonce_carry() {
+        let salt = [0x42; 16];
+        let psk = "test-psk-2026";
+        let cipher = Aes128Gcm::new_from_slice(&derive_record_key(psk, &salt).unwrap()).unwrap();
+        let mut writer = RecordWriter::new(tokio::io::sink(), psk, salt).unwrap();
+        let mut counter = 0u64;
+        let mut reference_wire = salt.to_vec();
+        let mut expected = Vec::new();
+        for i in 0..160 {
+            let size = [0, 1, 64, 1024, 16383][i % 5];
+            let padding = if size == 0 {
+                0
+            } else {
+                [0, 1, 17, 31, 288, 16383][i % 6]
+            };
+            let payload = vec![i as u8; size];
+            let mut header = [0u8; 7];
+            header[0] = 4;
+            header[3..5].copy_from_slice(&(padding as u16).to_be_bytes());
+            header[5..7].copy_from_slice(&(size as u16).to_be_bytes());
+            let header_cipher = seal(&cipher, counter, &header);
+            counter += 1;
+            let payload_cipher = if size == 0 {
+                Vec::new()
+            } else {
+                let c = seal(&cipher, counter, &payload);
+                counter += 1;
+                c
+            };
+            let encoded = writer.encode_frame(&payload, padding).unwrap();
+            let frame = if i == 0 {
+                assert_eq!(&encoded[..16], &salt);
+                &encoded[16..]
+            } else {
+                &encoded[..]
+            };
+            assert_eq!(&frame[..23], &header_cipher);
+            let mut body = frame[23..].to_vec();
+            for j in (0..padding.min(payload_cipher.len())).step_by(2) {
+                body.swap(j, padding + j);
+            }
+            assert_eq!(&body[padding..], &payload_cipher, "record {i}");
+            reference_wire.extend_from_slice(&header_cipher);
+            let mut body = vec![0xa5; padding];
+            body.extend_from_slice(&payload_cipher);
+            for j in (0..padding.min(payload_cipher.len())).step_by(2) {
+                body.swap(j, padding + j);
+            }
+            reference_wire.extend_from_slice(&body);
+            expected.push(payload);
+        }
+        assert!(counter > 256);
+        let mut reader = RecordReader::new(reference_wire.as_slice(), psk);
+        let mut output = Vec::new();
+        for payload in expected {
+            let kind = reader.read_frame_into(&mut output).await.unwrap();
+            assert_eq!(
+                kind,
+                if payload.is_empty() {
+                    RecordKind::Zero
+                } else {
+                    RecordKind::Payload
+                }
+            );
+            assert_eq!(output, payload);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_corruption_wrong_key_and_truncation() {
+        let salt = [0x42; 16];
+        let psk = "test-psk-2026";
+        let mut writer = RecordWriter::new(tokio::io::sink(), psk, salt).unwrap();
+        let wire = writer.encode_frame(b"authenticated payload", 0).unwrap();
+        for offset in [16, 16 + 22, 16 + 23, wire.len() - 1] {
+            let mut corrupt = wire.clone();
+            corrupt[offset] ^= 1;
+            assert!(
+                RecordReader::new(corrupt.as_slice(), psk)
+                    .read_frame()
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            RecordReader::new(wire.as_slice(), "wrong-psk")
+                .read_frame()
+                .await
+                .is_err()
+        );
+        for length in [15, 16 + 22, wire.len() - 1] {
+            assert!(
+                RecordReader::new(&wire[..length], psk)
+                    .read_frame()
+                    .await
+                    .is_err()
+            );
+        }
     }
 }
