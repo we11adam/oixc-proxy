@@ -4,8 +4,8 @@
 
 `oixc-proxy` is a clean-room Rust client and local named-node proxy for
 oixCloud. It fetches, authenticates and decrypts the managed node catalog, then
-publishes only nodes whose names contain `Fusion` or standalone `CIA`/`IXP`
-markers through one mixed HTTP/SOCKS5 listener and a separate HTTP nodelist
+publishes only nodes whose names contain `Fusion` or a standalone `CIA`
+marker through one mixed HTTP/SOCKS5 listener and a separate HTTP nodelist
 listener.
 
 This repository is the Rust rewrite of the Go implementation in `oixc`. The
@@ -138,8 +138,8 @@ routing secret. HTTP clients send those as `Proxy-Authorization: Basic`. The
 access token, node address, PSK and ECH configuration are never returned by
 the nodelist HTTP endpoint.
 
-Only names containing `Fusion` or standalone `CIA`/`IXP` tokens,
-case-insensitively, are published by default. Treating the acronyms as tokens
+Only names containing `Fusion` or a standalone `CIA` token,
+case-insensitively, are published by default. Treating the acronym as a token
 avoids admitting ordinary names such as `Special`. An empty filtered catalog
 is rejected so a control-plane naming change cannot expose ordinary nodes.
 `GET` `/surge-proxies.conf?all=1` and `/clash-proxies.yaml?all=1` publish the
@@ -239,7 +239,7 @@ port. It also serves `GET`/`HEAD` for `/surge-proxies.conf`,
 `/clash-proxies.yaml` and `/healthz`. Append `?all=1` to list every node, or
 `?socks=1` to advertise SOCKS5 instead of HTTP.
 
-`serve-map` fetches the same Fusion/CIA/IXP catalog itself, then gives each
+`serve-map` fetches the same Fusion/CIA catalog itself, then gives each
 node one loopback SOCKS5 port beginning at 7200 by default. Its default
 protected token file is `token.txt`. It does not provide the HTTP nodelist
 endpoint.
@@ -318,7 +318,7 @@ The control plane:
 3. Verifies the HMAC over the exact encrypted response string.
 4. Strictly decodes Base64, ASCII armor and age, with 8 MiB limits.
 5. Strictly parses one YAML document and validates the Snell ECH profile.
-6. Fails closed to the Fusion/CIA/IXP name allowlist.
+6. Fails closed to the Fusion/CIA name allowlist.
 
 The data plane:
 
@@ -361,7 +361,7 @@ cargo build --release
 Unit tests include fixed Go/Rust compatibility vectors for request HMAC,
 Identity v2, Argon2id record keys, CONNECT encoding and private DNS signatures.
 Live validation should additionally cover `/healthz`, a non-empty
-Fusion/CIA/IXP provider, shared-port SOCKS routing, `serve-map` and a real
+Fusion/CIA provider, shared-port SOCKS routing, `serve-map` and a real
 HTTPS request.
 
 ## Go/Rust Snell client benchmark

@@ -197,7 +197,7 @@ rules:
   防火墙必须使用完全相同的 UDP 端口范围；
 - `username` 是节点名的可逆编码（selector），`password` 是 HMAC 派生的
   路由密钥；均由 oixc-proxy 自动生成，**不要手动修改**；
-- 默认只发布名称含 `Fusion`、`CIA` 或 `IXP` 标记的节点；若账户没有这些
+- 默认只发布名称含 `Fusion` 或 `CIA` 标记的节点；若账户没有这些
   类型的节点，`serve` 需加 `--disable-node-filter`（各平台做法见对应章节）；
 - 节点目录每小时自动刷新；客户端按自己的 `interval` 拉取即可感知变更。
 
@@ -331,7 +331,7 @@ rm -f ~/Library/Logs/oixc-proxy.stdout.log ~/Library/Logs/oixc-proxy.stderr.log
 | 启动报 TLS / certificate 错误 | 系统时间不正确 | 系统设置 → 通用 → 日期与时间，打开“自动设置时间与日期” |
 | 启动报 DNS 解析失败 | 无法解析 `oix-api.dler.io` | `nslookup oix-api.dler.io`；检查网络与 DNS 设置 |
 | provider 返回 503 | 节点目录尚未加载完成 | 等待 5~10 秒后重试 |
-| provider 节点数为 0 | token 无效，或账户无 Fusion/CIA/IXP 节点 | `oixc-proxy information` 先验证 token；若账户确实无此类节点，手动编辑 `~/Library/LaunchAgents/io.oixc.proxy.plist`，在 `ProgramArguments` 数组中 `serve` 之后追加 `--disable-node-filter`，再 `launchctl kickstart -k "gui/$(id -u)/io.oixc.proxy"` |
+| provider 节点数为 0 | token 无效，或账户无 Fusion/CIA 节点 | `oixc-proxy information` 先验证 token；若账户确实无此类节点，手动编辑 `~/Library/LaunchAgents/io.oixc.proxy.plist`，在 `ProgramArguments` 数组中 `serve` 之后追加 `--disable-node-filter`，再 `launchctl kickstart -k "gui/$(id -u)/io.oixc.proxy"` |
 | 端口被占用 | 其他服务占用 6172/6173 | `lsof -nP -i :6172 -i :6173`；换端口或停掉冲突服务 |
 | 客户端连不上 SOCKS5 | 未允许 macOS 防火墙传入连接 | 系统设置 → 网络 → 防火墙 → 选项，允许 `oixc-proxy` 接受传入连接；确认监听为 `0.0.0.0` 且配置了 `outbound-ip` |
 | 局域网其他设备连不上 | 不在同一子网或路由不通 | 确认设备与本机同网段；从其他设备 `curl http://<本机IP>:6173/healthz` 测试 |
@@ -450,7 +450,7 @@ rm -rf ~/.config/oixc-proxy
 | 启动报 TLS / certificate 错误 | 系统时间不正确 | 确认 `timedatectl` 已启用 NTP 同步 |
 | 启动报 DNS 解析失败 | 无法解析 `oix-api.dler.io` | `nslookup oix-api.dler.io`；检查 DNS 设置 |
 | provider 返回 503 | 节点目录尚未加载完成 | 等待 5~10 秒后重试 |
-| provider 节点数为 0 | token 无效，或账户无 Fusion/CIA/IXP 节点 | `oixc-proxy information` 先验证 token；若账户确实无此类节点，编辑 `~/.config/systemd/user/oixc-proxy.service` 的 `ExecStart` 行，在 `serve` 之后追加 `--disable-node-filter`，然后 `systemctl --user daemon-reload && systemctl --user restart oixc-proxy.service` |
+| provider 节点数为 0 | token 无效，或账户无 Fusion/CIA 节点 | `oixc-proxy information` 先验证 token；若账户确实无此类节点，编辑 `~/.config/systemd/user/oixc-proxy.service` 的 `ExecStart` 行，在 `serve` 之后追加 `--disable-node-filter`，然后 `systemctl --user daemon-reload && systemctl --user restart oixc-proxy.service` |
 | 端口被占用 | 其他服务占用 6172/6173 | `ss -tlnp \| grep -E '617[23]'`；换端口或停掉冲突服务 |
 | 客户端连不上 SOCKS5 | 系统防火墙未放行传入连接 | 放行 6172/6173 端口（`firewalld` / `ufw`）；确认监听为 `0.0.0.0` 且配置了 `outbound-ip` |
 | 运行一段时间后节点不再更新 | token 过期 | 更新配置文件中的 token 后 `systemctl --user restart oixc-proxy.service` |
@@ -695,7 +695,7 @@ INIT_EOF
 '
 ```
 
-> **节点过滤**：默认只发布名称含 `Fusion`、`CIA` 或 `IXP` 标记的节点。
+> **节点过滤**：默认只发布名称含 `Fusion` 或 `CIA` 标记的节点。
 > 如果你的账户没有这些类型的节点，需要在 init 脚本的 `procd_set_param command`
 > 行追加 `--disable-node-filter` 以发布全部可用节点：
 >
@@ -771,7 +771,7 @@ ssh root@192.168.1.2 'logread -e oixc-proxy | tail -3'
 | 启动报 DNS 解析失败 | N1 无法解析 `oix-api.dler.io` | 检查 WAN DNS、`/etc/resolv.conf` |
 | 客户端连不上 SOCKS5 | 防火墙未放行 | `iptables -L INPUT -n \| grep 617`；重新执行“防火墙”一节 |
 | provider 返回 503 | 节点目录尚未加载完成 | 等待 5~10 秒后重试 |
-| provider 节点数为 0 | token 无效，或账户无 Fusion/CIA/IXP 节点且未加 `--disable-node-filter` | 检查 token；若账户无此类节点，在 init 脚本中追加 `--disable-node-filter`（见“procd 服务”一节） |
+| provider 节点数为 0 | token 无效，或账户无 Fusion/CIA 节点且未加 `--disable-node-filter` | 检查 token；若账户无此类节点，在 init 脚本中追加 `--disable-node-filter`（见“procd 服务”一节） |
 | `logread` 无 oixc-proxy 输出 | procd 未捕获 stdout/stderr | 确认 init 脚本含 `procd_set_param stdout 1` 和 `stderr 1` |
 | init 脚本执行报 `not found` 或语法错误 | CRLF 换行符 | `sed -i 's/\r$//' /etc/init.d/oixc-proxy` |
 | 配置文件解析报未知键 | 使用了引号、section 或拼写错误 | 严格 `key=value`，无引号，无 `[]` section |

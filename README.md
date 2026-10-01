@@ -2,7 +2,7 @@
 
 **中文** | [English](README.en.md)
 
-`oixc-proxy` 是一个面向 oixCloud 的纯净室 Rust 客户端和本地命名节点代理。它会获取、认证并解密托管节点目录，然后通过一个混合 HTTP/SOCKS5 监听器和一个独立的 HTTP 节点列表监听器，仅发布名称中包含 `Fusion` 或独立 `CIA`/`IXP` 标记的节点。
+`oixc-proxy` 是一个面向 oixCloud 的纯净室 Rust 客户端和本地命名节点代理。它会获取、认证并解密托管节点目录，然后通过一个混合 HTTP/SOCKS5 监听器和一个独立的 HTTP 节点列表监听器，仅发布名称中包含 `Fusion` 或独立 `CIA` 标记的节点。
 
 本仓库是 Go 版 `oixc` 的 Rust 重写。二进制名称、命令、配置、HTTP 端点、Surge provider 格式、SOCKS5 路由凭据、控制面认证以及 Snell/ECH 线路行为均有意保持兼容。
 
@@ -93,7 +93,7 @@ OIXC = select, policy-path=http://127.0.0.1:6173/surge-proxies.conf, update-inte
 
 每个 provider 条目都指向共享的混合监听器。条目默认声明为 HTTP 代理；`?socks=1` 会改为声明 SOCKS5（UDP ASSOCIATE 仅在 SOCKS 路径可用）。回环监听会直接声明节点的 UDP 能力；远程监听只有同时配置固定 UDP 端口范围和客户端可达的宣告地址后才会声明 UDP，避免生成实际不可用的配置。用户名是节点准确名称的可逆 URL-safe 编码，密码是稳定的 HMAC 派生路由密钥。HTTP 客户端通过 `Proxy-Authorization: Basic` 发送这些凭据。访问 token、节点地址、PSK 和 ECH 配置绝不会由节点列表 HTTP 端点返回。
 
-默认只发布名称中包含 `Fusion` 或独立 `CIA`/`IXP` token 的节点，匹配不区分大小写。将缩写视为独立 token，可避免错误纳入 `Special` 等普通名称。过滤后目录为空时会拒绝加载，以免控制面命名变化意外暴露普通节点。`GET /surge-proxies.conf?all=1` 和 `/clash-proxies.yaml?all=1` 会发布完整目录；这些额外节点仍通过同一个混合监听器路由。需要客户端使用 SOCKS5 时，再附加 `socks=1`。
+默认只发布名称中包含 `Fusion` 或独立 `CIA` token 的节点，匹配不区分大小写。将该缩写视为独立 token，可避免错误纳入 `Special` 等普通名称。过滤后目录为空时会拒绝加载，以免控制面命名变化意外暴露普通节点。`GET /surge-proxies.conf?all=1` 和 `/clash-proxies.yaml?all=1` 会发布完整目录；这些额外节点仍通过同一个混合监听器路由。需要客户端使用 SOCKS5 时，再附加 `socks=1`。
 
 ## 服务配置
 
@@ -154,7 +154,7 @@ oixc-proxy install-systemd [--config PATH]
 
 `serve` 是常规命名节点网关。生成的 provider 中，不同用户名/密码组合会在同一个混合 HTTP/SOCKS5 端口选择不同托管节点。它还会为 `/surge-proxies.conf`、`/clash-proxies.yaml` 和 `/healthz` 提供 `GET`/`HEAD`。附加 `?all=1` 可列出所有节点，附加 `?socks=1` 可将代理声明为 SOCKS5 而非 HTTP。
 
-`serve-map` 自行获取相同的 Fusion/CIA/IXP 目录，然后为每个节点分配一个回环 SOCKS5 端口，默认从 7200 开始。其默认受保护 token 文件为 `token.txt`。该命令不提供 HTTP 节点列表端点。
+`serve-map` 自行获取相同的 Fusion/CIA 目录，然后为每个节点分配一个回环 SOCKS5 端口，默认从 7200 开始。其默认受保护 token 文件为 `token.txt`。该命令不提供 HTTP 节点列表端点。
 
 `version` 会输出包版本、构建二进制时的 Git commit id（短 hash；工作区存在未提交变更时追加 `-dirty`）以及 UTC 构建时间。元数据由 `build.rs` 在编译时捕获；如果不在 Git checkout 中，则 commit id 显示为 `unknown`。
 
@@ -211,7 +211,7 @@ journalctl --user -u oixc-proxy.service
 3. 对准确的加密响应字符串验证 HMAC。
 4. 严格解码 Base64、ASCII armor 和 age，并实施 8 MiB 限制。
 5. 严格解析单个 YAML 文档并验证 Snell ECH profile。
-6. 对 Fusion/CIA/IXP 名称 allowlist 采取 fail-closed 策略。
+6. 对 Fusion/CIA 名称 allowlist 采取 fail-closed 策略。
 
 数据面流程：
 
@@ -241,7 +241,7 @@ cargo test
 cargo build --release
 ```
 
-单元测试包含 Go/Rust 兼容性的固定测试向量，覆盖请求 HMAC、Identity v2、Argon2id record key、CONNECT 编码和私有 DNS 签名。在线验证还应覆盖 `/healthz`、非空 Fusion/CIA/IXP provider、共享端口 SOCKS 路由、`serve-map` 和真实 HTTPS 请求。
+单元测试包含 Go/Rust 兼容性的固定测试向量，覆盖请求 HMAC、Identity v2、Argon2id record key、CONNECT 编码和私有 DNS 签名。在线验证还应覆盖 `/healthz`、非空 Fusion/CIA provider、共享端口 SOCKS 路由、`serve-map` 和真实 HTTPS 请求。
 
 ## Go/Rust Snell 客户端基准测试
 

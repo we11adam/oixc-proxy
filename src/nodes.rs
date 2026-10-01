@@ -102,7 +102,7 @@ impl ManagedConfig {
     pub fn filter_allowed_nodes(self) -> Result<Self> {
         let proxies = self.allowed_proxies();
         if proxies.is_empty() {
-            bail!("managed config contains no allowed Fusion/CIA/IXP proxies");
+            bail!("managed config contains no allowed Fusion/CIA proxies");
         }
         Ok(Self { proxies })
     }

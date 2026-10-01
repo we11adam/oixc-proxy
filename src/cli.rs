@@ -37,8 +37,8 @@ The information command is read-only. Its output file is created with mode
 0600 and must not already exist.
 
 --disable-node-filter publishes all managed nodes instead of only those
-whose names contain Fusion, CIA, or IXP markers. Use this when your
-account does not include any Fusion/CIA/IXP nodes.
+whose names contain Fusion or CIA markers. Use this when your
+account does not include any Fusion/CIA nodes.
 
 GET /surge-proxies.conf?all=1 and /clash-proxies.yaml?all=1 publish the
 full catalog without changing the default filtered listing. Provider
@@ -420,7 +420,7 @@ fn published_proxies(managed: &ManagedConfig, include_all: bool) -> Result<Vec<P
     }
     let proxies = managed.allowed_proxies();
     if proxies.is_empty() {
-        bail!("managed config contains no allowed Fusion/CIA/IXP proxies");
+        bail!("managed config contains no allowed Fusion/CIA proxies");
     }
     Ok(proxies)
 }
