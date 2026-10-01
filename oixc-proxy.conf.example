@@ -7,6 +7,7 @@ node-refresh-interval=1h
 # Optional performance tuning. Detailed tracing is disabled by default;
 # 1000 records roughly one request in every 1000.
 # request-timeout=15s
+# tcp-idle-timeout=1h
 # udp-idle-timeout=5m
 # Neither UDP option has a static default. Omit both for OS-assigned ports and
 # the actual bind IP; setting only one is invalid. Remote SOCKS5 UDP requires

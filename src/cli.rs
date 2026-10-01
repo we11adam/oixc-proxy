@@ -191,6 +191,7 @@ async fn run_serve(args: &[String]) -> Result<()> {
         socks_listener,
         socks5::Options {
             handshake_timeout: service.runtime.request_timeout.max(Duration::from_secs(45)),
+            tcp_idle_timeout: service.runtime.tcp_idle_timeout,
             udp_idle_timeout: service.runtime.udp_idle_timeout,
             udp_relay,
             mode: Mode::Dynamic(manager.clone()),
@@ -349,6 +350,7 @@ async fn run_serve_map(args: &[String]) -> Result<()> {
         let connection_limit = connection_limit.clone();
         let options = socks5::Options {
             handshake_timeout: runtime.request_timeout,
+            tcp_idle_timeout: runtime.tcp_idle_timeout,
             udp_idle_timeout: runtime.udp_idle_timeout,
             udp_relay: UdpRelay::ephemeral(listen),
             mode: Mode::Fixed {

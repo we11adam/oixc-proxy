@@ -71,6 +71,7 @@ pub struct Credentials {
 #[derive(Clone)]
 pub struct Options {
     pub handshake_timeout: Duration,
+    pub tcp_idle_timeout: Duration,
     pub udp_idle_timeout: Duration,
     pub udp_relay: UdpRelay,
     pub mode: Mode,
@@ -220,7 +221,7 @@ async fn serve_socks5(mut client: TcpStream, options: Options, version: u8) -> R
     };
     let (route, request) = route;
     let result = match request.command {
-        COMMAND_CONNECT => serve_connect(client, route, request).await,
+        COMMAND_CONNECT => serve_connect(client, route, request, options.tcp_idle_timeout).await,
         COMMAND_UDP_ASSOCIATE => {
             if !route.udp {
                 write_reply(&mut client, 7, None).await?;
@@ -361,7 +362,12 @@ async fn read_host(client: &mut TcpStream, address_type: u8) -> Result<String> {
     }
 }
 
-async fn serve_connect(mut client: TcpStream, route: Route, request: Request) -> Result<()> {
+async fn serve_connect(
+    mut client: TcpStream,
+    route: Route,
+    request: Request,
+    idle_timeout: Duration,
+) -> Result<()> {
     let started = Instant::now();
     let session = match route.client.dial_tcp(&request.host, request.port).await {
         Ok(session) => session,
@@ -373,24 +379,31 @@ async fn serve_connect(mut client: TcpStream, route: Route, request: Request) ->
     };
     crate::perftrace::stage("socks.upstream", started, true, &[]);
     write_reply(&mut client, 0, Some(session.local_addr())).await?;
-    relay(client, session).await
+    relay(client, session, idle_timeout).await
 }
 
-pub(crate) async fn relay(client: TcpStream, mut session: SnellSession) -> Result<()> {
+pub(crate) async fn relay(
+    client: TcpStream,
+    mut session: SnellSession,
+    idle_timeout: Duration,
+) -> Result<()> {
     let started = Instant::now();
     crate::perftrace::event("socks.relay_start", &[]);
     let (client_read, client_write) = client.into_split();
     let stop_timeout = session.close_timeout();
+    let activity = Activity::new();
     let (clean, close_write_sent) = {
         let (remote_read, remote_write) = session.split();
         let (stop, stopped) = oneshot::channel();
-        drive_relay(
-            upload(client_read, remote_write, stopped),
-            download(client_write, remote_read),
+        let relay = drive_relay(
+            upload(client_read, remote_write, stopped, &activity),
+            download(client_write, remote_read, &activity),
             stop,
             stop_timeout,
-        )
-        .await
+        );
+        until_idle(relay, &activity, idle_timeout)
+            .await
+            .unwrap_or((false, false))
     };
     session.finish(clean, close_write_sent).await;
     crate::perftrace::stage("socks.relay", started, clean, &[]);
@@ -421,8 +434,8 @@ async fn drive_relay(
         upload_result = &mut upload => {
             if matches!(upload_result, Ok(UploadEnd::ClientEof)) {
                 // A client half-close only ends the request direction. The
-                // response may legitimately take much longer, so wait for it
-                // without a deadline.
+                // response may legitimately take much longer, so only the
+                // relay idle timeout bounds the wait.
                 (download.await.is_ok(), true)
             } else {
                 (false, false)
@@ -449,6 +462,7 @@ async fn upload(
     mut client: OwnedReadHalf,
     mut session: SnellSessionWriter<'_>,
     mut stop: oneshot::Receiver<()>,
+    activity: &Activity,
 ) -> Result<UploadEnd> {
     let mut buffer = vec![0u8; 32 << 10];
     let mut first_data = true;
@@ -457,6 +471,7 @@ async fn upload(
             read = client.read(&mut buffer) => read?,
             _ = &mut stop => return Ok(UploadEnd::Stopped),
         };
+        activity.touch();
         if read == 0 {
             session.close_write().await?;
             return Ok(UploadEnd::ClientEof);
@@ -474,10 +489,12 @@ async fn upload(
 pub(crate) async fn download(
     mut client: OwnedWriteHalf,
     mut session: SnellSessionReader<'_>,
+    activity: &Activity,
 ) -> Result<()> {
     let mut first_data = true;
     loop {
         let chunk = session.read_chunk().await?;
+        activity.touch();
         if chunk.is_empty() {
             client.shutdown().await?;
             return Ok(());
@@ -546,22 +563,35 @@ async fn serve_udp_associate(mut client: TcpStream, route: Route, options: Optio
     Ok(())
 }
 
-/// Tracks the last datagram relayed in either direction, so an association
-/// that only receives is not mistaken for an idle one.
-struct Activity {
+/// Runs `relay` until it finishes, or returns `None` once no data has moved in
+/// either direction for `idle_timeout`.
+pub(crate) async fn until_idle<T>(
+    relay: impl Future<Output = T>,
+    activity: &Activity,
+    idle_timeout: Duration,
+) -> Option<T> {
+    tokio::select! {
+        result = relay => Some(result),
+        _ = activity.idle(idle_timeout) => None,
+    }
+}
+
+/// Tracks the last data relayed in either direction, so a session that only
+/// receives is not mistaken for an idle one.
+pub(crate) struct Activity {
     started: tokio::time::Instant,
     last_millis: AtomicU64,
 }
 
 impl Activity {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             started: tokio::time::Instant::now(),
             last_millis: AtomicU64::new(0),
         }
     }
 
-    fn touch(&self) {
+    pub(crate) fn touch(&self) {
         let elapsed = self.started.elapsed().as_millis();
         self.last_millis.store(
             u64::try_from(elapsed).unwrap_or(u64::MAX),
@@ -802,6 +832,30 @@ mod tests {
         })
         .await;
         assert_eq!(result, (true, true));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_stops_only_after_both_directions_go_quiet() {
+        let activity = Activity::new();
+        let busy = async {
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_secs(40)).await;
+                activity.touch();
+            }
+        };
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            until_idle(busy, &activity, Duration::from_secs(60)).await,
+            Some(())
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(200));
+
+        let quiet = std::future::pending::<()>();
+        assert_eq!(
+            until_idle(quiet, &activity, Duration::from_secs(60)).await,
+            None
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(260));
     }
 
     #[tokio::test]

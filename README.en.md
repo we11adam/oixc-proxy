@@ -166,6 +166,7 @@ The file must be a regular file with Unix mode `0600` or stricter.
 | `udp-advertise-address` | Conditional | Unset (bound IP) | Client-reachable address returned by SOCKS5 UDP ASSOCIATE |
 | `node-refresh-interval` | No | `1h` | Catalog refresh period, `1m` through `24h` |
 | `request-timeout` | No | `15s` | Control-plane and node operation deadline, up to `2m` |
+| `tcp-idle-timeout` | No | `1h` | Close a TCP tunnel after no data moves in either direction, `1m` through `24h` |
 | `udp-idle-timeout` | No | `5m` | Idle lifetime of one SOCKS5 UDP association |
 | `max-client-connections` | No | `256` | Process-wide mixed proxy connection limit, `1` through `4096` |
 | `dial-concurrency` | No | `32` | Process-wide fresh ECH-TLS dial limit, `1` through `1024` |

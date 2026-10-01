@@ -9,7 +9,7 @@ use tokio::time::timeout;
 use url::{Host, Url};
 
 use crate::snell::{SnellSession, SnellSessionWriter};
-use crate::socks5::{self, Mode, Options};
+use crate::socks5::{self, Activity, Mode, Options};
 
 const BODY_BATCH_SIZE: usize = 32 << 10;
 const CHUNK_LINE_LIMIT: usize = 4 << 10;
@@ -91,7 +91,7 @@ pub async fn serve(mut client: TcpStream, options: Options, first_byte: u8) -> R
             if !parsed.leftover.is_empty() {
                 session.write(&parsed.leftover).await?;
             }
-            socks5::relay(client, session).await
+            socks5::relay(client, session, options.tcp_idle_timeout).await
         }
         Some(forwarded) if forwarded.upgrade => {
             // After a protocol switch the connection no longer carries HTTP
@@ -100,9 +100,18 @@ pub async fn serve(mut client: TcpStream, options: Options, first_byte: u8) -> R
             if !parsed.leftover.is_empty() {
                 session.write(&parsed.leftover).await?;
             }
-            socks5::relay(client, session).await
+            socks5::relay(client, session, options.tcp_idle_timeout).await
         }
-        Some(forwarded) => relay_one_request(client, session, forwarded, parsed.leftover).await,
+        Some(forwarded) => {
+            relay_one_request(
+                client,
+                session,
+                forwarded,
+                parsed.leftover,
+                options.tcp_idle_timeout,
+            )
+            .await
+        }
     };
     crate::perftrace::stage("http.session", session_started, result.is_ok(), &[]);
     result
@@ -120,28 +129,34 @@ async fn relay_one_request(
     mut session: SnellSession,
     forwarded: ForwardedRequest,
     leftover: Vec<u8>,
+    idle_timeout: Duration,
 ) -> Result<()> {
     let started = Instant::now();
     let (client_read, client_write) = client.into_split();
     let mut request =
         BufReader::with_capacity(BODY_BATCH_SIZE, Cursor::new(leftover).chain(client_read));
+    let activity = Activity::new();
     let clean = {
-        let (remote_read, mut remote_write) = session.split();
-        let upload = forward_body(
-            &mut request,
-            &mut remote_write,
-            forwarded.framing,
-            forwarded.head,
-        );
-        let download = socks5::download(client_write, remote_read);
-        tokio::pin!(upload, download);
-        tokio::select! {
-            upload_result = &mut upload => upload_result.is_ok() && download.await.is_ok(),
-            download_result = &mut download => {
-                let _ = download_result;
-                false
+        let (remote_read, remote_write) = session.split();
+        let mut sink = ActiveSink {
+            writer: remote_write,
+            activity: &activity,
+        };
+        let upload = forward_body(&mut request, &mut sink, forwarded.framing, forwarded.head);
+        let download = socks5::download(client_write, remote_read, &activity);
+        let relay = async {
+            tokio::pin!(upload, download);
+            tokio::select! {
+                upload_result = &mut upload => upload_result.is_ok() && download.await.is_ok(),
+                download_result = &mut download => {
+                    let _ = download_result;
+                    false
+                }
             }
-        }
+        };
+        socks5::until_idle(relay, &activity, idle_timeout)
+            .await
+            .unwrap_or(false)
     };
     session.finish(clean, false).await;
     crate::perftrace::stage("http.relay", started, clean, &[]);
@@ -163,9 +178,16 @@ trait BodySink {
     async fn send(&mut self, content: &[u8]) -> Result<()>;
 }
 
-impl BodySink for SnellSessionWriter<'_> {
+/// Forwards request bytes upstream and records them as relay activity.
+struct ActiveSink<'a, 'b> {
+    writer: SnellSessionWriter<'b>,
+    activity: &'a Activity,
+}
+
+impl BodySink for ActiveSink<'_, '_> {
     async fn send(&mut self, content: &[u8]) -> Result<()> {
-        self.write(content).await.map(|_| ())
+        self.activity.touch();
+        self.writer.write(content).await.map(|_| ())
     }
 }
 

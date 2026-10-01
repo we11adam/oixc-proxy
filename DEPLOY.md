@@ -95,6 +95,7 @@ token=YOUR_OIXCLOUD_ACCESS_TOKEN
 | `udp-advertise-address` | 条件 | 未设置（沿用绑定 IP） | SOCKS5 UDP 响应中返回的客户端可达 IP；必须与端口范围同时配置 |
 | `node-refresh-interval` | 否 | `1h` | 节点目录刷新周期，范围 `1m` ~ `24h` |
 | `request-timeout` | 否 | `15s` | 控制面与节点操作超时，最大 `2m` |
+| `tcp-idle-timeout` | 否 | `1h` | TCP 隧道两个方向都没有数据时的关闭时间，范围 `1m` ~ `24h` |
 | `udp-idle-timeout` | 否 | `5m` | SOCKS5 UDP association 空闲超时 |
 | `max-client-connections` | 否 | `256` | 整个进程的 mixed proxy 连接上限 |
 | `dial-concurrency` | 否 | `32` | 整个进程同时新建 ECH-TLS 连接的上限 |

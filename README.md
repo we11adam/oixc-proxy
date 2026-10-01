@@ -111,6 +111,7 @@ OIXC = select, policy-path=http://127.0.0.1:6173/surge-proxies.conf, update-inte
 | `udp-advertise-address` | 条件必填 | 未设置（沿用绑定 IP） | 在 SOCKS5 UDP ASSOCIATE 响应中返回的客户端可达地址 |
 | `node-refresh-interval` | 否 | `1h` | 节点目录刷新周期，范围 `1m` 至 `24h` |
 | `request-timeout` | 否 | `15s` | 控制面和节点操作超时，最大 `2m` |
+| `tcp-idle-timeout` | 否 | `1h` | TCP 隧道两个方向都没有数据时的关闭时间，范围 `1m` 至 `24h` |
 | `udp-idle-timeout` | 否 | `5m` | 单个 SOCKS5 UDP 会话的空闲存活时间 |
 | `max-client-connections` | 否 | `256` | 进程级混合代理连接上限，范围 `1` 至 `4096` |
 | `dial-concurrency` | 否 | `32` | 进程级新建 ECH-TLS 连接并发上限，范围 `1` 至 `1024` |

@@ -24,6 +24,7 @@ pub struct RuntimeConfig {
     pub serve_port: u16,
     pub map_base_port: u16,
     pub request_timeout: Duration,
+    pub tcp_idle_timeout: Duration,
     pub udp_idle_timeout: Duration,
     pub allow_remote_access: bool,
     pub socks_username: String,
@@ -71,6 +72,7 @@ struct FileConfig {
     serve_port: u16,
     map_base_port: u16,
     request_timeout: String,
+    tcp_idle_timeout: String,
     udp_idle_timeout: String,
     allow_remote_access: bool,
     socks_username: String,
@@ -144,6 +146,7 @@ pub fn load_proxy_config(path: &Path) -> Result<ProxyConfig> {
             listen_address: "127.0.0.1".to_owned(),
             serve_port: listen.port(),
             request_timeout: config_string(&values, "request-timeout"),
+            tcp_idle_timeout: config_string(&values, "tcp-idle-timeout"),
             udp_idle_timeout: config_string(&values, "udp-idle-timeout"),
             max_client_connections: config_usize(&values, "max-client-connections", 1, 4096)?,
             dial_concurrency: config_usize(&values, "dial-concurrency", 1, 1024)?,
@@ -245,6 +248,13 @@ fn runtime_from_raw(config_dir: &Path, raw: FileConfig) -> Result<RuntimeConfig>
         Duration::from_nanos(1),
         Duration::from_secs(120),
     )?;
+    let tcp_idle_timeout = parse_bounded_duration(
+        "tcpIdleTimeout",
+        &raw.tcp_idle_timeout,
+        Duration::from_secs(3600),
+        Duration::from_secs(60),
+        Duration::from_secs(24 * 3600),
+    )?;
     let udp_idle_timeout = parse_bounded_duration(
         "udpIdleTimeout",
         &raw.udp_idle_timeout,
@@ -289,6 +299,7 @@ fn runtime_from_raw(config_dir: &Path, raw: FileConfig) -> Result<RuntimeConfig>
         serve_port: nonzero_or(raw.serve_port, 6172),
         map_base_port: nonzero_or(raw.map_base_port, 7200),
         request_timeout,
+        tcp_idle_timeout,
         udp_idle_timeout,
         allow_remote_access: raw.allow_remote_access,
         socks_username,
@@ -332,6 +343,7 @@ fn parse_proxy_config(content: &[u8]) -> Result<HashMap<String, String>> {
         "udp-advertise-address",
         "node-refresh-interval",
         "request-timeout",
+        "tcp-idle-timeout",
         "udp-idle-timeout",
         "max-client-connections",
         "dial-concurrency",
@@ -681,6 +693,26 @@ mod tests {
     }
 
     #[test]
+    fn tcp_idle_timeout_defaults_to_an_hour_and_is_bounded() {
+        let runtime = |tcp_idle_timeout: &str| {
+            runtime_from_raw(
+                Path::new(""),
+                FileConfig {
+                    access_token: "token".to_owned(),
+                    tcp_idle_timeout: tcp_idle_timeout.to_owned(),
+                    ..FileConfig::default()
+                },
+            )
+        };
+        assert_eq!(
+            runtime("").unwrap().tcp_idle_timeout,
+            Duration::from_secs(3600)
+        );
+        assert!(runtime("30s").is_err());
+        assert!(runtime("25h").is_err());
+    }
+
+    #[test]
     fn proxy_config_maps_performance_settings() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("oixc-proxy.conf");
@@ -689,6 +721,7 @@ mod tests {
             concat!(
                 "token=token\n",
                 "request-timeout=20s\n",
+                "tcp-idle-timeout=30m\n",
                 "max-client-connections=512\n",
                 "dial-concurrency=64\n",
                 "per-node-dial-concurrency=4\n",
@@ -707,6 +740,7 @@ mod tests {
 
         let config = load_proxy_config(&path).unwrap();
         assert_eq!(config.runtime.request_timeout, Duration::from_secs(20));
+        assert_eq!(config.runtime.tcp_idle_timeout, Duration::from_secs(1800));
         assert_eq!(config.runtime.max_client_connections, 512);
         assert_eq!(config.runtime.dial_concurrency, 64);
         assert_eq!(config.runtime.per_node_dial_concurrency, 4);
