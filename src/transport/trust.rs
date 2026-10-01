@@ -1,9 +1,10 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use rustls::RootCertStore;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::task::JoinHandle;
 
 const RELOAD_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -20,13 +21,16 @@ pub(super) struct TrustSnapshot {
 
 struct State {
     snapshot: TrustSnapshot,
-    complete: bool,
-    last_attempt: Option<Instant>,
+    /// No background reload is needed: the last load was complete, or a
+    /// reload produced the same roots so the platform store is stable.
+    settled: bool,
 }
 
 /// Shared across nodes. A failed or partial reload never replaces a usable store.
 pub(super) struct TrustStore {
     state: Arc<Mutex<State>>,
+    /// Held for the duration of a reload; stores when the last one started.
+    reload: Arc<AsyncMutex<Option<Instant>>>,
     loader: fn() -> LoadedRoots,
 }
 
@@ -46,76 +50,107 @@ impl TrustStore {
                     roots: Arc::new(loaded.roots),
                     generation: 1,
                 },
-                complete: loaded.complete,
-                last_attempt: None,
+                settled: loaded.complete,
             })),
+            reload: Arc::new(AsyncMutex::new(None)),
             loader,
         })
     }
 
+    /// Returns the current roots without waiting. An unsettled store starts a
+    /// background reload, so a slow keychain scan never delays other dials.
     pub async fn snapshot(&self) -> TrustSnapshot {
-        let state = self.state.lock().await;
-        let snapshot = state.snapshot.clone();
-        let incomplete = !state.complete;
-        drop(state);
-        if incomplete {
-            self.refresh(snapshot.generation).await
-        } else {
-            snapshot
+        let (snapshot, settled) = {
+            let state = lock(&self.state);
+            (state.snapshot.clone(), state.settled)
+        };
+        if !settled {
+            if let Ok(last_attempt) = self.reload.clone().try_lock_owned() {
+                if !cooling_down(&last_attempt) {
+                    drop(self.start_reload(last_attempt));
+                }
+            }
         }
+        snapshot
     }
 
+    /// Reloads after `observed_generation` failed verification, waiting for
+    /// the result. Concurrent callers share a single reload.
     pub async fn refresh(&self, observed_generation: u64) -> TrustSnapshot {
-        let mut state = self.state.clone().lock_owned().await;
-        if state.snapshot.generation != observed_generation
-            || state
-                .last_attempt
-                .is_some_and(|last| last.elapsed() < RELOAD_INTERVAL)
-        {
-            return state.snapshot.clone();
+        let last_attempt = self.reload.clone().lock_owned().await;
+        let current = lock(&self.state).snapshot.clone();
+        if current.generation != observed_generation || cooling_down(&last_attempt) {
+            return current;
         }
-        state.last_attempt = Some(Instant::now());
-        eprintln!(
-            "tls.roots reload requested count={} generation={}",
-            state.snapshot.roots.len(),
-            state.snapshot.generation
-        );
-        let fallback = state.snapshot.clone();
+        self.start_reload(last_attempt).await.unwrap_or(current)
+    }
+
+    fn start_reload(
+        &self,
+        mut last_attempt: OwnedMutexGuard<Option<Instant>>,
+    ) -> JoinHandle<TrustSnapshot> {
+        *last_attempt = Some(Instant::now());
+        let state = self.state.clone();
         let loader = self.loader;
-        // The worker owns the lock: even when a dial times out, its reload finishes
-        // and other nodes cannot start duplicate keychain scans.
+        {
+            let state = lock(&state);
+            eprintln!(
+                "tls.roots reload requested count={} generation={}",
+                state.snapshot.roots.len(),
+                state.snapshot.generation
+            );
+        }
+        // The worker owns the reload lock: even when a dial times out, its reload
+        // finishes and other nodes cannot start duplicate keychain scans.
         tokio::task::spawn_blocking(move || {
+            let _last_attempt = last_attempt;
             let loaded = loader();
-            if loaded.complete && !loaded.roots.is_empty() {
-                if state.snapshot.roots.roots != loaded.roots.roots {
-                    state.snapshot = TrustSnapshot {
-                        roots: Arc::new(loaded.roots),
-                        generation: state.snapshot.generation + 1,
-                    };
-                    eprintln!(
-                        "tls.roots refreshed count={} generation={}",
-                        state.snapshot.roots.len(),
-                        state.snapshot.generation
-                    );
-                }
-                state.complete = true;
-            } else {
-                eprintln!(
-                    "tls.roots reload incomplete; retained count={}",
-                    state.snapshot.roots.len()
-                );
-            }
-            state.snapshot.clone()
+            apply_reload(&mut lock(&state), loaded)
         })
-        .await
-        .unwrap_or(fallback)
     }
 
     #[cfg(test)]
     pub(super) async fn replace_for_test(&self, roots: RootCertStore) {
-        let mut state = self.state.lock().await;
-        state.snapshot.roots = Arc::new(roots);
+        lock(&self.state).snapshot.roots = Arc::new(roots);
     }
+}
+
+fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
+    state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn cooling_down(last_attempt: &Option<Instant>) -> bool {
+    last_attempt.is_some_and(|last| last.elapsed() < RELOAD_INTERVAL)
+}
+
+fn apply_reload(state: &mut State, loaded: LoadedRoots) -> TrustSnapshot {
+    let current = &state.snapshot.roots.roots;
+    let unchanged = loaded.roots.roots == *current;
+    // A partial load can still add anchors; it must not remove any.
+    let usable = !loaded.roots.is_empty()
+        && (loaded.complete
+            || (loaded.roots.len() > current.len()
+                && current.iter().all(|root| loaded.roots.roots.contains(root))));
+    if unchanged {
+        state.settled = true;
+    } else if usable {
+        state.snapshot = TrustSnapshot {
+            roots: Arc::new(loaded.roots),
+            generation: state.snapshot.generation + 1,
+        };
+        state.settled = loaded.complete;
+        eprintln!(
+            "tls.roots refreshed count={} generation={}",
+            state.snapshot.roots.len(),
+            state.snapshot.generation
+        );
+    } else {
+        eprintln!(
+            "tls.roots reload incomplete; retained count={}",
+            state.snapshot.roots.len()
+        );
+    }
+    state.snapshot.clone()
 }
 
 fn load_native() -> LoadedRoots {
@@ -145,8 +180,8 @@ mod tests {
         LoadedRoots {
             roots: RootCertStore {
                 roots: (0..count)
-                    .map(|_| TrustAnchor {
-                        subject: Der::from(vec![1]),
+                    .map(|index| TrustAnchor {
+                        subject: Der::from(vec![index as u8]),
                         subject_public_key_info: Der::from(vec![2]),
                         name_constraints: None,
                     })
@@ -196,5 +231,58 @@ mod tests {
     #[test]
     fn empty_initial_store_is_rejected() {
         assert!(TrustStore::with_loader(|| roots(0, false)).is_err());
+    }
+
+    #[tokio::test]
+    async fn snapshot_does_not_wait_for_background_reload() {
+        let store = TrustStore::with_loader(|| roots(5, false)).unwrap();
+        let store = TrustStore {
+            loader: || {
+                std::thread::sleep(Duration::from_millis(300));
+                roots(162, true)
+            },
+            ..store
+        };
+        let snapshot = tokio::time::timeout(Duration::from_millis(100), store.snapshot())
+            .await
+            .expect("snapshot must not wait for the keychain scan");
+        assert_eq!(snapshot.generation, 1);
+        let snapshot = tokio::time::timeout(Duration::from_millis(100), store.snapshot())
+            .await
+            .unwrap();
+        assert_eq!(snapshot.generation, 1);
+        // A verification failure waits for the reload already in flight.
+        assert_eq!(store.refresh(1).await.roots.len(), 162);
+        assert_eq!(store.snapshot().await.generation, 2);
+    }
+
+    fn state(count: usize) -> State {
+        State {
+            snapshot: TrustSnapshot {
+                roots: Arc::new(roots(count, false).roots),
+                generation: 1,
+            },
+            settled: false,
+        }
+    }
+
+    #[test]
+    fn partial_reloads_only_add_roots_and_settle_when_stable() {
+        let mut current = state(5);
+        assert_eq!(apply_reload(&mut current, roots(5, false)).generation, 1);
+        assert!(
+            current.settled,
+            "a stable partial store must stop rescanning"
+        );
+
+        let mut current = state(5);
+        let grown = apply_reload(&mut current, roots(8, false));
+        assert_eq!((grown.generation, grown.roots.len()), (2, 8));
+        assert!(!current.settled);
+
+        let mut current = state(5);
+        let shrunk = apply_reload(&mut current, roots(3, false));
+        assert_eq!((shrunk.generation, shrunk.roots.len()), (1, 5));
+        assert!(!current.settled);
     }
 }
