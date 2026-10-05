@@ -30,6 +30,7 @@ const SERVE_MAP_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
 const USAGE: &str = "Usage:
   oixc-proxy information [--config PATH] --output PATH
   oixc-proxy preview-nodes [--config PATH] [--refresh] [--disable-node-filter]
+  oixc-proxy refresh-nodes [--config PATH]
   oixc-proxy serve [--config PATH] [--disable-node-filter]
   oixc-proxy serve-map [--token-file PATH] [--listen IP] [--base-port PORT] [--disable-node-filter]
   oixc-proxy version
@@ -66,6 +67,7 @@ pub async fn run(args: Vec<String>) -> i32 {
     let result = match args[0].as_str() {
         "information" => run_information(&args[1..]).await,
         "preview-nodes" => run_preview_nodes(&args[1..]).await,
+        "refresh-nodes" => run_control(&args[1..], crate::control::Command::RefreshNodes).await,
         "serve" => run_serve(&args[1..]).await,
         "serve-map" => run_serve_map(&args[1..]).await,
         "install-launch-agent" => run_install_launch_agent(&args[1..]),
@@ -165,6 +167,84 @@ async fn run_preview_nodes(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+async fn run_control(args: &[String], command: crate::control::Command) -> Result<()> {
+    let default = default_proxy_config_path()?;
+    let flags = parse_flags(args, &[("config", true)])?;
+    let response = crate::control::send(&flag_path(&flags, "config", &default), command).await?;
+    let value = serde_json::to_string_pretty(&response)?;
+    if !response.ok {
+        bail!("{value}");
+    }
+    println!("{value}");
+    Ok(())
+}
+
+struct CatalogService {
+    service: crate::config::ProxyConfig,
+    managed: ManagedConfig,
+    fetched_at: Option<u64>,
+    network: NetworkMonitor,
+    cache: CatalogCache,
+    context: GatewayContext,
+    manager: Arc<GatewayManager>,
+    disable_filter: bool,
+}
+
+impl CatalogService {
+    async fn refresh(&mut self) -> Result<()> {
+        self.manager.refresh_started();
+        let result = self.refresh_inner().await;
+        self.manager.refresh_finished(result.as_ref().err());
+        if let Err(error) = &result {
+            if matches!(
+                crate::diagnostics::classify(error),
+                crate::diagnostics::ErrorKind::Authentication
+                    | crate::diagnostics::ErrorKind::Forbidden
+            ) {
+                self.manager.update_subscription(None, None).await;
+                if let Err(error) = self
+                    .cache
+                    .store_snapshot(&self.managed, None, self.fetched_at)
+                {
+                    eprintln!("clear cached account metadata: {error:#}");
+                }
+            }
+        }
+        result
+    }
+
+    async fn refresh_inner(&mut self) -> Result<()> {
+        let refreshed = load_managed_catalog(&self.service.runtime, true, &self.network).await?;
+        if refreshed.managed.proxies != self.managed.proxies {
+            let published = published_proxies(
+                &refreshed.managed,
+                self.disable_filter,
+                &self.service.runtime.node_filter,
+            )?;
+            let previous = self.manager.current().await?;
+            let replacement = Router::build(
+                &refreshed.managed.proxies,
+                &published,
+                &self.service.runtime,
+                &self.context,
+                Some(previous.as_ref()),
+            )?;
+            self.manager.replace(replacement).await?;
+            println!(
+                "Refreshed node catalog ({})",
+                format_node_count(published.len(), refreshed.managed.proxies.len())
+            );
+        }
+        self.manager
+            .update_subscription(refreshed.userinfo.clone(), refreshed.fetched_at)
+            .await;
+        self.fetched_at = refreshed.fetched_at;
+        self.cache.store_snapshot_or_log(&refreshed);
+        self.managed = refreshed.managed;
+        Ok(())
+    }
+}
+
 async fn run_serve(args: &[String]) -> Result<()> {
     rlimit::raise_nofile_limit();
     let default = default_proxy_config_path()?;
@@ -182,8 +262,7 @@ async fn run_serve(args: &[String]) -> Result<()> {
         cache.store_snapshot_or_log(&fetched);
         (fetched, false)
     };
-    let mut managed = initial.managed;
-    let mut catalog_fetched_at = initial.fetched_at;
+    let managed = initial.managed;
     let published = published_proxies(&managed, disable_node_filter, &service.runtime.node_filter)?;
     let routing_secret = derive_routing_secret(&service.runtime.access_token)?;
     let transport = Arc::new(TransportContext::built_in_with_network(network.clone())?);
@@ -257,86 +336,58 @@ async fn run_serve(args: &[String]) -> Result<()> {
         connection_limit,
     ));
     let mut http_task = tokio::spawn(http_server::serve(nodelist_listener, manager.clone()));
+    let control = crate::control::Server::bind(&config_path).await?;
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<crate::control::Request>(8);
+    let mut control_task = tokio::spawn(control.serve(control_tx));
     let mut refresh = tokio::time::interval(service.node_refresh_interval);
     if !from_cache {
         refresh.tick().await;
     }
+    let mut catalog = CatalogService {
+        service,
+        managed,
+        fetched_at: initial.fetched_at,
+        network,
+        cache,
+        context: gateway_context,
+        manager: manager.clone(),
+        disable_filter: disable_node_filter,
+    };
     loop {
-        tokio::select! {
+        let request = tokio::select! {
             result = &mut socks_task => {
                 return result.context("SOCKS5 server task failed")?;
             }
             result = &mut http_task => {
                 return result.context("nodelist HTTP task failed")?;
             }
-            _ = async {
-                tokio::select! {
-                    _ = refresh.tick() => {},
-                    _ = catalog_refresh.notified() => {},
-                }
-            } => {
-                manager.refresh_started();
-                let refreshed = match load_managed_catalog(&service.runtime, true, &network).await {
-                    Ok(value) => value,
-                    Err(error) => {
-                        manager.refresh_finished(Some(&error));
-                        if matches!(crate::diagnostics::classify(&error), crate::diagnostics::ErrorKind::Authentication | crate::diagnostics::ErrorKind::Forbidden) {
-                            manager.update_subscription(None, None).await;
-                            if let Err(error) = cache.store_snapshot(&managed, None, catalog_fetched_at) {
-                                eprintln!("clear cached account metadata: {error:#}");
-                            }
-                        }
-                        eprintln!("node catalog refresh failed: {error:#}");
-                        continue;
-                    }
-                };
-                if refreshed.managed.proxies == managed.proxies {
-                    catalog_fetched_at = refreshed.fetched_at;
-                    manager.refresh_finished(None);
-                    manager.update_subscription(refreshed.userinfo.clone(), refreshed.fetched_at).await;
-                    cache.store_snapshot_or_log(&refreshed);
-                    continue;
-                }
-                let published = match published_proxies(&refreshed.managed, disable_node_filter, &service.runtime.node_filter) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        manager.refresh_finished(Some(&error));
-                        eprintln!("node catalog refresh failed: {error:#}");
-                        continue;
-                    }
-                };
-                let previous = manager.current().await?;
-                let replacement = match Router::build(
-                    &refreshed.managed.proxies,
-                    &published,
-                    &service.runtime,
-                    &gateway_context,
-                    Some(previous.as_ref()),
-                ) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        manager.refresh_finished(Some(&error));
-                        eprintln!("node catalog refresh failed: {error:#}");
-                        continue;
-                    }
-                };
-                if let Err(error) = manager.replace(replacement).await {
-                    manager.refresh_finished(Some(&error));
-                    eprintln!("retire previous node catalog: {error:#}");
-                    continue;
-                }
-                let published_count = published.len();
-                let total_count = refreshed.managed.proxies.len();
-                manager.update_subscription(refreshed.userinfo.clone(), refreshed.fetched_at).await;
-                catalog_fetched_at = refreshed.fetched_at;
-                manager.refresh_finished(None);
-                cache.store_snapshot_or_log(&refreshed);
-                managed = refreshed.managed;
-                println!(
-                    "Refreshed node catalog ({})",
-                    format_node_count(published_count, total_count)
-                );
-            }
+            result = &mut control_task => { return result.context("service control task failed")?; }
+            request = control_rx.recv() => Some(request.context("service control queue closed")?),
+            _ = refresh.tick() => None,
+            _ = catalog_refresh.notified() => None,
+        };
+        if request
+            .as_ref()
+            .is_some_and(|request| request.reply.is_closed())
+        {
+            continue;
+        }
+        let result = catalog.refresh().await;
+        if let Some(request) = request {
+            let response = match &result {
+                Ok(()) => crate::control::Response::success(
+                    "node catalog refreshed",
+                    manager.status().await,
+                ),
+                Err(error) => crate::control::Response::failure(
+                    "refresh failed; previous catalog retained",
+                    crate::diagnostics::classify(error),
+                ),
+            };
+            let _ = request.reply.send(response);
+        }
+        if let Err(error) = result {
+            eprintln!("node catalog refresh failed: {error:#}");
         }
     }
 }
@@ -1159,6 +1210,61 @@ mod tests {
             "Japan IXP 01"
         );
         assert_eq!(published_proxies(&managed, true, &filter).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_manual_refresh_keeps_the_active_router_and_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test.conf");
+        std::fs::write(
+            &path,
+            "token=test\napi-base-url=https://127.0.0.1:9\nrequest-timeout=100ms\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let service = load_proxy_config(&path).unwrap();
+        let managed = ManagedConfig {
+            proxies: vec![node("香港 Fusion 01")],
+        };
+        let network = NetworkMonitor::new(None);
+        let transport = Arc::new(TransportContext::built_in_with_network(network.clone()).unwrap());
+        let context = GatewayContext::new(
+            service.outbound_ip,
+            false,
+            derive_routing_secret("test").unwrap(),
+            Arc::new(Semaphore::new(1)),
+            transport,
+        );
+        let router = Router::build(
+            &managed.proxies,
+            &managed.proxies,
+            &service.runtime,
+            &context,
+            None,
+        )
+        .unwrap();
+        let manager = Arc::new(GatewayManager::new(router));
+        let previous = manager.current().await.unwrap();
+        let cache = CatalogCache::beside_config(&path, "test");
+        cache.store(&managed).unwrap();
+        let mut catalog = CatalogService {
+            service,
+            managed: managed.clone(),
+            fetched_at: Some(1),
+            network,
+            cache,
+            context,
+            manager: manager.clone(),
+            disable_filter: false,
+        };
+        assert!(catalog.refresh().await.is_err());
+        assert!(Arc::ptr_eq(&previous, &manager.current().await.unwrap()));
+        assert_eq!(catalog.cache.load().unwrap(), managed);
+        assert_eq!(manager.status().await["catalog"]["refresh_failures"], 1);
     }
 
     #[test]

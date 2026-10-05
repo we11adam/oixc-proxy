@@ -148,6 +148,15 @@ node-refresh-interval=1h
 
 ## 命令
 
+立即刷新运行实例中的节点目录，无需重启：
+
+```sh
+oixc-proxy refresh-nodes
+oixc-proxy refresh-nodes --config /path/to/oixc-proxy.conf
+```
+
+管理命令通过配置目录内权限为 `0600` 的 Unix socket 操作 `serve` 实例，需以服务用户运行（root 服务使用 `sudo`）。它会等待实际刷新结果；失败时退出码为 1，保留当前目录及连接池。手动、定时及 ECH 触发刷新串行执行。该命令不使用磁盘上的新 token，不改变配置；`serve-map` 暂不提供此管理接口。
+
 Clash provider 成功的 GET/HEAD 响应会附加有效的 `Subscription-Userinfo`，包含 API 实际提供的 `upload`、`download`、`total` 和可选的 `expire`。信息与当前账户的目录一起缓存；缺失、非法、超过 24 小时或时间戳异常时省略 header，不补零。目录没有变化时也会更新账户信息；认证失效或拒绝访问时清除内存中的信息。旧版缓存仍可加载节点，但获取新信息前不输出账户 header。该 header 不改变 provider 正文，Surge provider 不附加它。
 
 四项筛选任意一项设置后，使用自定义筛选替代默认 Fusion/CIA 规则。每项内部用 `|` 表示“任一”，不同项之间同时满足，排除项优先；名称按不区分大小写的字面子串匹配，不执行正则。每项最多 64 个非空条件、4096 字节。当前目录没有独立地区字段，因此地区也按名称匹配。示例：

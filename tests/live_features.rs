@@ -118,6 +118,15 @@ async fn isolated_service_publishes_metadata_status_and_filtered_preview() {
     let preview: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
     assert_eq!(preview["mode"], "custom");
     assert_eq!(preview["kept"], status["published_nodes"]);
+    let refreshed = Command::new(&binary)
+        .args(["refresh-nodes", "--config"])
+        .arg(&config_path)
+        .output()
+        .unwrap();
+    assert!(refreshed.status.success());
+    let refreshed: serde_json::Value = serde_json::from_slice(&refreshed.stdout).unwrap();
+    assert_eq!(refreshed["ok"], true);
+    assert_eq!(refreshed["payload"]["ready"], true);
     let provider = http
         .get(format!("{base}/surge-proxies.conf"))
         .send()

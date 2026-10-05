@@ -223,6 +223,14 @@ removed profiles are rotated atomically.
 
 ## Commands
 
+Run `oixc-proxy refresh-nodes [--config PATH]` to refresh the running `serve`
+instance without restarting. The command uses a private mode-0600 Unix socket
+beside the config; run it as the service user (`sudo` for a root service).
+It waits for the actual result and exits 1 on failure, retaining the active catalog
+and pools. Manual, scheduled and ECH-triggered refreshes run serially. It uses
+the service's active token, not a changed on-disk token. `serve-map` does not
+provide this control interface.
+
 Successful Clash provider GET/HEAD responses include validated `Subscription-Userinfo`
 with actual upload/download/total and optional expiry values. Metadata shares the
 account-bound catalog cache. Missing, malformed, over-24-hour or invalidly timestamped
