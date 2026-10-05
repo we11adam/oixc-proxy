@@ -155,7 +155,11 @@ oixc-proxy refresh-nodes
 oixc-proxy refresh-nodes --config /path/to/oixc-proxy.conf
 ```
 
-管理命令通过配置目录内权限为 `0600` 的 Unix socket 操作 `serve` 实例，需以服务用户运行（root 服务使用 `sudo`）。它会等待实际刷新结果；失败时退出码为 1，保留当前目录及连接池。手动、定时及 ECH 触发刷新串行执行。该命令不使用磁盘上的新 token，不改变配置；`serve-map` 暂不提供此管理接口。
+修改配置后，执行 `oixc-proxy reload-config [--config PATH]` 热重载正在运行的 `serve` 实例。支持 token、API 地址/备用地址、节点过滤、超时、连接/拨号并发、复用参数、刷新间隔及性能日志采样。token 或 API 地址变化时先在线获取并验证目录，不使用旧账户缓存；校验、获取或路由准备失败会保留整套当前配置。过滤变化保留未变节点的连接池和诊断；拨号/复用参数或 token 变化会重建客户端并关闭旧空闲连接，已有隧道继续使用原参数。客户端连接上限包含已有连接，调低上限时等待已有连接退出后再放行新连接。
+
+`listen`、`nodelist-listen`、`outbound-ip`、`udp-port-range`、`udp-advertise-address` 需要重启；热重载发现这些字段变化会拒绝整次修改。命令不修改配置文件，使用与 `refresh-nodes` 相同的私有控制 socket；`serve-map` 不支持热重载。
+
+管理命令通过配置目录内权限为 `0600` 的 Unix socket 操作 `serve` 实例，需以服务用户运行（root 服务使用 `sudo`）。命令等待实际结果，失败时退出码为 1。手动、定时及 ECH 触发刷新与热重载串行执行。`refresh-nodes` 使用当前运行配置中的 token，不读取磁盘上的新 token；刷新失败保留当前目录及连接池。`serve-map` 暂不提供此管理接口。
 
 Clash provider 成功的 GET/HEAD 响应会附加有效的 `Subscription-Userinfo`，包含 API 实际提供的 `upload`、`download`、`total` 和可选的 `expire`。信息与当前账户的目录一起缓存；缺失、非法、超过 24 小时或时间戳异常时省略 header，不补零。目录没有变化时也会更新账户信息；认证失效或拒绝访问时清除内存中的信息。旧版缓存仍可加载节点，但获取新信息前不输出账户 header。该 header 不改变 provider 正文，Surge provider 不附加它。
 

@@ -19,6 +19,7 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(180);
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
     RefreshNodes,
+    ReloadConfig,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

@@ -40,6 +40,18 @@ pub struct RuntimeConfig {
     pub perf_trace_sample_every: usize,
 }
 
+impl RuntimeConfig {
+    pub fn same_client_settings(&self, other: &Self) -> bool {
+        self.access_token == other.access_token
+            && self.request_timeout == other.request_timeout
+            && self.dial_concurrency == other.dial_concurrency
+            && self.per_node_dial_concurrency == other.per_node_dial_concurrency
+            && self.reuse_max_idle == other.reuse_max_idle
+            && self.reuse_max_uses == other.reuse_max_uses
+            && self.reuse_idle_timeout == other.reuse_idle_timeout
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ProxyConfig {
     pub runtime: RuntimeConfig,

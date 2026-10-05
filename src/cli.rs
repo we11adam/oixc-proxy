@@ -31,6 +31,7 @@ const USAGE: &str = "Usage:
   oixc-proxy information [--config PATH] --output PATH
   oixc-proxy preview-nodes [--config PATH] [--refresh] [--disable-node-filter]
   oixc-proxy refresh-nodes [--config PATH]
+  oixc-proxy reload-config [--config PATH]
   oixc-proxy serve [--config PATH] [--disable-node-filter]
   oixc-proxy serve-map [--token-file PATH] [--listen IP] [--base-port PORT] [--disable-node-filter]
   oixc-proxy version
@@ -68,6 +69,7 @@ pub async fn run(args: Vec<String>) -> i32 {
         "information" => run_information(&args[1..]).await,
         "preview-nodes" => run_preview_nodes(&args[1..]).await,
         "refresh-nodes" => run_control(&args[1..], crate::control::Command::RefreshNodes).await,
+        "reload-config" => run_control(&args[1..], crate::control::Command::ReloadConfig).await,
         "serve" => run_serve(&args[1..]).await,
         "serve-map" => run_serve_map(&args[1..]).await,
         "install-launch-agent" => run_install_launch_agent(&args[1..]),
@@ -191,6 +193,61 @@ struct CatalogService {
 }
 
 impl CatalogService {
+    async fn reload(&mut self, path: &Path) -> Result<()> {
+        let next = load_proxy_config(path)
+            .map_err(|_| anyhow::anyhow!("invalid configuration; active configuration retained"))?;
+        if next.listen != self.service.listen
+            || next.nodelist_listen != self.service.nodelist_listen
+            || next.outbound_ip != self.service.outbound_ip
+            || next.udp_port_range != self.service.udp_port_range
+            || next.udp_advertise_address != self.service.udp_advertise_address
+        {
+            bail!("listener, egress and UDP binding changes require a restart");
+        }
+        let account_changed = next.runtime.access_token != self.service.runtime.access_token;
+        let api_changed = next.runtime.api_base_url != self.service.runtime.api_base_url
+            || next.runtime.api_fallback_urls != self.service.runtime.api_fallback_urls
+            || next.runtime.app_secret != self.service.runtime.app_secret;
+        let fetched = if account_changed || api_changed {
+            Some(load_managed_catalog(&next.runtime, true, &self.network).await?)
+        } else {
+            None
+        };
+        let managed = fetched
+            .as_ref()
+            .map(|s| &s.managed)
+            .unwrap_or(&self.managed);
+        let published = published_proxies(managed, self.disable_filter, &next.runtime.node_filter)?;
+        let context = self
+            .context
+            .reconfigured(&self.service.runtime, &next.runtime)?;
+        let previous = self.manager.current().await?;
+        let reusable = self.service.runtime.same_client_settings(&next.runtime);
+        let router = Router::build(
+            &managed.proxies,
+            &published,
+            &next.runtime,
+            &context,
+            if reusable { Some(&previous) } else { None },
+        )?;
+        let cache = CatalogCache::beside_config(path, &next.runtime.access_token);
+        self.manager.replace(router).await?;
+        if let Some(snapshot) = fetched {
+            self.manager
+                .update_subscription(snapshot.userinfo.clone(), snapshot.fetched_at)
+                .await;
+            self.manager.initialize_status(false, snapshot.fetched_at);
+            cache.store_snapshot_or_log(&snapshot);
+            self.fetched_at = snapshot.fetched_at;
+            self.managed = snapshot.managed;
+        }
+        self.cache = cache;
+        self.context = context;
+        self.service = next;
+        crate::perftrace::configure(self.service.runtime.perf_trace_sample_every);
+        Ok(())
+    }
+
     async fn refresh(&mut self) -> Result<()> {
         self.manager.refresh_started();
         let result = self.refresh_inner().await;
@@ -316,7 +373,6 @@ async fn run_serve(args: &[String]) -> Result<()> {
         println!("Started from cached catalog; refreshing in background");
     }
 
-    let connection_limit = Arc::new(Semaphore::new(service.runtime.max_client_connections));
     let udp_relay = match (service.udp_port_range, service.udp_advertise_address) {
         (Some(range), Some(advertise_address)) => {
             UdpRelay::fixed(service.outbound_ip, advertise_address, range)?
@@ -324,17 +380,18 @@ async fn run_serve(args: &[String]) -> Result<()> {
         (None, None) => UdpRelay::ephemeral(service.outbound_ip),
         _ => unreachable!("paired UDP relay configuration was validated"),
     };
-    let mut socks_task = tokio::spawn(serve_socks_listener(
-        socks_listener,
-        socks5::Options {
-            handshake_timeout: service.runtime.request_timeout.max(Duration::from_secs(45)),
-            tcp_idle_timeout: service.runtime.tcp_idle_timeout,
-            udp_idle_timeout: service.runtime.udp_idle_timeout,
-            udp_relay,
-            mode: Mode::Dynamic(manager.clone()),
-        },
-        connection_limit,
-    ));
+    let options = socks5::Options {
+        handshake_timeout: service.runtime.request_timeout.max(Duration::from_secs(45)),
+        tcp_idle_timeout: service.runtime.tcp_idle_timeout,
+        udp_idle_timeout: service.runtime.udp_idle_timeout,
+        udp_relay,
+        mode: Mode::Dynamic(manager.clone()),
+    };
+    let (settings_tx, settings_rx) = tokio::sync::watch::channel(AcceptSettings {
+        options,
+        max_connections: service.runtime.max_client_connections,
+    });
+    let mut socks_task = tokio::spawn(serve_dynamic_listener(socks_listener, settings_rx));
     let mut http_task = tokio::spawn(http_server::serve(nodelist_listener, manager.clone()));
     let control = crate::control::Server::bind(&config_path).await?;
     let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<crate::control::Request>(8);
@@ -372,22 +429,58 @@ async fn run_serve(args: &[String]) -> Result<()> {
         {
             continue;
         }
-        let result = catalog.refresh().await;
+        let reloading = request
+            .as_ref()
+            .is_some_and(|r| matches!(r.command, crate::control::Command::ReloadConfig));
+        let result = if reloading {
+            catalog.reload(&config_path).await
+        } else {
+            catalog.refresh().await
+        };
+        if reloading && result.is_ok() {
+            let mut settings = settings_tx.borrow().clone();
+            settings.options.handshake_timeout = catalog
+                .service
+                .runtime
+                .request_timeout
+                .max(Duration::from_secs(45));
+            settings.options.tcp_idle_timeout = catalog.service.runtime.tcp_idle_timeout;
+            settings.options.udp_idle_timeout = catalog.service.runtime.udp_idle_timeout;
+            settings.max_connections = catalog.service.runtime.max_client_connections;
+            settings_tx.send_replace(settings);
+            refresh = tokio::time::interval(catalog.service.node_refresh_interval);
+            refresh.tick().await;
+        }
         if let Some(request) = request {
             let response = match &result {
                 Ok(()) => crate::control::Response::success(
-                    "node catalog refreshed",
+                    if reloading {
+                        "configuration reloaded"
+                    } else {
+                        "node catalog refreshed"
+                    },
                     manager.status().await,
                 ),
                 Err(error) => crate::control::Response::failure(
-                    "refresh failed; previous catalog retained",
+                    if reloading {
+                        "reload failed; active configuration retained; check config validity and restart-only fields"
+                    } else {
+                        "refresh failed; previous catalog retained"
+                    },
                     crate::diagnostics::classify(error),
                 ),
             };
             let _ = request.reply.send(response);
         }
         if let Err(error) = result {
-            eprintln!("node catalog refresh failed: {error:#}");
+            if reloading {
+                eprintln!(
+                    "configuration reload failed: {:?}",
+                    crate::diagnostics::classify(&error)
+                );
+            } else {
+                eprintln!("node catalog refresh failed: {error:#}");
+            }
         }
     }
 }
@@ -602,6 +695,63 @@ fn plan_map_refresh(mapped: &[Proxy], refreshed: &[Proxy]) -> MapRefresh {
         updates,
         added,
         removed,
+    }
+}
+
+#[derive(Clone)]
+struct AcceptSettings {
+    options: socks5::Options,
+    max_connections: usize,
+}
+
+#[derive(Default)]
+struct ActiveConnections {
+    count: std::sync::atomic::AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+
+struct ActiveConnection(Arc<ActiveConnections>);
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        self.0
+            .count
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.0.changed.notify_one();
+    }
+}
+
+async fn admit_connection(
+    settings: &mut tokio::sync::watch::Receiver<AcceptSettings>,
+    active: &Arc<ActiveConnections>,
+) -> Result<(ActiveConnection, socks5::Options)> {
+    loop {
+        let current = settings.borrow_and_update().clone();
+        if active.count.load(std::sync::atomic::Ordering::Acquire) < current.max_connections {
+            active
+                .count
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            return Ok((ActiveConnection(active.clone()), current.options));
+        }
+        tokio::select! {
+            result = settings.changed() => result.context("listener settings closed")?,
+            _ = active.changed.notified() => {},
+        }
+    }
+}
+
+async fn serve_dynamic_listener(
+    listener: TcpListener,
+    mut settings: tokio::sync::watch::Receiver<AcceptSettings>,
+) -> Result<()> {
+    let active = Arc::new(ActiveConnections::default());
+    loop {
+        let connection = crate::accept::accept(&listener, "local proxy").await?;
+        let (permit, options) = admit_connection(&mut settings, &active).await?;
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _ = crate::perftrace::scope(socks5::serve_connection(connection, options)).await;
+        });
     }
 }
 
@@ -1213,7 +1363,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_manual_refresh_keeps_the_active_router_and_cache() {
+    async fn failed_refresh_and_reload_preserve_state_and_valid_reload_applies() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("test.conf");
         std::fs::write(
@@ -1265,6 +1415,80 @@ mod tests {
         assert!(Arc::ptr_eq(&previous, &manager.current().await.unwrap()));
         assert_eq!(catalog.cache.load().unwrap(), managed);
         assert_eq!(manager.status().await["catalog"]["refresh_failures"], 1);
+        for content in [
+            "token=test\nunknown-key=secret\n",
+            "token=test\nlisten=127.0.0.1:6174\n",
+            "token=new-account\napi-base-url=https://127.0.0.1:9\nrequest-timeout=100ms\n",
+        ] {
+            std::fs::write(&path, content).unwrap();
+            assert!(catalog.reload(&path).await.is_err());
+            assert!(Arc::ptr_eq(&previous, &manager.current().await.unwrap()));
+            assert_eq!(catalog.service.runtime.access_token, "test");
+            assert_eq!(catalog.cache.load().unwrap(), managed);
+        }
+        std::fs::write(&path, "token=test\napi-base-url=https://127.0.0.1:9\nrequest-timeout=200ms\nnode-filter-lines=Fusion\nmax-client-connections=2\ndial-concurrency=3\nper-node-dial-concurrency=2\ntcp-idle-timeout=2m\nnode-refresh-interval=2m\n").unwrap();
+        catalog.reload(&path).await.unwrap();
+        assert!(!Arc::ptr_eq(&previous, &manager.current().await.unwrap()));
+        assert_eq!(
+            catalog.service.runtime.request_timeout,
+            Duration::from_millis(200)
+        );
+        assert_eq!(catalog.service.runtime.max_client_connections, 2);
+        assert_eq!(catalog.service.runtime.dial_concurrency, 3);
+        assert_eq!(catalog.service.runtime.per_node_dial_concurrency, 2);
+        assert_eq!(
+            catalog.service.node_refresh_interval,
+            Duration::from_secs(120)
+        );
+        assert_eq!(manager.status().await["published_nodes"], 1);
+        assert_eq!(catalog.cache.load().unwrap(), managed);
+    }
+
+    #[tokio::test]
+    async fn connection_limit_reload_counts_existing_connections_and_wakes_waiters() {
+        let options = socks5::Options {
+            handshake_timeout: Duration::from_secs(45),
+            tcp_idle_timeout: Duration::from_secs(60),
+            udp_idle_timeout: Duration::from_secs(10),
+            udp_relay: UdpRelay::ephemeral("127.0.0.1".parse().unwrap()),
+            mode: Mode::Dynamic(Arc::new(GatewayManager::empty_for_test())),
+        };
+        let (tx, mut rx) = tokio::sync::watch::channel(AcceptSettings {
+            options,
+            max_connections: 2,
+        });
+        let active = Arc::new(ActiveConnections::default());
+        let first = admit_connection(&mut rx, &active).await.unwrap().0;
+        let second = admit_connection(&mut rx, &active).await.unwrap().0;
+        tx.send_modify(|s| s.max_connections = 1);
+        drop(first);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                admit_connection(&mut rx, &active)
+            )
+            .await
+            .is_err()
+        );
+        drop(second);
+        let third =
+            tokio::time::timeout(Duration::from_secs(1), admit_connection(&mut rx, &active))
+                .await
+                .unwrap()
+                .unwrap()
+                .0;
+        let waiting = tokio::spawn(async move { admit_connection(&mut rx, &active).await });
+        tx.send_modify(|s| {
+            s.max_connections = 2;
+            s.options.tcp_idle_timeout = Duration::from_secs(120);
+        });
+        let (_, updated) = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.tcp_idle_timeout, Duration::from_secs(120));
+        drop(third);
     }
 
     #[test]

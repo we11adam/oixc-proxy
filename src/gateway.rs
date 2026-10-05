@@ -58,6 +58,7 @@ pub struct GatewayManager {
     subscription: RwLock<Option<(crate::subscription::UserInfo, Option<u64>)>>,
 }
 
+#[derive(Clone)]
 pub struct GatewayContext {
     outbound_ip: IpAddr,
     udp_relay_advertised: bool,
@@ -67,6 +68,20 @@ pub struct GatewayContext {
 }
 
 impl GatewayContext {
+    pub fn reconfigured(&self, old: &RuntimeConfig, new: &RuntimeConfig) -> Result<Self> {
+        Ok(Self::new(
+            self.outbound_ip,
+            self.udp_relay_advertised,
+            derive_routing_secret(&new.access_token)?,
+            if old.dial_concurrency == new.dial_concurrency {
+                self.dial_limit.clone()
+            } else {
+                Arc::new(Semaphore::new(new.dial_concurrency))
+            },
+            self.transport.clone(),
+        ))
+    }
+
     pub fn new(
         outbound_ip: IpAddr,
         udp_relay_advertised: bool,

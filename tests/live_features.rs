@@ -48,7 +48,7 @@ async fn isolated_service_publishes_metadata_status_and_filtered_preview() {
                 .join(",")
         ));
     }
-    std::fs::write(&config_path, text).unwrap();
+    std::fs::write(&config_path, &text).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -189,4 +189,35 @@ async fn isolated_service_publishes_metadata_status_and_filtered_preview() {
     for stage in ["dns_ms", "tcp_ms", "tls_ms", "total_ms"] {
         assert!(observed["transport"]["last_timings"][stage].is_u64());
     }
+    let all_nodes = text.replace(
+        "node-filter-lines=Fusion|CIA",
+        "node-filter-exclude=__unused_filter_marker_9cfc__",
+    );
+    std::fs::write(&config_path, &all_nodes).unwrap();
+    let reloaded = Command::new(&binary)
+        .args(["reload-config", "--config"])
+        .arg(&config_path)
+        .output()
+        .unwrap();
+    assert!(reloaded.status.success());
+    let reloaded: serde_json::Value = serde_json::from_slice(&reloaded.stdout).unwrap();
+    assert_eq!(reloaded["payload"]["published_nodes"], after["total_nodes"]);
+    assert_eq!(reloaded["payload"]["nodes"], after["nodes"]);
+    std::fs::write(&config_path, "token=invalid\nunknown-key=private\n").unwrap();
+    let failed = Command::new(&binary)
+        .args(["reload-config", "--config"])
+        .arg(&config_path)
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert!(!String::from_utf8_lossy(&failed.stderr).contains("private"));
+    let retained: serde_json::Value = http
+        .get(format!("{base}/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(retained["nodes"], reloaded["payload"]["nodes"]);
 }

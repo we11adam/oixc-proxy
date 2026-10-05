@@ -224,6 +224,21 @@ removed profiles are rotated atomically.
 ## Commands
 
 Run `oixc-proxy refresh-nodes [--config PATH]` to refresh the running `serve`
+instance manually. Configuration changes can be applied with
+`oixc-proxy reload-config [--config PATH]`. Reload supports the token, API URLs,
+filters, timeouts, connection/dial limits, reuse settings, refresh interval and
+trace sampling. A token or API URL change must fetch and verify a fresh catalog;
+validation or preparation failure retains the complete active configuration.
+Filter-only changes retain unchanged clients and metrics. Token or dial/reuse
+changes rebuild clients and retire old idle connections; established tunnels
+continue with their original options. Lower connection limits count existing
+connections and wait for them to finish before admitting more.
+
+Changes to `listen`, `nodelist-listen`, `outbound-ip`, `udp-port-range` or
+`udp-advertise-address` require a restart and reject the entire reload. Both
+commands use the private control socket and only support `serve`.
+
+Manual refresh updates the running `serve`
 instance without restarting. The command uses a private mode-0600 Unix socket
 beside the config; run it as the service user (`sudo` for a root service).
 It waits for the actual result and exits 1 on failure, retaining the active catalog
