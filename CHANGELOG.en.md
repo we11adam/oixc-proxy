@@ -4,6 +4,31 @@
 
 Notable changes to `oixc-proxy` are recorded in this file. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-10-05
+
+### Added
+
+- `refresh-nodes` manually refreshes the running catalog through a private control socket without restarting. It waits for the actual result, retains the old catalog and pools on failure, and runs serially with scheduled and ECH-triggered refreshes.
+- `reload-config` reloads the token, API URLs, filters, timeouts, concurrency, reuse settings, refresh interval and trace sampling. New state is validated and prepared before switching; failure retains the complete active configuration. Token or API URL changes first fetch and verify a fresh catalog. Established tunnels continue, and lower client connection limits count existing connections.
+- `diagnose --output PATH` exports a sanitized mode-0600 JSON bundle and refuses to overwrite files. It includes the active configuration summary, process information, anonymous node status, the last 128 refresh/reload events and each node's last 16 ECH dial events. Tokens, PSKs, addresses, paths, node names, filter patterns and raw logs are excluded. Export still works with an invalid on-disk config.
+- `/status` reports catalog refresh results, cache age, physical egress, TLS roots and ECH dial statistics. Per-node diagnostics include health, consecutive failures, DNS/TCP/TLS/total timings and p50/p95 over the last 64 successful physical connections. It does not probe nodes or count reused sessions again.
+- `api-fallback-urls` configures up to three trusted HTTPS backup API endpoints. Network errors, timeouts and HTTP 5xx may fall back within one shared request budget; authentication, rate-limit, format and signature errors do not.
+- `node-filter-lines`, `node-filter-regions`, `node-filter-include`, `node-filter-exclude` and `preview-nodes` provide local literal name filtering and read-only previews. Default Fusion/CIA filtering and existing bypasses remain available.
+- Successful Clash provider responses include validated `Subscription-Userinfo` with actual traffic, quota and optional expiry. Metadata shares the account-bound catalog cache and is omitted when missing, invalid or stale; authentication failures clear it.
+
+### Fixed
+
+- The outer ECH ClientHello advertises browser ALPNs `h2` / `http/1.1`; the Snell protocol identifier remains inside the encrypted inner ClientHello.
+- Rejected ECH configurations trigger a catalog refresh. Requests from multiple nodes coalesce with a 30-second cooldown, and refresh failures retain the existing catalog.
+- DNS/TCP connection errors preserve underlying error types so common network failures can be classified correctly.
+
+### Usage notes
+
+- New management commands support only `serve` and use a mode-0600 Unix socket beside the configuration. Run as the service user (`sudo` for a root service).
+- Changes to `listen`, `nodelist-listen`, `outbound-ip`, `udp-port-range` or `udp-advertise-address` require a restart and reject the entire reload.
+- Unchanged nodes retain pools and metrics across refreshes and filter-only changes. Token or dial/reuse changes rebuild clients and retire old idle connections. Older account-bound caches remain readable; account metadata is populated after a successful refresh.
+- Chinese and English command examples, troubleshooting, sanitization boundaries and installation version examples are updated.
+
 ## [0.4.0] - 2026-10-01
 
 ### Added
@@ -99,6 +124,7 @@ First Rust release.
 - DNS and TCP racing: a shared transport context, coalesced signed DNS queries, concurrent A/AAAA lookups and staggered connection attempts.
 - Dial time budgets, sampled performance tracing and connection reuse tuning.
 
+[0.5.0]: https://github.com/we11adam/oixc-proxy/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/we11adam/oixc-proxy/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/we11adam/oixc-proxy/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/we11adam/oixc-proxy/compare/v0.2.1...v0.2.2

@@ -4,6 +4,31 @@
 
 本文件记录 `oixc-proxy` 各版本中值得注意的变更。版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.5.0] - 2026-10-05
+
+### 新功能
+
+- 新增 `refresh-nodes`，通过私有控制 socket 手动刷新正在运行的节点目录，无需重启。命令等待实际结果；失败保留原目录和连接池，与定时及 ECH 触发的刷新串行执行。
+- 新增 `reload-config`，支持热重载 token、API 地址、节点过滤、超时、并发、复用、刷新间隔和性能日志采样。先校验并准备新状态，失败保留完整当前配置；token 或 API 地址变化时先获取并验证新目录。已有隧道继续运行，调低客户端连接上限时计入已有连接。
+- 新增 `diagnose --output PATH`，导出权限为 `0600`、禁止覆盖的脱敏 JSON 诊断包。包含当前生效配置摘要、运行信息、匿名节点状态、最近 128 条刷新/重载事件及每节点最近 16 条 ECH 建连事件；不包含 token、PSK、地址、路径、节点名、过滤条件或原始日志。磁盘配置损坏时仍可导出。
+- 新增 `/status`，显示目录刷新结果、缓存年龄、物理出口、根证书状态和 ECH 建连统计；每节点提供健康状态、连续失败次数、DNS/TCP/TLS/总耗时及最近 64 次成功连接的 p50/p95。统计来自真实物理建连，不主动测速，也不重复统计复用会话。
+- 新增 `api-fallback-urls`，允许最多三个可信的 HTTPS 备用 API 地址。网络错误、超时和 HTTP 5xx 可回退，全部尝试共用一个请求时间预算；认证、限流、格式及签名错误不回退。
+- 新增 `node-filter-lines`、`node-filter-regions`、`node-filter-include`、`node-filter-exclude` 和 `preview-nodes`，支持按名称进行本地字面筛选和只读预览；保留默认 Fusion/CIA 筛选及现有绕过方式。
+- Clash provider 成功响应附加有效的 `Subscription-Userinfo`，提供实际流量、额度及可选到期时间。元数据与账户绑定的节点缓存一起保存，缺失、无效或过期时省略；认证失效时清除。
+
+### 修复
+
+- ECH 外层 ClientHello 使用浏览器常见的 `h2` / `http/1.1` ALPN，Snell 协议标识只放在加密的内层。
+- ECH 配置被服务端拒绝时触发节点目录刷新，多节点请求合并并限制为每 30 秒最多触发一次；刷新失败保留已有目录。
+- DNS/TCP 连接错误保留底层错误类型，使诊断可以正确分类常见网络故障。
+
+### 使用说明
+
+- 新管理命令仅支持 `serve`，通过配置目录内权限为 `0600` 的 Unix socket 通信，需以服务用户运行（root 服务使用 `sudo`）。
+- `listen`、`nodelist-listen`、`outbound-ip`、`udp-port-range` 和 `udp-advertise-address` 的变化需要重启，热重载会拒绝整次修改。
+- 未变节点在刷新和仅调整过滤时保留连接池及统计；token 或拨号/复用参数变化会重建客户端并关闭旧空闲连接。账户绑定的旧版缓存仍可读取，账户元数据在首次成功刷新后补齐。
+- 更新中英文命令示例、故障排查、脱敏范围和安装版本说明。
+
 ## [0.4.0] - 2026-10-01
 
 ### 新功能
@@ -99,6 +124,7 @@
 - DNS 与 TCP 竞速：共享传输上下文、合并签名 DNS 查询、A/AAAA 并发查询、错开的连接尝试。
 - 拨号时间预算、采样的性能 tracing 和连接复用调优。
 
+[0.5.0]: https://github.com/we11adam/oixc-proxy/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/we11adam/oixc-proxy/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/we11adam/oixc-proxy/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/we11adam/oixc-proxy/compare/v0.2.1...v0.2.2

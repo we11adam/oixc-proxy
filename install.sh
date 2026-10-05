@@ -15,7 +15,7 @@ Download a published oixc-proxy binary for the current macOS or Linux host,
 verify it against the release SHA256SUMS file, and atomically install it.
 
 Options:
-  --version VERSION   Install a release tag such as v0.4.0 (default: latest)
+  --version VERSION   Install a release tag such as v0.5.0 (default: latest)
   --install-dir DIR   Install directory (default: /usr/local/bin)
   -h, --help          Show this help
 
