@@ -571,7 +571,8 @@ async fn api_client(runtime: &RuntimeConfig, network: &NetworkMonitor) -> Result
         runtime.app_secret.clone(),
         runtime.request_timeout,
         &snapshot,
-    )
+    )?
+    .with_fallback_urls(runtime.api_fallback_urls.clone())
 }
 
 fn service_network(outbound_ip: IpAddr) -> NetworkMonitor {

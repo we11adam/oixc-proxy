@@ -159,6 +159,8 @@ The file must be a regular file with Unix mode `0600` or stricter.
 | Key | Required | Default | Meaning |
 | --- | --- | --- | --- |
 | `token` | Yes | — | oixCloud access token |
+| `api-base-url` | No | `https://oix-api.dler.io` | Primary control-plane API |
+| `api-fallback-urls` | No | Unset | Comma-separated trusted HTTPS API URLs, at most three |
 | `listen` | No | `127.0.0.1:6172` | Mixed HTTP/SOCKS5 numeric IP and port |
 | `nodelist-listen` | No | `127.0.0.1:6173` | HTTP numeric IP and port |
 | `outbound-ip` | Conditional | SOCKS5 bind IP | Provider/UDP address; a non-loopback value also pins control-plane and node connections to that physical source IP |
@@ -220,6 +222,14 @@ retain their Snell clients and idle connection pools; changed, added and
 removed profiles are rotated atomically.
 
 ## Commands
+
+API fallback applies only to network errors, timeouts and HTTP 5xx. All attempts
+and response reads share `request-timeout`, reserving time for remaining URLs.
+401/403/407/429, malformed responses and signature failures do not trigger retry.
+HTTPS verification, signatures, direct physical egress and no-redirect policy
+remain enabled. No fallback is assumed by default; configure only trusted API
+URLs for the same service, because they receive your token. JSON configuration
+uses `apiBaseURL` and `apiFallbackURLs`.
 
 Use `curl -fsS http://127.0.0.1:6173/status` to diagnose faults without restarting.
 `GET`/`HEAD /status` reports catalog refresh timestamps/errors, cache age, physical

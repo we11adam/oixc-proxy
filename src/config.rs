@@ -20,6 +20,7 @@ pub struct RuntimeConfig {
     pub access_token: String,
     pub app_secret: String,
     pub api_base_url: Url,
+    pub api_fallback_urls: Vec<Url>,
     pub listen_address: IpAddr,
     pub serve_port: u16,
     pub map_base_port: u16,
@@ -68,6 +69,7 @@ struct FileConfig {
     access_token_file: String,
     app_secret: String,
     api_base_url: String,
+    api_fallback_urls: Vec<String>,
     listen_address: String,
     serve_port: u16,
     map_base_port: u16,
@@ -143,6 +145,11 @@ pub fn load_proxy_config(path: &Path) -> Result<ProxyConfig> {
         Path::new(""),
         FileConfig {
             access_token: token,
+            api_base_url: config_string(&values, "api-base-url"),
+            api_fallback_urls: values
+                .get("api-fallback-urls")
+                .map(|v| v.split(',').map(|v| v.trim().to_owned()).collect())
+                .unwrap_or_default(),
             listen_address: "127.0.0.1".to_owned(),
             serve_port: listen.port(),
             request_timeout: config_string(&values, "request-timeout"),
@@ -231,14 +238,18 @@ fn runtime_from_raw(config_dir: &Path, raw: FileConfig) -> Result<RuntimeConfig>
         &raw.api_base_url
     })
     .context("parse apiBaseURL")?;
-    if api_base_url.scheme() != "https"
-        || api_base_url.host_str().is_none()
-        || !api_base_url.username().is_empty()
-        || api_base_url.password().is_some()
-        || api_base_url.query().is_some()
-        || api_base_url.fragment().is_some()
-    {
-        bail!("apiBaseURL must be an absolute HTTPS URL without credentials, query, or fragment");
+    validate_api_url(&api_base_url)?;
+    if raw.api_fallback_urls.len() > 3 {
+        bail!("configure at most three API fallback URLs");
+    }
+    let mut api_fallback_urls = Vec::new();
+    for value in &raw.api_fallback_urls {
+        let url = Url::parse(value).context("parse API fallback URL")?;
+        validate_api_url(&url)?;
+        if url == api_base_url || api_fallback_urls.contains(&url) {
+            bail!("API URLs must be distinct");
+        }
+        api_fallback_urls.push(url);
     }
 
     let request_timeout = parse_bounded_duration(
@@ -295,6 +306,7 @@ fn runtime_from_raw(config_dir: &Path, raw: FileConfig) -> Result<RuntimeConfig>
         access_token,
         app_secret,
         api_base_url,
+        api_fallback_urls,
         listen_address,
         serve_port: nonzero_or(raw.serve_port, 6172),
         map_base_port: nonzero_or(raw.map_base_port, 7200),
@@ -335,6 +347,8 @@ fn parse_proxy_config(content: &[u8]) -> Result<HashMap<String, String>> {
     let text = std::str::from_utf8(content).context("read proxy config")?;
     let allowed = [
         "token",
+        "api-base-url",
+        "api-fallback-urls",
         "listen",
         "socks5-listen",
         "nodelist-listen",
@@ -380,6 +394,19 @@ fn parse_proxy_config(content: &[u8]) -> Result<HashMap<String, String>> {
 
 fn config_string(values: &HashMap<String, String>, name: &str) -> String {
     values.get(name).cloned().unwrap_or_default()
+}
+
+pub(crate) fn validate_api_url(url: &Url) -> Result<()> {
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("API URL must be an absolute HTTPS URL without credentials, query, or fragment");
+    }
+    Ok(())
 }
 
 fn config_usize(
@@ -640,6 +667,39 @@ pub(crate) fn require_private_file(path: &Path, allow_insecure: bool) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_fallbacks_require_distinct_trusted_https_urls() {
+        let runtime = |urls: Vec<&str>| {
+            runtime_from_raw(
+                Path::new(""),
+                FileConfig {
+                    access_token: "token".to_owned(),
+                    api_fallback_urls: urls.into_iter().map(str::to_owned).collect(),
+                    ..FileConfig::default()
+                },
+            )
+        };
+        assert!(runtime(vec![]).unwrap().api_fallback_urls.is_empty());
+        assert_eq!(
+            runtime(vec!["https://backup.example"])
+                .unwrap()
+                .api_fallback_urls
+                .len(),
+            1
+        );
+        for url in [
+            "http://backup.example",
+            "https://user:pass@backup.example",
+            "https://backup.example?token=secret",
+            "https://backup.example#fragment",
+            DEFAULT_API_BASE_URL,
+        ] {
+            assert!(runtime(vec![url]).is_err());
+        }
+        assert!(runtime(vec!["https://backup.example", "https://backup.example"]).is_err());
+        assert!(parse_proxy_config(b"token=test\napi-base-url=https://primary.example\napi-fallback-urls=https://backup.example\n").is_ok());
+    }
 
     #[test]
     fn listen_accepts_legacy_socks5_listen_alias() {

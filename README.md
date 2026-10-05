@@ -105,6 +105,8 @@ OIXC = select, policy-path=http://127.0.0.1:6173/surge-proxies.conf, update-inte
 | 配置项 | 必填 | 默认值 | 含义 |
 | --- | --- | --- | --- |
 | `token` | 是 | — | oixCloud 访问 token |
+| `api-base-url` | 否 | `https://oix-api.dler.io` | 控制面主 API 地址 |
+| `api-fallback-urls` | 否 | 未设置 | 逗号分隔的可信备用 HTTPS API 地址，最多三个 |
 | `listen` | 否 | `127.0.0.1:6172` | 混合 HTTP/SOCKS5 数字 IP 与端口 |
 | `nodelist-listen` | 否 | `127.0.0.1:6173` | HTTP 数字 IP 与端口 |
 | `outbound-ip` | 条件必填 | SOCKS5 绑定 IP | 写入 provider、用于 UDP 绑定，并在非回环时固定控制面与节点连接的物理出口源 IP |
@@ -141,6 +143,8 @@ node-refresh-interval=1h
 启动时，如果配置文件旁存在 `nodes-cache.yaml`，程序会先加载它，使 SOCKS5 和节点列表监听器可以在控制面获取完成前开始监听。缓存权限为 `0600`，保存最近一次验证通过的目录，并通过不可逆账户指纹与当前 token 绑定；token 变化时旧缓存会被拒绝。后续刷新失败时继续使用当前账户的原目录；如果首次启动没有可用缓存，则仍要求首次获取成功。配置未变化的节点会保留其 Snell 客户端和空闲连接池；发生变化、新增或删除的节点配置会原子轮换。
 
 ## 命令
+
+API 回退只对网络错误、超时和 HTTP 5xx 生效。整个请求（包括响应读取）共用 `request-timeout` 预算，依次尝试时给剩余地址预留时间；401/403/407/429、格式或签名错误直接返回。所有地址继续使用 HTTPS 验证、签名校验和直连物理出口，不跟随重定向。备用地址默认为空，必须由你配置可信的同服务 API，配置后该地址会收到访问 token；JSON 配置对应 `apiBaseURL` 和 `apiFallbackURLs`。
 
 排查连接异常时先查看状态，无需重启服务：
 

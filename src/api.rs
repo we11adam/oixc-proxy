@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::io::Read;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -25,6 +26,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub struct Client {
     base_url: Url,
+    fallback_urls: Vec<Url>,
     access_token: String,
     app_secret: String,
     http: HttpClient,
@@ -58,9 +60,7 @@ impl Client {
         timeout: Duration,
         network: Option<&NetworkSnapshot>,
     ) -> Result<Self> {
-        if base_url.scheme() != "https" || base_url.host_str().is_none() {
-            bail!("base URL must be an absolute HTTPS URL");
-        }
+        crate::config::validate_api_url(&base_url)?;
         let access_token = access_token.into().trim().to_owned();
         let app_secret = app_secret.into().trim().to_owned();
         if access_token.is_empty() {
@@ -92,6 +92,7 @@ impl Client {
         let http = builder.build().context("create API HTTP client")?;
         Ok(Self {
             base_url,
+            fallback_urls: Vec::new(),
             access_token,
             app_secret,
             http,
@@ -99,14 +100,71 @@ impl Client {
         })
     }
 
+    pub fn with_fallback_urls(mut self, urls: Vec<Url>) -> Result<Self> {
+        if urls.len() > 3 {
+            bail!("configure at most three API fallback URLs");
+        }
+        for (index, url) in urls.iter().enumerate() {
+            crate::config::validate_api_url(url)?;
+            if url == &self.base_url || urls[..index].contains(url) {
+                bail!("API URLs must be distinct");
+            }
+        }
+        self.fallback_urls = urls;
+        Ok(self)
+    }
+
+    async fn with_fallback<T, F, Fut>(&self, path: &str, mut operation: F) -> Result<T>
+    where
+        F: FnMut(Url, Duration) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let urls = std::iter::once(&self.base_url)
+            .chain(self.fallback_urls.iter())
+            .collect::<Vec<_>>();
+        for (index, base) in urls.iter().enumerate() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(api_failure(ErrorKind::Timeout, None));
+            }
+            let budget = remaining / u32::try_from(urls.len() - index).unwrap();
+            let mut endpoint = (*base).clone();
+            endpoint.set_path(path);
+            endpoint.set_query(None);
+            endpoint.set_fragment(None);
+            let result = tokio::time::timeout(budget, operation(endpoint, budget))
+                .await
+                .unwrap_or_else(|_| Err(api_failure(ErrorKind::Timeout, None)));
+            match result {
+                Ok(value) => return Ok(value),
+                Err(error) if index + 1 < urls.len() && retryable(&error) => {
+                    eprintln!(
+                        "api.fallback attempt={} reason={:?}",
+                        index + 1,
+                        crate::diagnostics::classify(&error)
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("primary API URL always exists")
+    }
+
     pub async fn information(&self) -> Result<Vec<u8>> {
-        let endpoint = self.endpoint(INFORMATION_PATH)?;
+        self.with_fallback(INFORMATION_PATH, |endpoint, budget| {
+            self.information_at(endpoint, budget)
+        })
+        .await
+    }
+
+    async fn information_at(&self, endpoint: Url, budget: Duration) -> Result<Vec<u8>> {
         let response = self
             .http
             .request(Method::POST, endpoint)
             .header("Accept", "application/json")
             .bearer_auth(&self.access_token)
-            .timeout(self.timeout)
+            .timeout(budget)
             .send()
             .await
             .context("perform information request")?;
@@ -126,18 +184,20 @@ impl Client {
             .context("system clock is before Unix epoch")?
             .as_secs()
             .to_string();
-        self.get_managed_config(MANAGED_NODES_PATH, &timestamp, &recipient, &identity)
-            .await
+        self.with_fallback(MANAGED_NODES_PATH, |endpoint, budget| {
+            self.get_managed_config(endpoint, budget, &timestamp, &recipient, &identity)
+        })
+        .await
     }
 
     async fn get_managed_config(
         &self,
-        path: &str,
+        endpoint: Url,
+        budget: Duration,
         timestamp: &str,
         recipient: &str,
         identity: &age::x25519::Identity,
     ) -> Result<Vec<u8>> {
-        let endpoint = self.endpoint(path)?;
         let signature = request_signature(&self.app_secret, timestamp, recipient);
         let response = self
             .http
@@ -147,7 +207,7 @@ impl Client {
             .header(HEADER_TIMESTAMP, timestamp)
             .header(HEADER_AGE_PUBKEY, recipient)
             .header(HEADER_SIGNATURE, signature)
-            .timeout(self.timeout)
+            .timeout(budget)
             .send()
             .await
             .context("perform request")?;
@@ -196,14 +256,13 @@ impl Client {
         }
         decrypt_age(&armored, identity)
     }
+}
 
-    fn endpoint(&self, path: &str) -> Result<Url> {
-        let mut endpoint = self.base_url.clone();
-        endpoint.set_path(path);
-        endpoint.set_query(None);
-        endpoint.set_fragment(None);
-        Ok(endpoint)
-    }
+fn retryable(error: &anyhow::Error) -> bool {
+    matches!(
+        crate::diagnostics::classify(error),
+        ErrorKind::Timeout | ErrorKind::Network | ErrorKind::Server
+    )
 }
 
 #[derive(Deserialize)]
@@ -335,6 +394,87 @@ fn describe_json_fields(body: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fallback_client() -> Client {
+        Client::new(
+            Url::parse("https://primary.example").unwrap(),
+            "token",
+            "secret",
+            Duration::from_secs(12),
+        )
+        .unwrap()
+        .with_fallback_urls(vec![Url::parse("https://backup.example").unwrap()])
+        .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_primary_leaves_backup_budget_and_body_shares_deadline() {
+        let client = fallback_client();
+        let started = tokio::time::Instant::now();
+        let value = client
+            .with_fallback(INFORMATION_PATH, |url, budget| async move {
+                assert_eq!(url.path(), INFORMATION_PATH);
+                if url.host_str() == Some("primary.example") {
+                    assert_eq!(budget, Duration::from_secs(6));
+                    std::future::pending::<Result<&str>>().await
+                } else {
+                    assert_eq!(budget, Duration::from_secs(6));
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    Ok("backup")
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(value, "backup");
+        assert_eq!(started.elapsed(), Duration::from_secs(7));
+        let started = tokio::time::Instant::now();
+        assert!(
+            client
+                .with_fallback(INFORMATION_PATH, |_, _| std::future::pending::<Result<()>>(
+                ))
+                .await
+                .is_err()
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(12));
+    }
+
+    #[tokio::test]
+    async fn auth_rate_limit_invalid_and_signature_errors_do_not_fallback() {
+        let client = fallback_client();
+        for kind in [
+            ErrorKind::Authentication,
+            ErrorKind::Forbidden,
+            ErrorKind::ProxyAuthentication,
+            ErrorKind::RateLimited,
+            ErrorKind::Signature,
+            ErrorKind::InvalidResponse,
+            ErrorKind::TlsCertificate,
+        ] {
+            let mut attempts = 0;
+            let error = client
+                .with_fallback(MANAGED_NODES_PATH, |_, _| {
+                    attempts += 1;
+                    std::future::ready(Err::<(), _>(api_failure(kind, None)))
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(attempts, 1);
+            assert_eq!(crate::diagnostics::classify(&error), kind);
+        }
+        let mut attempts = 0;
+        let result = client
+            .with_fallback(MANAGED_NODES_PATH, |_, _| {
+                attempts += 1;
+                std::future::ready(if attempts == 1 {
+                    Err(api_failure(ErrorKind::Server, Some(503)))
+                } else {
+                    Ok(())
+                })
+            })
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(attempts, 2);
+    }
 
     #[test]
     fn rate_limit_reports_wait_and_auth_is_distinct() {
