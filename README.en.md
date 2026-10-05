@@ -223,6 +223,22 @@ removed profiles are rotated atomically.
 
 ## Commands
 
+Configure any of `node-filter-lines`, `node-filter-regions`, `node-filter-include`
+or `node-filter-exclude` to replace the default Fusion/CIA selection. Alternatives
+within each field use `|` (OR); fields combine with AND and exclusions take priority.
+Line filters match independent ASCII markers such as `Fusion|CIA|IXP`. Region and
+name filters match case-insensitive literal substrings, because the catalog lacks
+structured region metadata. No regex is evaluated. Each field allows at most 64
+nonempty alternatives and 4096 bytes. JSON uses `nodeFilterLines`, `nodeFilterRegions`,
+`nodeFilterInclude` and `nodeFilterExclude`; `serve-map` accepts corresponding flags.
+
+Run `oixc-proxy preview-nodes` to inspect selected names/counts from the current
+account cache (fetching if unavailable), or append `--refresh` to fetch explicitly.
+Preview does not write caches, change the service or update panel settings, and
+can show zero matches. The service rejects an empty selection. Remove all four
+settings to restore defaults. `--disable-node-filter` / provider `?all=1` bypass
+local selection but cannot restore nodes omitted by the API.
+
 API fallback applies only to network errors, timeouts and HTTP 5xx. All attempts
 and response reads share `request-timeout`, reserving time for remaining URLs.
 401/403/407/429, malformed responses and signature failures do not trigger retry.

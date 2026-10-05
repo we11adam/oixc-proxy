@@ -29,6 +29,7 @@ const SERVE_MAP_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
 
 const USAGE: &str = "Usage:
   oixc-proxy information [--config PATH] --output PATH
+  oixc-proxy preview-nodes [--config PATH] [--refresh] [--disable-node-filter]
   oixc-proxy serve [--config PATH] [--disable-node-filter]
   oixc-proxy serve-map [--token-file PATH] [--listen IP] [--base-port PORT] [--disable-node-filter]
   oixc-proxy version
@@ -46,6 +47,11 @@ GET /surge-proxies.conf?all=1 and /clash-proxies.yaml?all=1 publish the
 full catalog without changing the default filtered listing. Provider
 entries are HTTP proxies by default; append socks=1 to advertise SOCKS5
 instead. The local listener accepts both HTTP and SOCKS5.
+
+preview-nodes prints the effective selection without modifying the service,
+cache or panel settings. Use --refresh to fetch instead of reading the cache.
+serve-map also accepts --node-filter-lines, --node-filter-regions,
+--node-filter-include and --node-filter-exclude (alternatives separated by |).
 ";
 
 #[derive(Debug, thiserror::Error)]
@@ -59,6 +65,7 @@ pub async fn run(args: Vec<String>) -> i32 {
     }
     let result = match args[0].as_str() {
         "information" => run_information(&args[1..]).await,
+        "preview-nodes" => run_preview_nodes(&args[1..]).await,
         "serve" => run_serve(&args[1..]).await,
         "serve-map" => run_serve_map(&args[1..]).await,
         "install-launch-agent" => run_install_launch_agent(&args[1..]),
@@ -121,6 +128,43 @@ async fn run_information(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+async fn run_preview_nodes(args: &[String]) -> Result<()> {
+    let default = default_proxy_config_path()?;
+    let flags = parse_flags(
+        args,
+        &[
+            ("config", true),
+            ("refresh", false),
+            ("disable-node-filter", false),
+        ],
+    )?;
+    let config_path = flag_path(&flags, "config", &default);
+    let service = load_proxy_config(&config_path)?;
+    let cache = CatalogCache::beside_config(&config_path, &service.runtime.access_token);
+    let cached = if flags.contains_key("refresh") {
+        None
+    } else {
+        cache.load()
+    };
+    let managed = match cached {
+        Some(cached) => cached,
+        None => {
+            load_managed_nodes(
+                &service.runtime,
+                true,
+                &service_network(service.outbound_ip),
+            )
+            .await?
+        }
+    };
+    let preview = service
+        .runtime
+        .node_filter
+        .preview(&managed.proxies, flags.contains_key("disable-node-filter"));
+    println!("{}", serde_json::to_string_pretty(&preview)?);
+    Ok(())
+}
+
 async fn run_serve(args: &[String]) -> Result<()> {
     rlimit::raise_nofile_limit();
     let default = default_proxy_config_path()?;
@@ -138,7 +182,7 @@ async fn run_serve(args: &[String]) -> Result<()> {
         cache.store_or_log(&fetched);
         (fetched, false)
     };
-    let published = published_proxies(&managed, disable_node_filter)?;
+    let published = published_proxies(&managed, disable_node_filter, &service.runtime.node_filter)?;
     let routing_secret = derive_routing_secret(&service.runtime.access_token)?;
     let transport = Arc::new(TransportContext::built_in_with_network(network.clone())?);
     let catalog_refresh = transport.catalog_refresh.clone();
@@ -240,7 +284,7 @@ async fn run_serve(args: &[String]) -> Result<()> {
                     cache.store_or_log(&refreshed);
                     continue;
                 }
-                let published = match published_proxies(&refreshed, disable_node_filter) {
+                let published = match published_proxies(&refreshed, disable_node_filter, &service.runtime.node_filter) {
                     Ok(value) => value,
                     Err(error) => {
                         manager.refresh_finished(Some(&error));
@@ -291,6 +335,10 @@ async fn run_serve_map(args: &[String]) -> Result<()> {
             ("listen", true),
             ("base-port", true),
             ("disable-node-filter", false),
+            ("node-filter-lines", true),
+            ("node-filter-regions", true),
+            ("node-filter-include", true),
+            ("node-filter-exclude", true),
         ],
     )?;
     let disable_node_filter = flags.contains_key("disable-node-filter");
@@ -303,6 +351,24 @@ async fn run_serve_map(args: &[String]) -> Result<()> {
         return Err(UsageError("--token-file cannot be empty".to_owned()).into());
     }
     let mut runtime = load_token_file(&token_file)?;
+    runtime.node_filter = crate::nodes::NodeFilter::new(
+        flags
+            .get("node-filter-lines")
+            .and_then(Option::as_deref)
+            .unwrap_or(""),
+        flags
+            .get("node-filter-regions")
+            .and_then(Option::as_deref)
+            .unwrap_or(""),
+        flags
+            .get("node-filter-include")
+            .and_then(Option::as_deref)
+            .unwrap_or(""),
+        flags
+            .get("node-filter-exclude")
+            .and_then(Option::as_deref)
+            .unwrap_or(""),
+    )?;
     crate::perftrace::configure(runtime.perf_trace_sample_every);
     let listen: IpAddr = flags
         .get("listen")
@@ -523,15 +589,15 @@ fn build_fixed_route(
     })
 }
 
-fn published_proxies(managed: &ManagedConfig, include_all: bool) -> Result<Vec<Proxy>> {
+fn published_proxies(
+    managed: &ManagedConfig,
+    include_all: bool,
+    filter: &crate::nodes::NodeFilter,
+) -> Result<Vec<Proxy>> {
     if include_all {
         return Ok(managed.proxies.clone());
     }
-    let proxies = managed.allowed_proxies();
-    if proxies.is_empty() {
-        bail!("managed config contains no allowed Fusion/CIA proxies");
-    }
-    Ok(proxies)
+    managed.filtered_proxies(filter)
 }
 
 fn format_node_count(published: usize, total: usize) -> String {
@@ -559,7 +625,9 @@ async fn load_managed_nodes(
     if disable_filter {
         Ok(managed)
     } else {
-        managed.filter_allowed_nodes()
+        Ok(ManagedConfig {
+            proxies: managed.filtered_proxies(&runtime.node_filter)?,
+        })
     }
 }
 
@@ -1048,6 +1116,19 @@ mod tests {
     fn format_node_count_mentions_total_when_filtered() {
         assert_eq!(format_node_count(12, 12), "12 named nodes");
         assert_eq!(format_node_count(12, 40), "12 named nodes (40 total)");
+    }
+
+    #[test]
+    fn publishing_uses_custom_filter_and_all_bypasses_it() {
+        let managed = ManagedConfig {
+            proxies: vec![node("香港 Fusion 01"), node("Japan IXP 01")],
+        };
+        let filter = crate::nodes::NodeFilter::new("IXP", "Japan", "", "").unwrap();
+        assert_eq!(
+            published_proxies(&managed, false, &filter).unwrap()[0].name,
+            "Japan IXP 01"
+        );
+        assert_eq!(published_proxies(&managed, true, &filter).unwrap().len(), 2);
     }
 
     #[test]

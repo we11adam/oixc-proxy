@@ -5,6 +5,107 @@ use serde::{Deserialize, Serialize};
 
 const MAX_MANAGED_CONFIG_BYTES: usize = 8 << 20;
 
+#[derive(Clone, Debug, Default)]
+pub struct NodeFilter {
+    lines: Vec<String>,
+    regions: Vec<String>,
+    include: Vec<String>,
+    exclude: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct FilterPreview {
+    pub mode: &'static str,
+    pub total: usize,
+    pub kept: usize,
+    pub excluded: usize,
+    pub nodes: Vec<String>,
+}
+
+impl NodeFilter {
+    pub fn new(lines: &str, regions: &str, include: &str, exclude: &str) -> Result<Self> {
+        fn alternatives(value: &str) -> Result<Vec<String>> {
+            if value.is_empty() {
+                return Ok(Vec::new());
+            }
+            if value.len() > 4096 || value.chars().any(char::is_control) {
+                bail!("node filter is too long or contains control characters");
+            }
+            let parts = value
+                .split('|')
+                .map(|p| p.trim().to_lowercase())
+                .collect::<Vec<_>>();
+            if parts.len() > 64 || parts.iter().any(String::is_empty) {
+                bail!("node filter requires at most 64 nonempty alternatives separated by |");
+            }
+            Ok(parts)
+        }
+        let lines = alternatives(lines)?;
+        if lines
+            .iter()
+            .any(|line| !line.chars().all(|c| c.is_ascii_alphanumeric()))
+        {
+            bail!(
+                "node filter lines must be ASCII alphanumeric markers, such as Fusion, CIA or IXP"
+            );
+        }
+        Ok(Self {
+            lines,
+            regions: alternatives(regions)?,
+            include: alternatives(include)?,
+            exclude: alternatives(exclude)?,
+        })
+    }
+
+    pub fn is_custom(&self) -> bool {
+        !self.lines.is_empty()
+            || !self.regions.is_empty()
+            || !self.include.is_empty()
+            || !self.exclude.is_empty()
+    }
+
+    pub fn matches(&self, name: &str) -> bool {
+        if !self.is_custom() {
+            return is_allowed_node_name(name);
+        }
+        let lower = name.to_lowercase();
+        let contains_any = |patterns: &[String]| patterns.iter().any(|p| lower.contains(p));
+        let line_matches = self.lines.is_empty()
+            || name
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|token| {
+                    self.lines
+                        .iter()
+                        .any(|line| token.eq_ignore_ascii_case(line))
+                });
+        line_matches
+            && (self.regions.is_empty() || contains_any(&self.regions))
+            && (self.include.is_empty() || contains_any(&self.include))
+            && !contains_any(&self.exclude)
+    }
+
+    pub fn preview(&self, proxies: &[Proxy], all: bool) -> FilterPreview {
+        let nodes = proxies
+            .iter()
+            .filter(|p| all || self.matches(&p.name))
+            .map(|p| p.name.clone())
+            .collect::<Vec<_>>();
+        FilterPreview {
+            mode: if all {
+                "all"
+            } else if self.is_custom() {
+                "custom"
+            } else {
+                "default"
+            },
+            total: proxies.len(),
+            kept: nodes.len(),
+            excluded: proxies.len() - nodes.len(),
+            nodes,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedConfig {
@@ -97,6 +198,19 @@ impl ManagedConfig {
             .filter(|proxy| is_allowed_node_name(&proxy.name))
             .cloned()
             .collect()
+    }
+
+    pub fn filtered_proxies(&self, filter: &NodeFilter) -> Result<Vec<Proxy>> {
+        let proxies = self
+            .proxies
+            .iter()
+            .filter(|p| filter.matches(&p.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        if proxies.is_empty() {
+            bail!("node filter kept no nodes; use preview-nodes to inspect the selection");
+        }
+        Ok(proxies)
     }
 
     pub fn filter_allowed_nodes(self) -> Result<Self> {
@@ -209,6 +323,52 @@ proxies:
       skip-cert-verify: false
       preconnect: 0
 "#;
+
+    #[test]
+    fn custom_filters_combine_groups_and_preview_empty_results() {
+        let mut managed = ManagedConfig::parse(YAML.as_bytes()).unwrap();
+        let template = managed.proxies[0].clone();
+        managed.proxies = [
+            "香港 Fusion 01",
+            "香港 Fusion 维护",
+            "日本 CIA 01",
+            "Japan IXP 01",
+            "香港 Special 01",
+        ]
+        .into_iter()
+        .map(|name| {
+            let mut proxy = template.clone();
+            proxy.name = name.to_owned();
+            proxy
+        })
+        .collect();
+        let filter = NodeFilter::new("Fusion|CIA", "香港|日本", "01", "维护").unwrap();
+        let preview = filter.preview(&managed.proxies, false);
+        assert_eq!(preview.mode, "custom");
+        assert_eq!(preview.kept, 2);
+        assert_eq!(preview.nodes, ["香港 Fusion 01", "日本 CIA 01"]);
+        assert_eq!(filter.preview(&managed.proxies, true).kept, 5);
+        assert!(
+            !NodeFilter::new("CIA", "", "", "")
+                .unwrap()
+                .matches("香港 Special 01")
+        );
+        assert!(
+            NodeFilter::new("IXP", "Japan", "", "")
+                .unwrap()
+                .matches("Japan IxP 01")
+        );
+        let empty = NodeFilter::new("", "不存在", "", "").unwrap();
+        assert_eq!(empty.preview(&managed.proxies, false).kept, 0);
+        assert!(managed.filtered_proxies(&empty).is_err());
+        assert_eq!(
+            NodeFilter::default().preview(&managed.proxies, false).kept,
+            3
+        );
+        for invalid in ["香港|", "|日本", "香港||日本", "香港\n日本"] {
+            assert!(NodeFilter::new("", invalid, "", "").is_err());
+        }
+    }
 
     #[test]
     fn filters_allowed_node_names_in_original_order() {

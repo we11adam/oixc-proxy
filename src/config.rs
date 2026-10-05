@@ -21,6 +21,7 @@ pub struct RuntimeConfig {
     pub app_secret: String,
     pub api_base_url: Url,
     pub api_fallback_urls: Vec<Url>,
+    pub node_filter: crate::nodes::NodeFilter,
     pub listen_address: IpAddr,
     pub serve_port: u16,
     pub map_base_port: u16,
@@ -68,8 +69,14 @@ struct FileConfig {
     access_token: String,
     access_token_file: String,
     app_secret: String,
+    #[serde(rename = "apiBaseURL", alias = "apiBaseUrl")]
     api_base_url: String,
+    #[serde(rename = "apiFallbackURLs", alias = "apiFallbackUrls")]
     api_fallback_urls: Vec<String>,
+    node_filter_lines: String,
+    node_filter_regions: String,
+    node_filter_include: String,
+    node_filter_exclude: String,
     listen_address: String,
     serve_port: u16,
     map_base_port: u16,
@@ -146,6 +153,10 @@ pub fn load_proxy_config(path: &Path) -> Result<ProxyConfig> {
         FileConfig {
             access_token: token,
             api_base_url: config_string(&values, "api-base-url"),
+            node_filter_lines: config_string(&values, "node-filter-lines"),
+            node_filter_regions: config_string(&values, "node-filter-regions"),
+            node_filter_include: config_string(&values, "node-filter-include"),
+            node_filter_exclude: config_string(&values, "node-filter-exclude"),
             api_fallback_urls: values
                 .get("api-fallback-urls")
                 .map(|v| v.split(',').map(|v| v.trim().to_owned()).collect())
@@ -307,6 +318,12 @@ fn runtime_from_raw(config_dir: &Path, raw: FileConfig) -> Result<RuntimeConfig>
         app_secret,
         api_base_url,
         api_fallback_urls,
+        node_filter: crate::nodes::NodeFilter::new(
+            &raw.node_filter_lines,
+            &raw.node_filter_regions,
+            &raw.node_filter_include,
+            &raw.node_filter_exclude,
+        )?,
         listen_address,
         serve_port: nonzero_or(raw.serve_port, 6172),
         map_base_port: nonzero_or(raw.map_base_port, 7200),
@@ -349,6 +366,10 @@ fn parse_proxy_config(content: &[u8]) -> Result<HashMap<String, String>> {
         "token",
         "api-base-url",
         "api-fallback-urls",
+        "node-filter-lines",
+        "node-filter-regions",
+        "node-filter-include",
+        "node-filter-exclude",
         "listen",
         "socks5-listen",
         "nodelist-listen",

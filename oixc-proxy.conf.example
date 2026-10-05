@@ -4,6 +4,12 @@ listen=127.0.0.1:6172
 nodelist-listen=127.0.0.1:6173
 node-refresh-interval=1h
 
+# Custom selection replaces the default Fusion/CIA filter. Alternatives use |.
+# Preview without changing the service: oixc-proxy preview-nodes
+# node-filter-lines=Fusion|CIA
+# node-filter-regions=香港|日本
+# node-filter-exclude=维护|测试
+
 # Optional performance tuning. Detailed tracing is disabled by default;
 # 1000 records roughly one request in every 1000.
 # request-timeout=15s

@@ -113,6 +113,10 @@ OIXC = select, policy-path=http://127.0.0.1:6173/surge-proxies.conf, update-inte
 | `udp-port-range` | 条件必填 | 未设置（系统动态分配） | SOCKS5 UDP relay 固定端口范围，格式 `START-END`，最多 4096 个端口 |
 | `udp-advertise-address` | 条件必填 | 未设置（沿用绑定 IP） | 在 SOCKS5 UDP ASSOCIATE 响应中返回的客户端可达地址 |
 | `node-refresh-interval` | 否 | `1h` | 节点目录刷新周期，范围 `1m` 至 `24h` |
+| `node-filter-lines` | 否 | 未设置 | 线路标记，如 `Fusion|CIA|IXP`，匹配独立 ASCII 标记 |
+| `node-filter-regions` | 否 | 未设置 | 地区名称包含项，如 `香港|日本|Hong Kong` |
+| `node-filter-include` | 否 | 未设置 | 节点名称包含项，如 `01|02` |
+| `node-filter-exclude` | 否 | 未设置 | 节点名称排除项，如 `维护|测试` |
 | `request-timeout` | 否 | `15s` | 控制面和节点操作超时，最大 `2m` |
 | `tcp-idle-timeout` | 否 | `1h` | TCP 隧道两个方向都没有数据时的关闭时间，范围 `1m` 至 `24h` |
 | `udp-idle-timeout` | 否 | `5m` | 单个 SOCKS5 UDP 会话的空闲存活时间 |
@@ -144,6 +148,23 @@ node-refresh-interval=1h
 
 ## 命令
 
+四项筛选任意一项设置后，使用自定义筛选替代默认 Fusion/CIA 规则。每项内部用 `|` 表示“任一”，不同项之间同时满足，排除项优先；名称按不区分大小写的字面子串匹配，不执行正则。每项最多 64 个非空条件、4096 字节。当前目录没有独立地区字段，因此地区也按名称匹配。示例：
+
+```ini
+node-filter-lines=Fusion|CIA
+node-filter-regions=香港|日本
+node-filter-exclude=维护|测试
+```
+
+预览实际保留的名称和数量：
+
+```sh
+oixc-proxy preview-nodes
+oixc-proxy preview-nodes --refresh
+```
+
+预览默认读取当前账户缓存，没有可用缓存时才请求 API；`--refresh` 强制获取。预览不写缓存、不修改运行服务或面板筛选，允许显示空结果；服务启动或刷新则拒绝空选集。删除四项配置恢复默认规则。`--disable-node-filter` 和 provider 的 `?all=1` 仍可绕过本地筛选，但无法恢复 API 未下发的节点。JSON 对应 `nodeFilterLines`、`nodeFilterRegions`、`nodeFilterInclude`、`nodeFilterExclude`；`serve-map` 支持同名 kebab-case 命令行选项。
+
 API 回退只对网络错误、超时和 HTTP 5xx 生效。整个请求（包括响应读取）共用 `request-timeout` 预算，依次尝试时给剩余地址预留时间；401/403/407/429、格式或签名错误直接返回。所有地址继续使用 HTTPS 验证、签名校验和直连物理出口，不跟随重定向。备用地址默认为空，必须由你配置可信的同服务 API，配置后该地址会收到访问 token；JSON 配置对应 `apiBaseURL` 和 `apiFallbackURLs`。
 
 排查连接异常时先查看状态，无需重启服务：
@@ -156,6 +177,7 @@ curl -fsS http://127.0.0.1:6173/status
 
 ```text
 oixc-proxy information [--config PATH] --output PATH
+oixc-proxy preview-nodes [--config PATH] [--refresh] [--disable-node-filter]
 
 oixc-proxy serve [--config PATH]
 oixc-proxy serve-map [--token-file PATH] [--listen IP] [--base-port PORT]
