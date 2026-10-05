@@ -5,6 +5,7 @@ pub mod catalog_refresh;
 pub mod clash;
 pub mod cli;
 pub mod config;
+pub mod diagnostics;
 pub mod gateway;
 pub mod http_proxy;
 pub mod http_server;

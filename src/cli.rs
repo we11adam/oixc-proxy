@@ -150,7 +150,7 @@ async fn run_serve(args: &[String]) -> Result<()> {
         udp_relay_advertised,
         routing_secret,
         dial_limit,
-        transport,
+        transport.clone(),
     );
     let router = Router::build(
         &managed.proxies,
@@ -159,7 +159,15 @@ async fn run_serve(args: &[String]) -> Result<()> {
         &gateway_context,
         None,
     )?;
-    let manager = Arc::new(GatewayManager::new(router));
+    let manager = Arc::new(GatewayManager::new(router).with_transport(transport));
+    manager.initialize_status(
+        from_cache,
+        if from_cache {
+            cache.modified_at()
+        } else {
+            Some(crate::diagnostics::unix_now())
+        },
+    );
     let socks_listener = TcpListener::bind(service.listen)
         .await
         .map_err(|_| anyhow::anyhow!("listen on local SOCKS5 address"))?;
@@ -218,19 +226,24 @@ async fn run_serve(args: &[String]) -> Result<()> {
                     _ = catalog_refresh.notified() => {},
                 }
             } => {
+                manager.refresh_started();
                 let refreshed = match load_managed_nodes(&service.runtime, true, &network).await {
                     Ok(value) => value,
                     Err(error) => {
+                        manager.refresh_finished(Some(&error));
                         eprintln!("node catalog refresh failed: {error:#}");
                         continue;
                     }
                 };
                 if refreshed.proxies == managed.proxies {
+                    manager.refresh_finished(None);
+                    cache.store_or_log(&refreshed);
                     continue;
                 }
                 let published = match published_proxies(&refreshed, disable_node_filter) {
                     Ok(value) => value,
                     Err(error) => {
+                        manager.refresh_finished(Some(&error));
                         eprintln!("node catalog refresh failed: {error:#}");
                         continue;
                     }
@@ -245,17 +258,20 @@ async fn run_serve(args: &[String]) -> Result<()> {
                 ) {
                     Ok(value) => value,
                     Err(error) => {
+                        manager.refresh_finished(Some(&error));
                         eprintln!("node catalog refresh failed: {error:#}");
                         continue;
                     }
                 };
                 if let Err(error) = manager.replace(replacement).await {
+                    manager.refresh_finished(Some(&error));
                     eprintln!("retire previous node catalog: {error:#}");
                     continue;
                 }
                 let published_count = published.len();
                 let total_count = refreshed.proxies.len();
                 managed = refreshed;
+                manager.refresh_finished(None);
                 cache.store_or_log(&managed);
                 println!(
                     "Refreshed node catalog ({})",
@@ -533,7 +549,13 @@ async fn load_managed_nodes(
 ) -> Result<ManagedConfig> {
     let client = api_client(runtime, network).await?;
     let plaintext = client.dump_managed_config().await?;
-    let managed = ManagedConfig::parse(&plaintext)?;
+    let managed = ManagedConfig::parse(&plaintext).map_err(|error| {
+        error.context(crate::diagnostics::ApiFailure {
+            kind: crate::diagnostics::ErrorKind::InvalidResponse,
+            status: None,
+            retry_after_seconds: None,
+        })
+    })?;
     if disable_filter {
         Ok(managed)
     } else {

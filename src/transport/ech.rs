@@ -44,6 +44,7 @@ pub struct TransportContext {
     resolver: PrivateDnsResolver,
     network: NetworkMonitor,
     pub catalog_refresh: Arc<CatalogRefresh>,
+    pub diagnostics: crate::diagnostics::DialDiagnostics,
 }
 
 struct CachedTlsConfig {
@@ -69,6 +70,16 @@ pub struct EchDialer {
 }
 
 impl TransportContext {
+    pub async fn status(&self) -> serde_json::Value {
+        let network = self.network.snapshot().await;
+        let fields = network
+            .diagnostic_fields()
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        serde_json::json!({"network": fields, "tls_roots": self.roots.status(), "ech_dials": self.diagnostics.snapshot()})
+    }
+
     pub fn built_in() -> Result<Self> {
         Self::built_in_with_network(NetworkMonitor::new(None))
     }
@@ -80,6 +91,7 @@ impl TransportContext {
             resolver: PrivateDnsResolver::built_in()?,
             network,
             catalog_refresh: Arc::new(CatalogRefresh::default()),
+            diagnostics: crate::diagnostics::DialDiagnostics::default(),
         })
     }
 }
@@ -118,7 +130,13 @@ impl EchDialer {
         let started = Instant::now();
         let result = timeout(self.timeout, self.dial_inner())
             .await
-            .map_err(|_| anyhow::anyhow!("ECH-TLS node connection timed out"))?;
+            .unwrap_or_else(|_| {
+                Err(
+                    io::Error::new(io::ErrorKind::TimedOut, "ECH-TLS node connection timed out")
+                        .into(),
+                )
+            });
+        self.context.diagnostics.record(result.as_ref().map(|_| ()));
         crate::perftrace::stage("ech.dial", started, result.is_ok(), &[]);
         result
     }

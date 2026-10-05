@@ -221,6 +221,15 @@ removed profiles are rotated atomically.
 
 ## Commands
 
+Use `curl -fsS http://127.0.0.1:6173/status` to diagnose faults without restarting.
+`GET`/`HEAD /status` reports catalog refresh timestamps/errors, cache age, physical
+egress, TLS root count/generation/load completeness and cumulative ECH dial results.
+Timestamps are Unix seconds; counters reset on process restart. `ready` means a
+catalog is loaded. `/healthz` only indicates HTTP liveness; neither endpoint probes
+upstream nodes. HTTP 401/403/407/429 have distinct sanitized error categories,
+and valid `Retry-After` seconds appear in rate-limit errors. Status omits tokens,
+PSKs, node addresses and remote error bodies. Expose it only to trusted networks.
+
 ```text
 oixc-proxy information [--config PATH] --output PATH
 

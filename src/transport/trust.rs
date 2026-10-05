@@ -24,6 +24,7 @@ struct State {
     /// No background reload is needed: the last load was complete, or a
     /// reload produced the same roots so the platform store is stable.
     settled: bool,
+    complete: bool,
 }
 
 /// Shared across nodes. A failed or partial reload never replaces a usable store.
@@ -35,6 +36,11 @@ pub(super) struct TrustStore {
 }
 
 impl TrustStore {
+    pub fn status(&self) -> serde_json::Value {
+        let state = lock(&self.state);
+        serde_json::json!({"count": state.snapshot.roots.len(), "generation": state.snapshot.generation, "last_load_complete": state.complete, "auto_reload_pending": !state.settled})
+    }
+
     pub fn new() -> Result<Self> {
         Self::with_loader(load_native)
     }
@@ -51,6 +57,7 @@ impl TrustStore {
                     generation: 1,
                 },
                 settled: loaded.complete,
+                complete: loaded.complete,
             })),
             reload: Arc::new(AsyncMutex::new(None)),
             loader,
@@ -133,12 +140,14 @@ fn apply_reload(state: &mut State, loaded: LoadedRoots) -> TrustSnapshot {
                 && current.iter().all(|root| loaded.roots.roots.contains(root))));
     if unchanged {
         state.settled = true;
+        state.complete = loaded.complete;
     } else if usable {
         state.snapshot = TrustSnapshot {
             roots: Arc::new(loaded.roots),
             generation: state.snapshot.generation + 1,
         };
         state.settled = loaded.complete;
+        state.complete = loaded.complete;
         eprintln!(
             "tls.roots refreshed count={} generation={}",
             state.snapshot.roots.len(),
@@ -263,6 +272,7 @@ mod tests {
                 generation: 1,
             },
             settled: false,
+            complete: false,
         }
     }
 

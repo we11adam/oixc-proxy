@@ -30,6 +30,16 @@ pub struct CatalogCache {
 }
 
 impl CatalogCache {
+    pub fn modified_at(&self) -> Option<u64> {
+        std::fs::metadata(&self.path)
+            .ok()?
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|time| time.as_secs())
+    }
+
     pub fn beside_config(config_path: &Path, access_token: &str) -> Self {
         let directory = config_path.parent().unwrap_or_else(|| Path::new("."));
         Self {

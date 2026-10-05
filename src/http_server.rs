@@ -6,7 +6,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
-use crate::gateway::{CLASH_PROVIDER_PATH, GatewayManager, HEALTH_PATH, PROVIDER_PATH};
+use crate::gateway::{
+    CLASH_PROVIDER_PATH, GatewayManager, HEALTH_PATH, PROVIDER_PATH, STATUS_PATH,
+};
 
 pub async fn serve(listener: TcpListener, manager: Arc<GatewayManager>) -> Result<()> {
     loop {
@@ -46,6 +48,33 @@ async fn serve_connection(mut connection: TcpStream, manager: Arc<GatewayManager
     }
 
     match path {
+        STATUS_PATH => {
+            if method != "GET" && method != "HEAD" {
+                return write_response(
+                    &mut connection,
+                    405,
+                    "Method Not Allowed",
+                    &[("Allow", "GET, HEAD")],
+                    b"method not allowed\n",
+                    method == "HEAD",
+                )
+                .await;
+            }
+            let body = serde_json::to_vec(&manager.status().await)?;
+            write_response(
+                &mut connection,
+                200,
+                "OK",
+                &[
+                    ("Content-Type", "application/json"),
+                    ("Cache-Control", "no-store"),
+                    ("X-Content-Type-Options", "nosniff"),
+                ],
+                &body,
+                method == "HEAD",
+            )
+            .await
+        }
         HEALTH_PATH => {
             if method != "GET" && method != "HEAD" {
                 write_response(
@@ -192,6 +221,55 @@ async fn write_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn status_reports_failures_and_head_omits_body() {
+        let manager = Arc::new(GatewayManager::empty_for_test());
+        manager.initialize_status(true, Some(crate::diagnostics::unix_now() - 90));
+        manager.refresh_started();
+        let error = anyhow::Error::new(crate::diagnostics::ApiFailure {
+            kind: crate::diagnostics::ErrorKind::Authentication,
+            status: Some(401),
+            retry_after_seconds: None,
+        });
+        manager.refresh_finished(Some(&error));
+        for method in ["GET", "HEAD", "POST"] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let task = tokio::spawn(serve_connection(server, manager.clone()));
+            client
+                .write_all(
+                    format!("{method} /status HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut bytes = Vec::new();
+            client.read_to_end(&mut bytes).await.unwrap();
+            task.await.unwrap().unwrap();
+            let response = String::from_utf8(bytes).unwrap();
+            let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+            if method == "POST" {
+                assert!(headers.contains("405"));
+                continue;
+            }
+            assert!(headers.contains("200 OK"));
+            assert!(headers.contains("no-store"));
+            if method == "HEAD" {
+                assert!(body.is_empty());
+            } else {
+                let value: serde_json::Value = serde_json::from_str(body).unwrap();
+                assert_eq!(value["ready"], false);
+                assert_eq!(value["catalog"]["last_error"], "authentication");
+                assert_eq!(value["catalog"]["refresh_failures"], 1);
+                assert!(value["catalog"]["cache_age_seconds"].as_u64().unwrap() >= 90);
+            }
+        }
+        manager.refresh_finished(None);
+        assert!(manager.status().await["catalog"]["last_error"].is_null());
+    }
 
     #[test]
     fn splits_path_from_query() {

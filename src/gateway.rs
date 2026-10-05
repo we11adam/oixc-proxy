@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -18,6 +19,7 @@ use crate::transport::{EchDialer, TransportContext};
 pub const PROVIDER_PATH: &str = "/surge-proxies.conf";
 pub const CLASH_PROVIDER_PATH: &str = "/clash-proxies.yaml";
 pub const HEALTH_PATH: &str = "/healthz";
+pub const STATUS_PATH: &str = "/status";
 const ROUTING_SECRET_CONTEXT: &[u8] = b"oixc-proxy/provider-routing/v1";
 
 #[derive(Clone)]
@@ -45,10 +47,13 @@ pub struct Router {
     filtered: ProviderDocs,
     all: ProviderDocs,
     routing_secret: String,
+    published_count: usize,
 }
 
 pub struct GatewayManager {
     router: RwLock<Option<Arc<Router>>>,
+    catalog_status: Mutex<crate::diagnostics::CatalogStatus>,
+    transport: Option<Arc<TransportContext>>,
 }
 
 pub struct GatewayContext {
@@ -157,6 +162,7 @@ impl Router {
             filtered,
             all,
             routing_secret: context.routing_secret.clone(),
+            published_count: published.len(),
         })
     }
 
@@ -199,9 +205,77 @@ impl Router {
 }
 
 impl GatewayManager {
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            router: RwLock::new(None),
+            catalog_status: Mutex::new(crate::diagnostics::CatalogStatus::default()),
+            transport: None,
+        }
+    }
+
+    pub fn with_transport(mut self, transport: Arc<TransportContext>) -> Self {
+        self.transport = Some(transport);
+        self
+    }
+
+    pub fn initialize_status(&self, from_cache: bool, last_success_at: Option<u64>) {
+        let mut status = self
+            .catalog_status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        status.started_from_cache = from_cache;
+        status.last_success_at = last_success_at;
+    }
+
+    pub fn refresh_started(&self) {
+        self.catalog_status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last_attempt_at = Some(crate::diagnostics::unix_now());
+    }
+
+    pub fn refresh_finished(&self, error: Option<&anyhow::Error>) {
+        let mut status = self
+            .catalog_status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        status.last_error = error.map(crate::diagnostics::classify);
+        if error.is_some() {
+            status.refresh_failures += 1;
+        } else {
+            status.last_success_at = Some(crate::diagnostics::unix_now());
+        }
+    }
+
+    pub async fn status(&self) -> serde_json::Value {
+        let mut catalog = self
+            .catalog_status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        catalog.cache_age_seconds = catalog
+            .last_success_at
+            .map(|time| crate::diagnostics::unix_now().saturating_sub(time));
+        let (ready, total, published) = {
+            let router = self.router.read().await;
+            router
+                .as_ref()
+                .map(|r| (true, r.runtimes.len(), r.published_count))
+                .unwrap_or((false, 0, 0))
+        };
+        let transport = match &self.transport {
+            Some(transport) => transport.status().await,
+            None => serde_json::Value::Null,
+        };
+        serde_json::json!({"version": crate::VERSION, "ready": ready, "total_nodes": total, "published_nodes": published, "catalog": catalog, "transport": transport})
+    }
+
     pub fn new(router: Router) -> Self {
         Self {
             router: RwLock::new(Some(Arc::new(router))),
+            catalog_status: Mutex::new(crate::diagnostics::CatalogStatus::default()),
+            transport: None,
         }
     }
 

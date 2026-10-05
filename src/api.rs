@@ -10,6 +10,7 @@ use serde::Deserialize;
 use sha2::Sha256;
 use url::Url;
 
+use crate::diagnostics::{ApiFailure, ErrorKind, http_error_kind};
 use crate::network::NetworkSnapshot;
 
 pub const MANAGED_NODES_PATH: &str = "/api/v1/managed/anywhere/direct";
@@ -110,10 +111,10 @@ impl Client {
             .await
             .context("perform information request")?;
         let status = response.status();
+        ensure_success(status, retry_after_seconds(&response))?;
         let body = read_limited_response(response).await?;
-        ensure_success(status, &body)?;
         serde_json::from_slice::<serde_json::Value>(&body)
-            .map_err(|_| anyhow::anyhow!("information response is not valid JSON"))?;
+            .map_err(|_| api_failure(ErrorKind::InvalidResponse, None))?;
         Ok(body)
     }
 
@@ -151,6 +152,7 @@ impl Client {
             .await
             .context("perform request")?;
         let status = response.status();
+        ensure_success(status, retry_after_seconds(&response))?;
         let response_signature = response
             .headers()
             .get(HEADER_RESPONSE_SIGNATURE)
@@ -159,16 +161,14 @@ impl Client {
             .trim()
             .to_owned();
         let body = read_limited_response(response).await?;
-        ensure_success(status, &body)?;
 
-        let envelope: ManagedEnvelope =
-            serde_json::from_slice(&body).context("decode managed API envelope")?;
+        let envelope: ManagedEnvelope = serde_json::from_slice(&body)
+            .map_err(|_| api_failure(ErrorKind::InvalidResponse, None))?;
         if envelope.ret != StatusCode::OK.as_u16() as i32 {
-            bail!(
-                "managed API returned ret={}: {}",
-                envelope.ret,
-                envelope.msg
-            );
+            return Err(api_failure(
+                http_error_kind(u16::try_from(envelope.ret).unwrap_or(0)),
+                u16::try_from(envelope.ret).ok(),
+            ));
         }
         if envelope.config.is_empty() {
             bail!(
@@ -178,7 +178,7 @@ impl Client {
             );
         }
         if response_signature.is_empty() {
-            bail!("API response is missing its signature");
+            return Err(api_failure(ErrorKind::Signature, None));
         }
         if !verify_response_signature(
             &self.app_secret,
@@ -186,7 +186,7 @@ impl Client {
             envelope.config.as_bytes(),
             &response_signature,
         ) {
-            bail!("API response signature does not match");
+            return Err(api_failure(ErrorKind::Signature, None));
         }
         let armored = base64::engine::general_purpose::STANDARD
             .decode(envelope.config)
@@ -278,29 +278,35 @@ async fn read_limited_response(mut response: reqwest::Response) -> Result<Vec<u8
     Ok(body)
 }
 
-fn ensure_success(status: StatusCode, body: &[u8]) -> Result<()> {
+fn ensure_success(status: StatusCode, retry_after_seconds: Option<u64>) -> Result<()> {
     if !status.is_success() {
-        bail!(
-            "API returned HTTP {}: {}",
-            status.as_u16(),
-            safe_error_body(body)
-        );
+        return Err(ApiFailure {
+            kind: http_error_kind(status.as_u16()),
+            status: Some(status.as_u16()),
+            retry_after_seconds,
+        }
+        .into());
     }
     Ok(())
 }
 
-fn safe_error_body(body: &[u8]) -> String {
-    let value = String::from_utf8_lossy(body);
-    let trimmed = value.trim();
-    if trimmed.len() > 512 {
-        let mut end = 512;
-        while !trimmed.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}...", &trimmed[..end])
-    } else {
-        trimmed.to_owned()
+fn api_failure(kind: ErrorKind, status: Option<u16>) -> anyhow::Error {
+    ApiFailure {
+        kind,
+        status,
+        retry_after_seconds: None,
     }
+    .into()
+}
+
+fn retry_after_seconds(response: &reqwest::Response) -> Option<u64> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
 }
 
 fn describe_json_fields(body: &[u8]) -> String {
@@ -331,14 +337,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn safe_error_body_truncates_on_a_character_boundary() {
-        // 171 three-byte characters put byte 512 inside a character.
-        let body = "错".repeat(171);
-        let message = safe_error_body(body.as_bytes());
-        assert_eq!(message, format!("{}...", "错".repeat(170)));
-
-        let short = safe_error_body("  错误  ".as_bytes());
-        assert_eq!(short, "错误");
+    fn rate_limit_reports_wait_and_auth_is_distinct() {
+        let error = ensure_success(StatusCode::TOO_MANY_REQUESTS, Some(60)).unwrap_err();
+        let detail = error.downcast_ref::<ApiFailure>().unwrap();
+        assert_eq!(detail.kind, ErrorKind::RateLimited);
+        assert_eq!(detail.retry_after_seconds, Some(60));
+        assert_eq!(
+            crate::diagnostics::classify(
+                &ensure_success(StatusCode::UNAUTHORIZED, None).unwrap_err()
+            ),
+            ErrorKind::Authentication
+        );
     }
 
     #[test]

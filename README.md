@@ -82,7 +82,8 @@ target/release/oixc-proxy serve
 | 混合代理 | `127.0.0.1:6172` | 在同一端口提供 HTTP 和 SOCKS5；通过 provider 凭据路由到指定命名节点 |
 | 节点列表 | `http://127.0.0.1:6173/surge-proxies.conf` | Surge 列表（`?all=1` 发布全部节点，`?socks=1` 声明为 SOCKS5） |
 | Clash | `http://127.0.0.1:6173/clash-proxies.yaml` | Clash 列表（`?all=1` 发布全部节点，`?socks=1` 声明为 SOCKS5） |
-| 健康检查 | `http://127.0.0.1:6173/healthz` | 就绪探针 |
+| 健康检查 | `http://127.0.0.1:6173/healthz` | HTTP 服务存活探针，不代表上游可达 |
+| 诊断状态 | `http://127.0.0.1:6173/status` | 目录刷新、缓存年龄、物理出口、证书库及 ECH 建连统计 |
 
 Surge 代理组示例：
 
@@ -140,6 +141,14 @@ node-refresh-interval=1h
 启动时，如果配置文件旁存在 `nodes-cache.yaml`，程序会先加载它，使 SOCKS5 和节点列表监听器可以在控制面获取完成前开始监听。缓存权限为 `0600`，保存最近一次验证通过的目录，并通过不可逆账户指纹与当前 token 绑定；token 变化时旧缓存会被拒绝。后续刷新失败时继续使用当前账户的原目录；如果首次启动没有可用缓存，则仍要求首次获取成功。配置未变化的节点会保留其 Snell 客户端和空闲连接池；发生变化、新增或删除的节点配置会原子轮换。
 
 ## 命令
+
+排查连接异常时先查看状态，无需重启服务：
+
+```sh
+curl -fsS http://127.0.0.1:6173/status
+```
+
+`GET`/`HEAD /status` 返回 JSON（HEAD 无正文）。`ready` 表示目录已装载；`catalog` 包含最近刷新时间、累计失败次数及错误类别；`transport` 包含物理出口、根证书数量/代次/加载完整性和 ECH 建连结果。时间使用 Unix 秒，计数从进程启动累计，不主动测速；最近一次失败不会因为后来成功而从计数中消失。HTTP 401、403、407、429 分别归类为认证失效、拒绝访问、代理认证和限流，日志中的限流错误会附带有效的 `Retry-After` 秒数。状态不包含 token、PSK、节点地址或远端错误正文；和 provider 一样，仅向受信任网络开放诊断监听端口。
 
 ```text
 oixc-proxy information [--config PATH] --output PATH
