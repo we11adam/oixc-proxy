@@ -4,6 +4,11 @@
 
 本文件记录 `oixc-proxy` 各版本中值得注意的变更。版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 未发布
+
+- 控制面请求对齐官方 v0.0.39 的 `User-Agent: oixCloud Helper` 和 `X-oixCloud-Client: oixcloud-helper`。
+- 新增 `login --output PATH`，显式导入配置中的旧 token，调用官方重绑定接口取得 Helper 专属 token，并保存到新的 `0600` 配置；保留其他设置、不覆盖原配置、不自动重载服务，也不重试或回退到备用 API。启动和只读命令不会自动迁移 token；暂不提供邮箱/密码登录。
+
 ## [0.5.0] - 2026-10-05
 
 ### 新功能

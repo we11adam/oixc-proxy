@@ -148,9 +148,34 @@ listener. Append `socks=1` when the client should use SOCKS5.
 
 ## Service configuration
 
-`serve`, `information`, `install-launch-agent` and `install-systemd` read
+`serve`, `login`, `information`, `install-launch-agent` and `install-systemd` read
 `~/.config/oixc-proxy/oixc-proxy.conf` by default. `--config PATH` selects a
 different file.
+
+### Log in as oixCloud Helper
+
+API requests match official v0.0.39 with `User-Agent: oixCloud Helper` and
+`X-oixCloud-Client: oixcloud-helper`. Headers alone do not migrate an existing
+token's client ownership. To import your configured token:
+
+```sh
+oixc-proxy login --output "$HOME/.config/oixc-proxy/oixc-proxy.helper.conf"
+```
+
+`login` sends one bodyless `POST /api/v1/token/rebind` to the primary API with
+the existing bearer token. It saves the returned Helper token in a new mode
+`0600` config while preserving other settings. The destination must not exist.
+It never retries, uses fallback APIs or prints the token. This changes server-side
+token ownership; a failed request or timeout may still have issued a token.
+
+After success, copy the new token into your original config and run
+`oixc-proxy reload-config` as the service user. Login does not modify the running
+service. Reload fetches and verifies a fresh catalog and rejects caches bound to
+the old token. This aligns the existing token-import workflow; email/password
+login is not supported. Service startup and read-only commands never rebind
+tokens automatically. See the [official-client analysis](docs/2026-10-06_reverse-oixcloud-helper-login-report.md).
+
+### Configuration format
 
 The format is strict `key=value`. Blank lines and `#` comments are accepted;
 unknown keys, duplicate keys, empty values, quoting and sections are rejected.
@@ -315,6 +340,7 @@ Unchanged nodes retain statistics across refreshes; changed connection parameter
 or process restarts reset them.
 
 ```text
+oixc-proxy login [--config PATH] --output PATH
 oixc-proxy information [--config PATH] --output PATH
 
 oixc-proxy serve [--config PATH]

@@ -98,7 +98,21 @@ OIXC = select, policy-path=http://127.0.0.1:6173/surge-proxies.conf, update-inte
 
 ## 服务配置
 
-`serve`、`information`、`install-launch-agent` 和 `install-systemd` 默认读取 `~/.config/oixc-proxy/oixc-proxy.conf`。使用 `--config PATH` 可指定其他文件。
+`serve`、`login`、`information`、`install-launch-agent` 和 `install-systemd` 默认读取 `~/.config/oixc-proxy/oixc-proxy.conf`。使用 `--config PATH` 可指定其他文件。
+
+### 以 oixCloud Helper 身份登录
+
+控制面请求与官方 v0.0.39 一致，发送 `User-Agent: oixCloud Helper` 和 `X-oixCloud-Client: oixcloud-helper`。请求头不会自动迁移旧 token 的客户端归属。导入原有 token 时，使用：
+
+```sh
+oixc-proxy login --output "$HOME/.config/oixc-proxy/oixc-proxy.helper.conf"
+```
+
+`login` 读取当前配置中的 token，向主 API 发送一次无正文的 `POST /api/v1/token/rebind`，取得 Helper 专属 token，并保留其他设置写入新的 `0600` 配置文件；目标文件必须不存在。它不自动重试、不使用备用 API，也不输出 token。这个命令会改变服务端令牌归属；请求失败时服务端可能已完成签发，不能把超时理解为没有生效。
+
+成功后，将新配置中的 token 更新到原配置，再执行 `oixc-proxy reload-config`（以服务用户运行）。运行中的服务不会被登录命令自动修改；新 token 会触发重新获取并验证节点目录，旧 token 缓存不会混用。此命令对齐本项目已有的 token 导入方式，暂不提供邮箱/密码登录。启动服务和只读命令都不会自动重绑定 token。实现依据见[官方登录身份分析](docs/2026-10-06_reverse-oixcloud-helper-login-report.md)。
+
+### 配置格式
 
 配置采用严格的 `key=value` 格式。允许空行和 `#` 注释；未知键、重复键、空值、引号和 section 均会被拒绝。配置必须是 Unix 权限为 `0600` 或更严格的普通文件。
 
@@ -203,6 +217,7 @@ curl -fsS http://127.0.0.1:6173/status
 `GET`/`HEAD /status` 返回 JSON（HEAD 无正文）。`ready` 表示目录已装载；`catalog` 包含最近刷新时间、累计失败次数及错误类别；`transport` 包含物理出口、根证书数量/代次/加载完整性和 ECH 建连结果。时间使用 Unix 秒，计数从进程启动累计，不主动测速；最近一次失败不会因为后来成功而从计数中消失。HTTP 401、403、407、429 分别归类为认证失效、拒绝访问、代理认证和限流，日志中的限流错误会附带有效的 `Retry-After` 秒数。状态不包含 token、PSK、节点地址或远端错误正文；和 provider 一样，仅向受信任网络开放诊断监听端口。
 
 ```text
+oixc-proxy login [--config PATH] --output PATH
 oixc-proxy information [--config PATH] --output PATH
 oixc-proxy preview-nodes [--config PATH] [--refresh] [--disable-node-filter]
 

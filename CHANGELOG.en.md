@@ -4,6 +4,11 @@
 
 Notable changes to `oixc-proxy` are recorded in this file. Versions follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+- Match official v0.0.39 API identity with `User-Agent: oixCloud Helper` and `X-oixCloud-Client: oixcloud-helper`.
+- Add `login --output PATH` to explicitly import the configured token through the official rebind API and save the Helper token in a new mode `0600` config. Other settings are preserved; the original config and running service are unchanged. Login never retries or uses fallback APIs, and startup/read-only commands never rebind automatically. Email/password login is not supported.
+
 ## [0.5.0] - 2026-10-05
 
 ### Added
