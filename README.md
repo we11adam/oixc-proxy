@@ -233,6 +233,8 @@ Surge / Clash provider
 
 ECH 外层 ClientHello 使用 `h2` / `http/1.1`，真实的 `snell-ech/1` ALPN 仅位于加密内层。仓库内保留了范围很小的 [rustls 补丁](vendor/README.md)，证书验证和强制 ECH 策略保持启用。
 
+服务端拒绝 ECH 配置时，`serve` 和 `serve-map` 会立即请求刷新目录；跨节点并发失败合并，30 秒内最多触发一次。刷新失败保留原目录。握手仍优先使用经认证的服务端 ECH 重试配置，只重试一次；新目录用于后续连接，不重放已经发送的应用数据。
+
 密码学和协议层均在本仓库实现。Rust crate 提供基础原语（`argon2`、`aes-gcm`、`hmac`、`sha2`）、age 和 ECH-TLS（`rustls`）；项目没有使用第三方 Snell 实现。
 
 ## 开发检查

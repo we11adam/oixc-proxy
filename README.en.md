@@ -359,6 +359,11 @@ The ECH outer ClientHello advertises `h2` / `http/1.1`; the real `snell-ech/1`
 ALPN is confined to the encrypted inner hello. A small [rustls patch](vendor/README.md)
 provides separate ALPN settings while retaining certificate verification and mandatory ECH.
 
+An ECH rejection wakes the catalog refresh loop in both `serve` and `serve-map`.
+Concurrent failures are coalesced with a 30-second cooldown. Failed refreshes
+retain the previous catalog. Authenticated server retry configs still allow one
+handshake retry; refreshed nodes serve subsequent connections without replaying payloads.
+
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings

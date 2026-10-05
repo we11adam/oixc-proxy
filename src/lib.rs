@@ -1,6 +1,7 @@
 pub mod accept;
 pub mod api;
 pub mod catalog_cache;
+pub mod catalog_refresh;
 pub mod clash;
 pub mod cli;
 pub mod config;

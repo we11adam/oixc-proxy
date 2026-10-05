@@ -141,6 +141,7 @@ async fn run_serve(args: &[String]) -> Result<()> {
     let published = published_proxies(&managed, disable_node_filter)?;
     let routing_secret = derive_routing_secret(&service.runtime.access_token)?;
     let transport = Arc::new(TransportContext::built_in_with_network(network.clone())?);
+    let catalog_refresh = transport.catalog_refresh.clone();
     let dial_limit = Arc::new(Semaphore::new(service.runtime.dial_concurrency));
     let udp_relay_advertised = service.listen.ip().is_loopback()
         || (service.udp_port_range.is_some() && service.udp_advertise_address.is_some());
@@ -211,7 +212,12 @@ async fn run_serve(args: &[String]) -> Result<()> {
             result = &mut http_task => {
                 return result.context("nodelist HTTP task failed")?;
             }
-            _ = refresh.tick() => {
+            _ = async {
+                tokio::select! {
+                    _ = refresh.tick() => {},
+                    _ = catalog_refresh.notified() => {},
+                }
+            } => {
                 let refreshed = match load_managed_nodes(&service.runtime, true, &network).await {
                     Ok(value) => value,
                     Err(error) => {
@@ -373,7 +379,12 @@ async fn run_serve_map(args: &[String]) -> Result<()> {
             error = error_rx.recv() => {
                 return error.context("SOCKS5 map listener stopped")?;
             }
-            _ = refresh.tick() => {
+            _ = async {
+                tokio::select! {
+                    _ = refresh.tick() => {},
+                    _ = transport.catalog_refresh.notified() => {},
+                }
+            } => {
                 let refreshed = match load_managed_nodes(&runtime, disable_node_filter, &network).await {
                     Ok(value) => value,
                     Err(error) => {

@@ -20,6 +20,7 @@ use tokio::time::{Instant as TokioInstant, Sleep, sleep, timeout};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
+use crate::catalog_refresh::CatalogRefresh;
 use crate::network::{NetworkMonitor, NetworkSnapshot};
 use crate::nodes::Proxy;
 use crate::snell::Exporter;
@@ -42,6 +43,7 @@ pub struct TransportContext {
     provider: Arc<CryptoProvider>,
     resolver: PrivateDnsResolver,
     network: NetworkMonitor,
+    pub catalog_refresh: Arc<CatalogRefresh>,
 }
 
 struct CachedTlsConfig {
@@ -77,6 +79,7 @@ impl TransportContext {
             provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
             resolver: PrivateDnsResolver::built_in()?,
             network,
+            catalog_refresh: Arc::new(CatalogRefresh::default()),
         })
     }
 }
@@ -177,7 +180,11 @@ impl EchDialer {
     }
 
     async fn dial_with_trust(&self, trust: &TrustSnapshot) -> Result<EchConnection> {
-        match self.dial_once(trust).await {
+        let result = self.dial_once(trust).await;
+        if result.as_ref().is_err_and(ech_rejected) && self.context.catalog_refresh.request() {
+            eprintln!("ech.rejected: requested node catalog refresh");
+        }
+        match result {
             Err(error) => match ech_retry_config(&error) {
                 Some(retry) => {
                     // The server authenticated itself for its public name
@@ -359,6 +366,23 @@ fn ech_retry_config(error: &anyhow::Error) -> Option<EchConfig> {
             return None;
         };
         ech_config_from_list(configs.get_encoding()).ok()
+    })
+}
+
+fn ech_rejected(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let tls = cause.downcast_ref::<rustls::Error>().or_else(|| {
+            cause
+                .downcast_ref::<io::Error>()?
+                .get_ref()?
+                .downcast_ref::<rustls::Error>()
+        });
+        matches!(
+            tls,
+            Some(rustls::Error::PeerIncompatible(
+                PeerIncompatible::ServerRejectedEncryptedClientHello(_)
+            ))
+        )
     })
 }
 
@@ -628,6 +652,9 @@ mod tests {
             .context("ECH-TLS handshake")
         };
         assert!(ech_retry_config(&rejected(Some(configs))).is_some());
+        assert!(ech_rejected(&rejected(None)));
+        assert!(ech_rejected(&rejected(Some(Vec::new()))));
+        assert!(!ech_rejected(&anyhow::anyhow!("handshake failed")));
         assert!(ech_retry_config(&rejected(None)).is_none());
         assert!(ech_retry_config(&rejected(Some(Vec::new()))).is_none());
         assert!(ech_retry_config(&anyhow::anyhow!("handshake failed")).is_none());
