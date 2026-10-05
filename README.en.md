@@ -223,6 +223,14 @@ removed profiles are rotated atomically.
 
 ## Commands
 
+Successful Clash provider GET/HEAD responses include validated `Subscription-Userinfo`
+with actual upload/download/total and optional expiry values. Metadata shares the
+account-bound catalog cache. Missing, malformed, over-24-hour or invalidly timestamped
+metadata is omitted, never filled with zeroes. Refreshes update metadata even when
+nodes are unchanged; authentication/forbidden errors clear it in memory. Legacy
+caches remain readable but have no metadata until refreshed. Provider bodies are
+unchanged and Surge responses do not include this header.
+
 Configure any of `node-filter-lines`, `node-filter-regions`, `node-filter-include`
 or `node-filter-exclude` to replace the default Fusion/CIA selection. Alternatives
 within each field use `|` (OR); fields combine with AND and exclusions take priority.
@@ -389,6 +397,19 @@ Rust crates provide primitives (`argon2`, `aes-gcm`, `hmac`, `sha2`), age and
 ECH-TLS (`rustls`); no third-party Snell implementation is used.
 
 ## Development checks
+
+After building release, verify features with an isolated process and temporary
+ports/config/cache, without changing an existing service:
+
+```sh
+OIXC_LIVE_CONFIG="$HOME/.config/oixc-proxy/oixc-proxy.conf" \
+OIXC_LIVE_BINARY="$PWD/target/release/oixc-proxy" \
+cargo test --test live_features -- --ignored
+```
+
+This opt-in test makes read-only API requests using the configured token,
+checks status, filter preview, Clash GET/HEAD metadata and a real HTTPS proxy
+request, then stops its temporary service process.
 
 The ECH outer ClientHello advertises `h2` / `http/1.1`; the real `snell-ech/1`
 ALPN is confined to the encrypted inner hello. A small [rustls patch](vendor/README.md)

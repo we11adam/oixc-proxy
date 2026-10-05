@@ -12,7 +12,7 @@ use crate::config::require_private_file;
 use crate::nodes::ManagedConfig;
 
 const CACHE_FILE_NAME: &str = "nodes-cache.yaml";
-const CACHE_FORMAT_VERSION: u8 = 1;
+const CACHE_FORMAT_VERSION: u8 = 2;
 const MAX_CACHE_BYTES: usize = (8 << 20) + (64 << 10);
 const ACCOUNT_FINGERPRINT_CONTEXT: &[u8] = b"oixc-proxy/catalog-cache-account/v1";
 
@@ -22,6 +22,16 @@ struct CacheEnvelope {
     version: u8,
     account_fingerprint: String,
     managed: ManagedConfig,
+    #[serde(default)]
+    fetched_at: Option<u64>,
+    #[serde(default)]
+    userinfo: serde_json::Value,
+}
+
+pub struct CatalogSnapshot {
+    pub managed: ManagedConfig,
+    pub fetched_at: Option<u64>,
+    pub userinfo: Option<crate::subscription::UserInfo>,
 }
 
 pub struct CatalogCache {
@@ -49,6 +59,10 @@ impl CatalogCache {
     }
 
     pub fn load(&self) -> Option<ManagedConfig> {
+        self.load_snapshot().map(|snapshot| snapshot.managed)
+    }
+
+    pub fn load_snapshot(&self) -> Option<CatalogSnapshot> {
         if !self.path.exists() {
             return None;
         }
@@ -76,10 +90,21 @@ impl CatalogCache {
     }
 
     pub fn store(&self, managed: &ManagedConfig) -> Result<()> {
+        self.store_snapshot(managed, None, Some(crate::diagnostics::unix_now()))
+    }
+
+    pub fn store_snapshot(
+        &self,
+        managed: &ManagedConfig,
+        userinfo: Option<&crate::subscription::UserInfo>,
+        fetched_at: Option<u64>,
+    ) -> Result<()> {
         let envelope = CacheEnvelope {
             version: CACHE_FORMAT_VERSION,
             account_fingerprint: self.account_fingerprint.clone(),
             managed: managed.clone(),
+            fetched_at,
+            userinfo: serde_json::to_value(userinfo)?,
         };
         let content = serde_yaml::to_string(&envelope).context("encode node catalog cache")?;
         write_private_atomic(&self.path, content.as_bytes())
@@ -87,6 +112,16 @@ impl CatalogCache {
 
     pub fn store_or_log(&self, managed: &ManagedConfig) {
         if let Err(error) = self.store(managed) {
+            eprintln!("node catalog cache write failed: {error:#}");
+        }
+    }
+
+    pub fn store_snapshot_or_log(&self, snapshot: &CatalogSnapshot) {
+        if let Err(error) = self.store_snapshot(
+            &snapshot.managed,
+            snapshot.userinfo.as_ref(),
+            snapshot.fetched_at,
+        ) {
             eprintln!("node catalog cache write failed: {error:#}");
         }
     }
@@ -99,14 +134,14 @@ fn account_fingerprint(access_token: &str) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
-fn parse_envelope(content: &[u8], expected_fingerprint: &str) -> Result<ManagedConfig> {
+fn parse_envelope(content: &[u8], expected_fingerprint: &str) -> Result<CatalogSnapshot> {
     let mut documents = serde_yaml::Deserializer::from_slice(content);
     let first = documents.next().context("cache is empty")?;
     let envelope = CacheEnvelope::deserialize(first).context("decode cache envelope")?;
     if documents.next().is_some() {
         bail!("cache contains multiple YAML documents");
     }
-    if envelope.version != CACHE_FORMAT_VERSION {
+    if ![1, CACHE_FORMAT_VERSION].contains(&envelope.version) {
         bail!("cache format version is unsupported");
     }
     if !bool::from(
@@ -118,7 +153,14 @@ fn parse_envelope(content: &[u8], expected_fingerprint: &str) -> Result<ManagedC
         bail!("cache belongs to a different account");
     }
     envelope.managed.validate()?;
-    Ok(envelope.managed)
+    let userinfo = serde_json::from_value::<crate::subscription::UserInfo>(envelope.userinfo)
+        .ok()
+        .filter(|info| info.valid());
+    Ok(CatalogSnapshot {
+        managed: envelope.managed,
+        fetched_at: envelope.fetched_at,
+        userinfo,
+    })
 }
 
 fn write_private_atomic(path: &Path, content: &[u8]) -> Result<()> {
@@ -188,6 +230,51 @@ proxies:
         cache.store(&managed).unwrap();
         let loaded = cache.load().expect("cache should load");
         assert_eq!(loaded, managed);
+    }
+
+    #[test]
+    fn metadata_is_account_scoped_and_legacy_or_invalid_metadata_is_omitted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oixc-proxy.conf");
+        let cache = CatalogCache::beside_config(&path, "token-a");
+        let managed = ManagedConfig::parse(YAML.as_bytes()).unwrap();
+        let info =
+            crate::subscription::UserInfo::parse("upload=1;download=2;total=100;expire=1700000000")
+                .unwrap();
+        cache
+            .store_snapshot(&managed, Some(&info), Some(100))
+            .unwrap();
+        let loaded = cache.load_snapshot().unwrap();
+        assert_eq!(loaded.userinfo, Some(info));
+        assert_eq!(loaded.fetched_at, Some(100));
+        assert!(
+            CatalogCache::beside_config(&path, "token-b")
+                .load_snapshot()
+                .is_none()
+        );
+        let mut value: serde_yaml::Value =
+            serde_yaml::from_slice(&fs::read(&cache.path).unwrap()).unwrap();
+        value["userinfo"] = serde_yaml::Value::String("invalid metadata".to_owned());
+        write_private_atomic(
+            &cache.path,
+            serde_yaml::to_string(&value).unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(cache.load_snapshot().unwrap().managed, managed);
+        assert!(cache.load_snapshot().unwrap().userinfo.is_none());
+        let map = value.as_mapping_mut().unwrap();
+        map.insert("version".into(), 1.into());
+        map.remove(serde_yaml::Value::String("userinfo".to_owned()));
+        map.remove(serde_yaml::Value::String("fetched_at".to_owned()));
+        write_private_atomic(
+            &cache.path,
+            serde_yaml::to_string(&value).unwrap().as_bytes(),
+        )
+        .unwrap();
+        let loaded = cache.load_snapshot().unwrap();
+        assert_eq!(loaded.managed, managed);
+        assert!(loaded.userinfo.is_none());
+        assert!(loaded.fetched_at.is_none());
     }
 
     #[test]

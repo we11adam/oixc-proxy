@@ -117,15 +117,24 @@ async fn serve_connection(mut connection: TcpStream, manager: Arc<GatewayManager
             };
             match provider {
                 Ok(provider) => {
+                    let subscription = if path == CLASH_PROVIDER_PATH {
+                        manager.subscription_header().await
+                    } else {
+                        None
+                    };
+                    let mut headers = vec![
+                        ("Content-Type", content_type),
+                        ("Cache-Control", "no-store"),
+                        ("X-Content-Type-Options", "nosniff"),
+                    ];
+                    if let Some(value) = subscription.as_deref() {
+                        headers.push(("Subscription-Userinfo", value));
+                    }
                     write_response(
                         &mut connection,
                         200,
                         "OK",
-                        &[
-                            ("Content-Type", content_type),
-                            ("Cache-Control", "no-store"),
-                            ("X-Content-Type-Options", "nosniff"),
-                        ],
+                        &headers,
                         &provider,
                         method == "HEAD",
                     )
@@ -221,6 +230,73 @@ async fn write_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn request_for_test(manager: Arc<GatewayManager>, method: &str, path: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let task = tokio::spawn(serve_connection(server, manager));
+        client
+            .write_all(format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).await.unwrap();
+        task.await.unwrap().unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn clash_get_and_head_publish_only_fresh_valid_userinfo() {
+        let manager = Arc::new(GatewayManager::provider_for_test());
+        let info =
+            crate::subscription::UserInfo::parse("upload=1;download=2;total=100;expire=1700000000")
+                .unwrap();
+        manager
+            .update_subscription(Some(info.clone()), Some(crate::diagnostics::unix_now()))
+            .await;
+        for method in ["GET", "HEAD"] {
+            let response =
+                request_for_test(manager.clone(), method, "/clash-proxies.yaml?all=1&socks=1")
+                    .await;
+            let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+            assert!(headers.contains(
+                "Subscription-Userinfo: upload=1; download=2; total=100; expire=1700000000"
+            ));
+            assert!(headers.contains("200 OK"));
+            if method == "HEAD" {
+                assert!(body.is_empty());
+            } else {
+                assert!(!body.is_empty());
+            }
+        }
+        assert!(
+            !request_for_test(manager.clone(), "GET", "/surge-proxies.conf")
+                .await
+                .contains("Subscription-Userinfo")
+        );
+        manager
+            .update_subscription(
+                Some(info),
+                Some(crate::diagnostics::unix_now() - crate::subscription::MAX_USERINFO_AGE - 1),
+            )
+            .await;
+        assert!(
+            !request_for_test(manager.clone(), "GET", "/clash-proxies.yaml")
+                .await
+                .contains("Subscription-Userinfo")
+        );
+        manager.update_subscription(None, None).await;
+        assert!(
+            !request_for_test(manager.clone(), "HEAD", "/clash-proxies.yaml")
+                .await
+                .contains("Subscription-Userinfo")
+        );
+        manager.close().await;
+        assert!(manager.subscription_header().await.is_none());
+    }
 
     #[tokio::test]
     async fn status_reports_failures_and_head_omits_body() {

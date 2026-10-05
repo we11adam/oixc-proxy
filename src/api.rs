@@ -24,6 +24,11 @@ const MAX_RESPONSE_BYTES: usize = 8 << 20;
 const USER_AGENT: &str = concat!("oixc-proxy/", env!("CARGO_PKG_VERSION"));
 type HmacSha256 = Hmac<Sha256>;
 
+pub struct ManagedResponse {
+    pub config: Vec<u8>,
+    pub userinfo: Option<crate::subscription::UserInfo>,
+}
+
 pub struct Client {
     base_url: Url,
     fallback_urls: Vec<Url>,
@@ -177,6 +182,10 @@ impl Client {
     }
 
     pub async fn dump_managed_config(&self) -> Result<Vec<u8>> {
+        Ok(self.fetch_managed().await?.config)
+    }
+
+    pub async fn fetch_managed(&self) -> Result<ManagedResponse> {
         let identity = age::x25519::Identity::generate();
         let recipient = identity.to_public().to_string();
         let timestamp = SystemTime::now()
@@ -197,7 +206,7 @@ impl Client {
         timestamp: &str,
         recipient: &str,
         identity: &age::x25519::Identity,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<ManagedResponse> {
         let signature = request_signature(&self.app_secret, timestamp, recipient);
         let response = self
             .http
@@ -254,7 +263,12 @@ impl Client {
         if armored.len() > MAX_RESPONSE_BYTES {
             bail!("decoded managed config exceeds {MAX_RESPONSE_BYTES} bytes");
         }
-        decrypt_age(&armored, identity)
+        let config = decrypt_age(&armored, identity)?;
+        let userinfo = envelope
+            .userinfo
+            .as_str()
+            .and_then(crate::subscription::UserInfo::parse);
+        Ok(ManagedResponse { config, userinfo })
     }
 }
 
@@ -272,8 +286,8 @@ struct ManagedEnvelope {
     msg: String,
     #[serde(default)]
     config: String,
-    #[serde(default, rename = "userinfo")]
-    _userinfo: String,
+    #[serde(default)]
+    userinfo: serde_json::Value,
 }
 
 pub fn request_signature(app_secret: &str, timestamp: &str, recipient: &str) -> String {
@@ -488,6 +502,27 @@ mod tests {
             ),
             ErrorKind::Authentication
         );
+    }
+
+    #[test]
+    fn missing_or_unexpected_userinfo_does_not_break_node_envelope() {
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!({"unexpected": true}),
+            serde_json::json!("upload=0; download=0"),
+        ] {
+            let envelope: ManagedEnvelope = serde_json::from_value(
+                serde_json::json!({"ret":200,"config":"signed payload", "userinfo":value}),
+            )
+            .unwrap();
+            assert!(
+                envelope
+                    .userinfo
+                    .as_str()
+                    .and_then(crate::subscription::UserInfo::parse)
+                    .is_none()
+            );
+        }
     }
 
     #[test]

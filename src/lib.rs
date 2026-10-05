@@ -15,6 +15,7 @@ pub mod perftrace;
 pub mod rlimit;
 pub mod snell;
 pub mod socks5;
+pub mod subscription;
 pub mod surge;
 pub mod transport;
 

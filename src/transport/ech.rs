@@ -603,6 +603,17 @@ mod tests {
         .with_root_certificates(rustls::RootCertStore::empty())
         .with_no_client_auth();
         config.alpn_protocols = vec![b"snell-ech/1".to_vec()];
+        let mut legacy = rustls::ClientConnection::new(
+            Arc::new(config.clone()),
+            ServerName::try_from("inner.example.com").unwrap(),
+        )
+        .unwrap();
+        let mut public = Vec::new();
+        legacy.write_tls(&mut public).unwrap();
+        assert!(
+            public.windows(11).any(|p| p == b"snell-ech/1"),
+            "unset cover ALPN preserves upstream behavior"
+        );
         config.ech_outer_alpn_protocols = Some(vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
         let mut connection = rustls::ClientConnection::new(
             Arc::new(config),
@@ -741,6 +752,52 @@ mod tests {
         let after = context.roots.snapshot().await;
         assert!(after.generation > before.generation);
         assert!(after.roots.len() > before.roots.len());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires OIXC_LIVE_CONFIG and live managed nodes"]
+    async fn live_cover_alpn_negotiates_real_snell_on_fresh_nodes() {
+        let path = std::env::var("OIXC_LIVE_CONFIG").unwrap();
+        let config = crate::config::load_proxy_config(std::path::Path::new(&path)).unwrap();
+        let network =
+            NetworkMonitor::new((!config.outbound_ip.is_loopback()).then_some(config.outbound_ip));
+        let snapshot = network.snapshot().await;
+        let client = crate::api::Client::new_with_network(
+            config.runtime.api_base_url,
+            config.runtime.access_token,
+            config.runtime.app_secret,
+            config.runtime.request_timeout,
+            &snapshot,
+        )
+        .unwrap()
+        .with_fallback_urls(config.runtime.api_fallback_urls)
+        .unwrap();
+        let response = client
+            .fetch_managed()
+            .await
+            .expect("fetch current signed catalog");
+        assert!(
+            response.userinfo.is_some(),
+            "live API must provide valid subscription metadata"
+        );
+        let managed = crate::nodes::ManagedConfig::parse(&response.config).unwrap();
+        let context = Arc::new(TransportContext::built_in_with_network(network).unwrap());
+        let nodes = managed.allowed_proxies();
+        assert!(!nodes.is_empty());
+        for node in nodes.iter().take(2) {
+            let dialer =
+                EchDialer::new_with_context(node, Duration::from_secs(15), context.clone())
+                    .unwrap();
+            let connection = dialer
+                .dial()
+                .await
+                .expect("real node must accept browser cover ALPN and inner Snell ALPN");
+            assert_eq!(
+                connection.stream.get_ref().1.alpn_protocol(),
+                Some(b"snell-ech/1".as_slice())
+            );
+        }
+        assert_eq!(context.diagnostics.snapshot().succeeded, 2);
     }
 
     /// Port 1 never answers, port 2 fails after 10ms, other ports connect.

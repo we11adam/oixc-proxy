@@ -54,6 +54,7 @@ pub struct GatewayManager {
     router: RwLock<Option<Arc<Router>>>,
     catalog_status: Mutex<crate::diagnostics::CatalogStatus>,
     transport: Option<Arc<TransportContext>>,
+    subscription: RwLock<Option<(crate::subscription::UserInfo, Option<u64>)>>,
 }
 
 pub struct GatewayContext {
@@ -211,7 +212,27 @@ impl GatewayManager {
             router: RwLock::new(None),
             catalog_status: Mutex::new(crate::diagnostics::CatalogStatus::default()),
             transport: None,
+            subscription: RwLock::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provider_for_test() -> Self {
+        let doc: Arc<[u8]> = b"proxies: []\n".as_slice().into();
+        let docs = ProviderDocs {
+            surge_http: doc.clone(),
+            surge_socks: doc.clone(),
+            clash_http: doc.clone(),
+            clash_socks: doc,
+        };
+        Self::new(Router {
+            routes: HashMap::new(),
+            runtimes: HashMap::new(),
+            filtered: docs.clone(),
+            all: docs,
+            routing_secret: "test".to_owned(),
+            published_count: 0,
+        })
     }
 
     pub fn with_transport(mut self, transport: Arc<TransportContext>) -> Self {
@@ -276,6 +297,7 @@ impl GatewayManager {
             router: RwLock::new(Some(Arc::new(router))),
             catalog_status: Mutex::new(crate::diagnostics::CatalogStatus::default()),
             transport: None,
+            subscription: RwLock::new(None),
         }
     }
 
@@ -305,6 +327,22 @@ impl GatewayManager {
             .ok_or_else(|| anyhow::anyhow!("gateway unavailable"))
     }
 
+    pub async fn update_subscription(
+        &self,
+        info: Option<crate::subscription::UserInfo>,
+        fetched_at: Option<u64>,
+    ) {
+        *self.subscription.write().await = info.map(|info| (info, fetched_at));
+    }
+
+    pub async fn subscription_header(&self) -> Option<String> {
+        self.subscription
+            .read()
+            .await
+            .as_ref()
+            .and_then(|(info, at)| info.header(*at, crate::diagnostics::unix_now()))
+    }
+
     pub async fn current(&self) -> Result<Arc<Router>> {
         self.router
             .read()
@@ -328,6 +366,7 @@ impl GatewayManager {
     }
 
     pub async fn close(&self) {
+        *self.subscription.write().await = None;
         let previous = self.router.write().await.take();
         if let Some(previous) = previous {
             previous.retire_exclusive_runtimes(None).await;

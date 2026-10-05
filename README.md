@@ -2,7 +2,7 @@
 
 **中文** | [English](README.en.md)
 
-`oixc-proxy` 是一个面向 oixCloud 的纯净室 Rust 客户端和本地命名节点代理。它会获取、认证并解密托管节点目录，然后通过一个混合 HTTP/SOCKS5 监听器和一个独立的 HTTP 节点列表监听器，仅发布名称中包含 `Fusion` 或独立 `CIA` 标记的节点。
+`oixc-proxy` 是一个面向 oixCloud 的纯净室 Rust 客户端和本地命名节点代理。它会获取、认证并解密托管节点目录，然后通过一个混合 HTTP/SOCKS5 监听器和一个独立的 HTTP 节点列表监听器，默认仅发布名称中包含 `Fusion` 或独立 `CIA` 标记的节点，也支持自定义筛选。
 
 本仓库是 Go 版 `oixc` 的 Rust 重写。二进制名称、命令、配置、HTTP 端点、Surge provider 格式、SOCKS5 路由凭据、控制面认证以及 Snell/ECH 线路行为均有意保持兼容。
 
@@ -148,6 +148,8 @@ node-refresh-interval=1h
 
 ## 命令
 
+Clash provider 成功的 GET/HEAD 响应会附加有效的 `Subscription-Userinfo`，包含 API 实际提供的 `upload`、`download`、`total` 和可选的 `expire`。信息与当前账户的目录一起缓存；缺失、非法、超过 24 小时或时间戳异常时省略 header，不补零。目录没有变化时也会更新账户信息；认证失效或拒绝访问时清除内存中的信息。旧版缓存仍可加载节点，但获取新信息前不输出账户 header。该 header 不改变 provider 正文，Surge provider 不附加它。
+
 四项筛选任意一项设置后，使用自定义筛选替代默认 Fusion/CIA 规则。每项内部用 `|` 表示“任一”，不同项之间同时满足，排除项优先；名称按不区分大小写的字面子串匹配，不执行正则。每项最多 64 个非空条件、4096 字节。当前目录没有独立地区字段，因此地区也按名称匹配。示例：
 
 ```ini
@@ -282,6 +284,16 @@ cargo build --release
 ```
 
 单元测试包含 Go/Rust 兼容性的固定测试向量，覆盖请求 HMAC、Identity v2、Argon2id record key、CONNECT 编码和私有 DNS 签名。在线验证还应覆盖 `/healthz`、非空 Fusion/CIA provider、共享端口 SOCKS 路由、`serve-map` 和真实 HTTPS 请求。
+
+可用临时端口、配置和缓存验证新功能，不修改现有服务：
+
+```sh
+OIXC_LIVE_CONFIG="$HOME/.config/oixc-proxy/oixc-proxy.conf" \
+OIXC_LIVE_BINARY="$PWD/target/release/oixc-proxy" \
+cargo test --test live_features -- --ignored
+```
+
+该测试使用配置中的 token 进行只读 API 请求，在临时目录启动独立实例，检查状态、筛选预览、Clash GET/HEAD 账户信息和实际 HTTPS 代理请求，结束时自动停止测试进程。
 
 ## Go/Rust Snell 客户端基准测试
 

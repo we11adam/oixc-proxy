@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
 use crate::api::Client as ApiClient;
-use crate::catalog_cache::CatalogCache;
+use crate::catalog_cache::{CatalogCache, CatalogSnapshot};
 use crate::config::{RuntimeConfig, default_proxy_config_path, load_proxy_config, load_token_file};
 use crate::gateway::{
     CLASH_PROVIDER_PATH, GatewayContext, GatewayManager, PROVIDER_PATH, Route, Router,
@@ -175,13 +175,15 @@ async fn run_serve(args: &[String]) -> Result<()> {
     crate::perftrace::configure(service.runtime.perf_trace_sample_every);
     let network = service_network(service.outbound_ip);
     let cache = CatalogCache::beside_config(&config_path, &service.runtime.access_token);
-    let (mut managed, from_cache) = if let Some(cached) = cache.load() {
+    let (initial, from_cache) = if let Some(cached) = cache.load_snapshot() {
         (cached, true)
     } else {
-        let fetched = load_managed_nodes(&service.runtime, true, &network).await?;
-        cache.store_or_log(&fetched);
+        let fetched = load_managed_catalog(&service.runtime, true, &network).await?;
+        cache.store_snapshot_or_log(&fetched);
         (fetched, false)
     };
+    let mut managed = initial.managed;
+    let mut catalog_fetched_at = initial.fetched_at;
     let published = published_proxies(&managed, disable_node_filter, &service.runtime.node_filter)?;
     let routing_secret = derive_routing_secret(&service.runtime.access_token)?;
     let transport = Arc::new(TransportContext::built_in_with_network(network.clone())?);
@@ -207,11 +209,14 @@ async fn run_serve(args: &[String]) -> Result<()> {
     manager.initialize_status(
         from_cache,
         if from_cache {
-            cache.modified_at()
+            initial.fetched_at.or_else(|| cache.modified_at())
         } else {
             Some(crate::diagnostics::unix_now())
         },
     );
+    manager
+        .update_subscription(initial.userinfo, initial.fetched_at)
+        .await;
     let socks_listener = TcpListener::bind(service.listen)
         .await
         .map_err(|_| anyhow::anyhow!("listen on local SOCKS5 address"))?;
@@ -271,20 +276,28 @@ async fn run_serve(args: &[String]) -> Result<()> {
                 }
             } => {
                 manager.refresh_started();
-                let refreshed = match load_managed_nodes(&service.runtime, true, &network).await {
+                let refreshed = match load_managed_catalog(&service.runtime, true, &network).await {
                     Ok(value) => value,
                     Err(error) => {
                         manager.refresh_finished(Some(&error));
+                        if matches!(crate::diagnostics::classify(&error), crate::diagnostics::ErrorKind::Authentication | crate::diagnostics::ErrorKind::Forbidden) {
+                            manager.update_subscription(None, None).await;
+                            if let Err(error) = cache.store_snapshot(&managed, None, catalog_fetched_at) {
+                                eprintln!("clear cached account metadata: {error:#}");
+                            }
+                        }
                         eprintln!("node catalog refresh failed: {error:#}");
                         continue;
                     }
                 };
-                if refreshed.proxies == managed.proxies {
+                if refreshed.managed.proxies == managed.proxies {
+                    catalog_fetched_at = refreshed.fetched_at;
                     manager.refresh_finished(None);
-                    cache.store_or_log(&refreshed);
+                    manager.update_subscription(refreshed.userinfo.clone(), refreshed.fetched_at).await;
+                    cache.store_snapshot_or_log(&refreshed);
                     continue;
                 }
-                let published = match published_proxies(&refreshed, disable_node_filter, &service.runtime.node_filter) {
+                let published = match published_proxies(&refreshed.managed, disable_node_filter, &service.runtime.node_filter) {
                     Ok(value) => value,
                     Err(error) => {
                         manager.refresh_finished(Some(&error));
@@ -294,7 +307,7 @@ async fn run_serve(args: &[String]) -> Result<()> {
                 };
                 let previous = manager.current().await?;
                 let replacement = match Router::build(
-                    &refreshed.proxies,
+                    &refreshed.managed.proxies,
                     &published,
                     &service.runtime,
                     &gateway_context,
@@ -313,10 +326,12 @@ async fn run_serve(args: &[String]) -> Result<()> {
                     continue;
                 }
                 let published_count = published.len();
-                let total_count = refreshed.proxies.len();
-                managed = refreshed;
+                let total_count = refreshed.managed.proxies.len();
+                manager.update_subscription(refreshed.userinfo.clone(), refreshed.fetched_at).await;
+                catalog_fetched_at = refreshed.fetched_at;
                 manager.refresh_finished(None);
-                cache.store_or_log(&managed);
+                cache.store_snapshot_or_log(&refreshed);
+                managed = refreshed.managed;
                 println!(
                     "Refreshed node catalog ({})",
                     format_node_count(published_count, total_count)
@@ -613,22 +628,37 @@ async fn load_managed_nodes(
     disable_filter: bool,
     network: &NetworkMonitor,
 ) -> Result<ManagedConfig> {
+    Ok(load_managed_catalog(runtime, disable_filter, network)
+        .await?
+        .managed)
+}
+
+async fn load_managed_catalog(
+    runtime: &RuntimeConfig,
+    disable_filter: bool,
+    network: &NetworkMonitor,
+) -> Result<CatalogSnapshot> {
     let client = api_client(runtime, network).await?;
-    let plaintext = client.dump_managed_config().await?;
-    let managed = ManagedConfig::parse(&plaintext).map_err(|error| {
+    let response = client.fetch_managed().await?;
+    let managed = ManagedConfig::parse(&response.config).map_err(|error| {
         error.context(crate::diagnostics::ApiFailure {
             kind: crate::diagnostics::ErrorKind::InvalidResponse,
             status: None,
             retry_after_seconds: None,
         })
     })?;
-    if disable_filter {
-        Ok(managed)
+    let managed = if disable_filter {
+        managed
     } else {
-        Ok(ManagedConfig {
+        ManagedConfig {
             proxies: managed.filtered_proxies(&runtime.node_filter)?,
-        })
-    }
+        }
+    };
+    Ok(CatalogSnapshot {
+        managed,
+        userinfo: response.userinfo,
+        fetched_at: Some(crate::diagnostics::unix_now()),
+    })
 }
 
 async fn api_client(runtime: &RuntimeConfig, network: &NetworkMonitor) -> Result<ApiClient> {
