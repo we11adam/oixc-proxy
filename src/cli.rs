@@ -28,6 +28,7 @@ use crate::transport::{EchDialer, TransportContext};
 const SERVE_MAP_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
 
 const USAGE: &str = "Usage:
+  oixc-proxy login [--config PATH] --output PATH
   oixc-proxy information [--config PATH] --output PATH
   oixc-proxy preview-nodes [--config PATH] [--refresh] [--disable-node-filter]
   oixc-proxy refresh-nodes [--config PATH]
@@ -38,6 +39,10 @@ const USAGE: &str = "Usage:
   oixc-proxy version
   oixc-proxy install-launch-agent [--config PATH]
   oixc-proxy install-systemd [--config PATH]
+
+login imports the configured token as oixCloud Helper and writes a new config.
+It changes server-side token ownership, sends one request to the primary API,
+and does not overwrite the current config or reload the running service.
 
 The information command is read-only. Its output file is created with mode
 0600 and must not already exist.
@@ -67,6 +72,7 @@ pub async fn run(args: Vec<String>) -> i32 {
         return 2;
     }
     let result = match args[0].as_str() {
+        "login" => run_login(&args[1..]).await,
         "information" => run_information(&args[1..]).await,
         "preview-nodes" => run_preview_nodes(&args[1..]).await,
         "refresh-nodes" => run_control(&args[1..], crate::control::Command::RefreshNodes).await,
@@ -97,6 +103,69 @@ pub async fn run(args: Vec<String>) -> i32 {
             1
         }
     }
+}
+
+async fn run_login(args: &[String]) -> Result<()> {
+    let default = default_proxy_config_path()?;
+    let flags = parse_flags(args, &[("config", true), ("output", true)])?;
+    let config_path = flag_path(&flags, "config", &default);
+    let output = flags
+        .get("output")
+        .and_then(|value| value.as_ref())
+        .map(PathBuf::from)
+        .ok_or_else(|| UsageError("--output is required".to_owned()))?;
+    let content = crate::config::read_proxy_config(&config_path)?;
+    let service = crate::config::proxy_config_from_bytes(&content)?;
+    let content = std::str::from_utf8(&content).context("read proxy config")?;
+    let template = replace_config_token(content, &service.runtime.access_token, "pending")?;
+    let network = service_network(service.outbound_ip);
+    let client = api_client(&service.runtime, &network).await?;
+    // Reserve a private destination before the mutation (reject existing files/symlinks).
+    let mut file = create_exclusive(&output)?;
+    let token = match client.rebind_token().await {
+        Ok(token) => token,
+        Err(error) => {
+            drop(file);
+            let _ = fs::remove_file(&output);
+            return Err(error.context("Helper login failed; no automatic retry was made"));
+        }
+    };
+    let updated = replace_config_token(&template, "pending", &token)?;
+    file.write_all(updated.as_bytes())
+        .context("save Helper login config; server may already have issued a new token")?;
+    file.sync_all().context("sync Helper login config")?;
+    println!(
+        "Wrote oixCloud Helper config to {}; the running service is unchanged",
+        output.display()
+    );
+    Ok(())
+}
+
+fn replace_config_token(content: &str, expected: &str, token: &str) -> Result<String> {
+    let mut found = false;
+    let mut updated = String::with_capacity(content.len() + token.len());
+    for line in content.lines() {
+        if !line.trim_start().starts_with('#')
+            && line
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "token")
+        {
+            let (_, current) = line.split_once('=').unwrap();
+            if found || current.trim() != expected {
+                bail!("proxy config changed while preparing login");
+            }
+            found = true;
+            updated.push_str("token=");
+            updated.push_str(token);
+        } else {
+            updated.push_str(line);
+        }
+        updated.push('\n');
+    }
+    if !found {
+        bail!("proxy config requires token");
+    }
+    Ok(updated)
 }
 
 fn run_version(args: &[String]) -> Result<()> {
@@ -1004,7 +1073,7 @@ fn flag_path(flags: &HashMap<String, Option<String>>, name: &str, default: &Path
         .unwrap_or_else(|| default.to_owned())
 }
 
-fn write_exclusive(path: &Path, content: &[u8]) -> Result<()> {
+fn create_exclusive(path: &Path) -> Result<fs::File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -1012,9 +1081,13 @@ fn write_exclusive(path: &Path, content: &[u8]) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options
+    options
         .open(path)
-        .with_context(|| format!("create output file {}", path.display()))?;
+        .with_context(|| format!("create output file {}", path.display()))
+}
+
+fn write_exclusive(path: &Path, content: &[u8]) -> Result<()> {
+    let mut file = create_exclusive(path)?;
     file.write_all(content)?;
     file.sync_all()?;
     Ok(())
@@ -1322,6 +1395,45 @@ fn format_duration(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_login_preserves_settings_and_comments_and_detects_token_changes() {
+        let content = "# token=comment\r\n token = old-token \r\nlisten=127.0.0.1:6174\r\nnode-filter-include=Hong Kong\r\n";
+        let updated = replace_config_token(content, "old-token", "helper-token").unwrap();
+        assert_eq!(
+            updated,
+            "# token=comment\ntoken=helper-token\nlisten=127.0.0.1:6174\nnode-filter-include=Hong Kong\n"
+        );
+        assert!(replace_config_token(content, "other-account", "helper-token").is_err());
+        assert!(replace_config_token("# token=comment\n", "old-token", "helper-token").is_err());
+        assert!(
+            replace_config_token(
+                "token=old-token\ntoken=old-token\n",
+                "old-token",
+                "helper-token"
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn helper_login_existing_destination_is_rejected_before_api_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.conf");
+        write_exclusive(&path, b"token=test\napi-base-url=https://127.0.0.1:9\n").unwrap();
+        let args = vec![
+            "--config".to_owned(),
+            path.to_str().unwrap().to_owned(),
+            "--output".to_owned(),
+            path.to_str().unwrap().to_owned(),
+        ];
+        let error = run_login(&args).await.unwrap_err();
+        assert!(format!("{error:#}").contains("create output file"));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "token=test\napi-base-url=https://127.0.0.1:9\n"
+        );
+    }
 
     fn node(name: &str) -> Proxy {
         let yaml = format!(

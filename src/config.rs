@@ -117,9 +117,16 @@ pub fn default_proxy_config_path() -> Result<PathBuf> {
 }
 
 pub fn load_proxy_config(path: &Path) -> Result<ProxyConfig> {
+    proxy_config_from_bytes(&read_proxy_config(path)?)
+}
+
+pub(crate) fn read_proxy_config(path: &Path) -> Result<Vec<u8>> {
     require_private_file(path, false).context("validate proxy config permissions")?;
-    let content = read_limited(path, MAX_PROXY_CONFIG_BYTES, "proxy config")?;
-    let values = parse_proxy_config(&content)?;
+    read_limited(path, MAX_PROXY_CONFIG_BYTES, "proxy config")
+}
+
+pub(crate) fn proxy_config_from_bytes(content: &[u8]) -> Result<ProxyConfig> {
+    let values = parse_proxy_config(content)?;
     let token = values
         .get("token")
         .filter(|value| !value.is_empty())

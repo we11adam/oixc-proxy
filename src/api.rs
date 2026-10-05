@@ -16,12 +16,15 @@ use crate::network::NetworkSnapshot;
 
 pub const MANAGED_NODES_PATH: &str = "/api/v1/managed/anywhere/direct";
 pub const INFORMATION_PATH: &str = "/api/v1/information";
+pub const TOKEN_REBIND_PATH: &str = "/api/v1/token/rebind";
+pub const HEADER_CLIENT: &str = "X-oixCloud-Client";
+pub const CLIENT_ID: &str = "oixcloud-helper";
 pub const HEADER_TIMESTAMP: &str = "X-Anywhere-Timestamp";
 pub const HEADER_SIGNATURE: &str = "X-Anywhere-Signature";
 pub const HEADER_AGE_PUBKEY: &str = "X-Anywhere-Age-Pubkey";
 pub const HEADER_RESPONSE_SIGNATURE: &str = "X-Anywhere-Response-Signature";
 const MAX_RESPONSE_BYTES: usize = 8 << 20;
-const USER_AGENT: &str = concat!("oixc-proxy/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str = "oixCloud Helper";
 type HmacSha256 = Hmac<Sha256>;
 
 pub struct ManagedResponse {
@@ -77,10 +80,16 @@ impl Client {
         if timeout.is_zero() || timeout > Duration::from_secs(120) {
             bail!("timeout must be between 1ns and 2m");
         }
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            HEADER_CLIENT,
+            reqwest::header::HeaderValue::from_static(CLIENT_ID),
+        );
         let mut builder = HttpClient::builder()
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
+            .default_headers(headers)
             .user_agent(USER_AGENT);
         if let Some(network) = network {
             if let Some(source) = network
@@ -161,6 +170,30 @@ impl Client {
             self.information_at(endpoint, budget)
         })
         .await
+    }
+
+    /// Explicit token import/login: obtain a token owned by oixCloud Helper.
+    /// Never retry this mutation: a lost response may already have issued a token.
+    pub async fn rebind_token(&self) -> Result<String> {
+        let mut endpoint = self.base_url.clone();
+        endpoint.set_path(TOKEN_REBIND_PATH);
+        endpoint.set_query(None);
+        endpoint.set_fragment(None);
+        tokio::time::timeout(self.timeout, async {
+            let response = self
+                .http
+                .post(endpoint)
+                .header("Accept", "application/json")
+                .bearer_auth(&self.access_token)
+                .send()
+                .await
+                .context("perform token rebind request")?;
+            ensure_success(response.status(), retry_after_seconds(&response))?;
+            let body = read_limited_response(response).await?;
+            parse_rebound_token(&body)
+        })
+        .await
+        .unwrap_or_else(|_| Err(api_failure(ErrorKind::Timeout, None)))
     }
 
     async fn information_at(&self, endpoint: Url, budget: Duration) -> Result<Vec<u8>> {
@@ -270,6 +303,36 @@ impl Client {
             .and_then(crate::subscription::UserInfo::parse);
         Ok(ManagedResponse { config, userinfo })
     }
+}
+
+fn parse_rebound_token(body: &[u8]) -> Result<String> {
+    #[derive(Deserialize)]
+    struct Response {
+        ret: i32,
+        data: Option<Data>,
+    }
+    #[derive(Deserialize)]
+    struct Data {
+        token: String,
+    }
+    let response: Response =
+        serde_json::from_slice(body).map_err(|_| api_failure(ErrorKind::InvalidResponse, None))?;
+    if response.ret != 200 {
+        return Err(api_failure(
+            http_error_kind(u16::try_from(response.ret).unwrap_or(0)),
+            u16::try_from(response.ret).ok(),
+        ));
+    }
+    let token = response.data.map(|data| data.token).unwrap_or_default();
+    let token = token.trim();
+    if token.is_empty()
+        || token
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || !byte.is_ascii_graphic())
+    {
+        return Err(api_failure(ErrorKind::InvalidResponse, None));
+    }
+    Ok(token.to_owned())
 }
 
 fn retryable(error: &anyhow::Error) -> bool {
@@ -408,6 +471,106 @@ fn describe_json_fields(body: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn mock_response(status: u16, body: &str) -> (Url, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let body = body.to_owned();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let mut chunk = [0; 1024];
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&chunk[..count]);
+                assert!(bytes.len() < 16384);
+                if bytes.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 {status} Mock\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8(bytes).unwrap()
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn helper_identity_and_token_import_match_official_wire_format() {
+        for operation in ["information", "managed", "rebind"] {
+            let (url, request) =
+                mock_response(200, r#"{"ret":200,"data":{"token":" helper-token "}}"#).await;
+            let mut client = fallback_client();
+            // Only the test bypasses production HTTPS URL validation.
+            client.base_url = url;
+            client.fallback_urls.clear();
+            match operation {
+                "information" => {
+                    client.information().await.unwrap();
+                }
+                "managed" => {
+                    assert!(client.fetch_managed().await.is_err());
+                }
+                _ => {
+                    assert_eq!(client.rebind_token().await.unwrap(), "helper-token");
+                }
+            }
+            let request = request.await.unwrap().to_ascii_lowercase();
+            assert!(request.contains("user-agent: oixcloud helper\r\n"));
+            assert!(request.contains("x-oixcloud-client: oixcloud-helper\r\n"));
+            assert!(request.contains("authorization: bearer token\r\n"));
+            if operation == "rebind" {
+                assert!(request.starts_with("post /api/v1/token/rebind http/1.1\r\n"));
+                assert!(request.ends_with("\r\n\r\n"));
+                assert!(!request.contains("content-type:"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn token_import_never_retries_or_uses_backup() {
+        let (url, request) = mock_response(503, "private-server-message").await;
+        let backup = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = fallback_client();
+        client.base_url = url;
+        client.fallback_urls =
+            vec![Url::parse(&format!("http://{}", backup.local_addr().unwrap())).unwrap()];
+        let error = client.rebind_token().await.unwrap_err();
+        assert_eq!(crate::diagnostics::classify(&error), ErrorKind::Server);
+        assert!(!format!("{error:#}").contains("private-server-message"));
+        request.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), backup.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn token_import_rejects_invalid_or_missing_tokens_without_disclosure() {
+        for body in [
+            r#"{"ret":200}"#,
+            r#"{"ret":200,"data":{"token":" "}}"#,
+            r#"{"ret":200,"data":{"token":123}}"#,
+            r#"{"ret":200,"data":{"token":"secret\nlisten=0.0.0.0:80"}}"#,
+            r#"{"ret":200,"token":"secret"}"#,
+            "secret",
+        ] {
+            let error = parse_rebound_token(body.as_bytes()).unwrap_err();
+            assert_eq!(
+                crate::diagnostics::classify(&error),
+                ErrorKind::InvalidResponse
+            );
+            assert!(!format!("{error:#}").contains("secret"));
+        }
+        let error = parse_rebound_token(br#"{"ret":403,"msg":"private"}"#).unwrap_err();
+        assert_eq!(crate::diagnostics::classify(&error), ErrorKind::Forbidden);
+    }
 
     fn fallback_client() -> Client {
         Client::new(
