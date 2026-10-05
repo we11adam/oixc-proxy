@@ -166,6 +166,7 @@ impl EchDialer {
             .with_root_certificates(trust.roots.clone())
             .with_no_client_auth();
         config.alpn_protocols = vec![self.alpn.clone()];
+        config.ech_outer_alpn_protocols = Some(vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
         let config = Arc::new(config);
         *cached = Some(CachedTlsConfig {
             generation: trust.generation,
@@ -527,6 +528,81 @@ fn validate_profile(proxy: &Proxy) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_hello_hides_snell_alpn_and_preserves_inner_offer() {
+        use rustls::crypto::hpke::EncapsulatedSecret;
+        use rustls::internal::msgs::codec::Reader;
+        use rustls::internal::msgs::handshake::EchConfigPayload;
+        let list = base64::engine::general_purpose::STANDARD
+            .decode(crate::nodes::TEST_ECH_CONFIG)
+            .unwrap();
+        let mut configs = Vec::<EchConfigPayload>::read(&mut Reader::init(&list)).unwrap();
+        let EchConfigPayload::V18(contents) = &mut configs[0] else {
+            panic!("expected ECH config")
+        };
+        let hpke = rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES
+            .iter()
+            .find(|hpke| {
+                hpke.suite().kem == contents.key_config.kem_id
+                    && hpke.suite().sym == contents.key_config.symmetric_cipher_suites[0]
+            })
+            .unwrap();
+        let (public, private) = hpke.generate_key_pair().unwrap();
+        contents.key_config.public_key = rustls::internal::msgs::base::PayloadU16::new(public.0);
+        let mut info = b"tls ech\0".to_vec();
+        configs[0].encode(&mut info);
+        let ech = ech_config_from_list(configs.get_encoding()).unwrap();
+        let mut config = ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_ech(EchMode::Enable(ech))
+        .unwrap()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+        config.alpn_protocols = vec![b"snell-ech/1".to_vec()];
+        config.ech_outer_alpn_protocols = Some(vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+        let mut connection = rustls::ClientConnection::new(
+            Arc::new(config),
+            ServerName::try_from("inner.example.com").unwrap(),
+        )
+        .unwrap();
+        let mut wire = Vec::new();
+        connection.write_tls(&mut wire).unwrap();
+        assert!(!wire.windows(11).any(|p| p == b"snell-ech/1"));
+        assert!(!wire.windows(17).any(|p| p == b"inner.example.com"));
+        assert!(wire.windows(8).any(|p| p == b"http/1.1"));
+        assert!(wire.windows(2).any(|p| p == b"h2"));
+
+        // Reconstruct ClientHelloOuterAAD and decrypt with our synthetic server key.
+        let mut aad = wire[9..].to_vec();
+        let mut offset = 35 + usize::from(aad[34]);
+        let len = usize::from(u16::from_be_bytes([aad[offset], aad[offset + 1]]));
+        offset += 2 + len;
+        offset += 1 + usize::from(aad[offset]);
+        offset += 2; // extension list length
+        loop {
+            let kind = u16::from_be_bytes([aad[offset], aad[offset + 1]]);
+            let len = usize::from(u16::from_be_bytes([aad[offset + 2], aad[offset + 3]]));
+            offset += 4;
+            if kind == 0xfe0d {
+                break;
+            }
+            offset += len;
+        }
+        offset += 6; // outer discriminator, cipher suite, config id
+        let enc_len = usize::from(u16::from_be_bytes([aad[offset], aad[offset + 1]]));
+        offset += 2;
+        let enc = EncapsulatedSecret(aad[offset..offset + enc_len].to_vec());
+        offset += enc_len;
+        let payload_len = usize::from(u16::from_be_bytes([aad[offset], aad[offset + 1]]));
+        offset += 2;
+        let ciphertext = aad[offset..offset + payload_len].to_vec();
+        aad[offset..offset + payload_len].fill(0);
+        let inner = hpke.open(&enc, &info, &aad, &ciphertext, &private).unwrap();
+        assert!(inner.windows(11).any(|p| p == b"snell-ech/1"));
+        assert!(!inner.windows(8).any(|p| p == b"http/1.1"));
+    }
 
     #[test]
     fn parses_only_supported_ech_config_lists() {

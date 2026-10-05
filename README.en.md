@@ -355,6 +355,10 @@ ECH-TLS (`rustls`); no third-party Snell implementation is used.
 
 ## Development checks
 
+The ECH outer ClientHello advertises `h2` / `http/1.1`; the real `snell-ech/1`
+ALPN is confined to the encrypted inner hello. A small [rustls patch](vendor/README.md)
+provides separate ALPN settings while retaining certificate verification and mandatory ECH.
+
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings

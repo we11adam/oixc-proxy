@@ -42,6 +42,9 @@ aes-gcm = "0.10.3"
 tempfile = "3.23.0"
 tokio = { version = "1.48.0", features = ["full", "test-util"] }
 
+[patch.crates-io]
+rustls = { path = "vendor/rustls" }
+
 [profile.release]
 codegen-units = 1
 lto = "fat"

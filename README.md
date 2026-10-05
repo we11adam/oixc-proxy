@@ -231,6 +231,8 @@ Surge / Clash provider
 
 所有节点 dialer 共用一个系统根证书库、密码学 provider 和签名 DNS 缓存。冷启动的签名 DNS A/AAAA 查询会并发执行，并按 host 合并相同请求；TCP 地址尝试使用错峰 Happy Eyeballs 竞争，并记住节点上次成功的地址。
 
+ECH 外层 ClientHello 使用 `h2` / `http/1.1`，真实的 `snell-ech/1` ALPN 仅位于加密内层。仓库内保留了范围很小的 [rustls 补丁](vendor/README.md)，证书验证和强制 ECH 策略保持启用。
+
 密码学和协议层均在本仓库实现。Rust crate 提供基础原语（`argon2`、`aes-gcm`、`hmac`、`sha2`）、age 和 ECH-TLS（`rustls`）；项目没有使用第三方 Snell 实现。
 
 ## 开发检查
