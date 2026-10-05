@@ -238,6 +238,25 @@ Changes to `listen`, `nodelist-listen`, `outbound-ip`, `udp-port-range` or
 `udp-advertise-address` require a restart and reject the entire reload. Both
 commands use the private control socket and only support `serve`.
 
+Export a sanitized bundle while preserving the running process:
+
+```sh
+oixc-proxy diagnose --output diagnostics.json
+sudo oixc-proxy diagnose --config /path/to/oixc-proxy.conf --output diagnostics.json
+```
+
+The JSON file is created with mode `0600` and must not exist. It contains running
+build/version/PID information, service start time, the active configuration
+summary, catalog/TLS-root/anonymous node status, the last 128 refresh/reload events
+and each node's last 16 ECH dial events. Events contain only timestamps, fixed
+types, error categories and failure stages; `error: null` means success.
+Raw logs/config files, tokens, PSKs, API/upstream/destination addresses, local IPs,
+interface names, paths, node names and filter patterns are excluded. `node-1` IDs
+are local to the bundle and may change between exports. Export still works when
+the on-disk config is invalid and reports the configuration actually in use.
+It does not restart, probe or refresh; it waits behind any ongoing serialized
+management operation. Only `serve` supports this command.
+
 Manual refresh updates the running `serve`
 instance without restarting. The command uses a private mode-0600 Unix socket
 beside the config; run it as the service user (`sudo` for a root service).

@@ -220,4 +220,41 @@ async fn isolated_service_publishes_metadata_status_and_filtered_preview() {
         .await
         .unwrap();
     assert_eq!(retained["nodes"], reloaded["payload"]["nodes"]);
+    let output_path = directory.path().join("diagnostics.json");
+    let diagnosed = Command::new(&binary)
+        .args(["diagnose", "--config"])
+        .arg(&config_path)
+        .arg("--output")
+        .arg(&output_path)
+        .output()
+        .unwrap();
+    assert!(diagnosed.status.success());
+    let bytes = std::fs::read(&output_path).unwrap();
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    assert!(!text.contains(&config.runtime.access_token));
+    assert!(!text.contains(config.runtime.api_base_url.as_str()));
+    assert!(!text.contains(directory.path().to_str().unwrap()));
+    for node in retained["nodes"].as_array().unwrap() {
+        assert!(!text.contains(node["name"].as_str().unwrap()));
+    }
+    let bundle: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(bundle["schema_version"], 1);
+    assert_eq!(bundle["status"]["ready"], true);
+    assert_eq!(bundle["active_config"]["filter"], "custom");
+    assert!(
+        bundle["service"]["recent_events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["kind"] == "config_reload" && !event["error"].is_null())
+    );
+    let denied = Command::new(&binary)
+        .args(["diagnose", "--config"])
+        .arg(&config_path)
+        .arg("--output")
+        .arg(&output_path)
+        .output()
+        .unwrap();
+    assert!(!denied.status.success());
+    assert_eq!(std::fs::read(&output_path).unwrap(), bytes);
 }

@@ -195,6 +195,14 @@ struct NodeState {
     last_timings: Option<DialTimings>,
     last_failure_stage: Option<DialStage>,
     samples: VecDeque<u64>,
+    events: VecDeque<DialEvent>,
+}
+
+#[derive(Serialize)]
+struct DialEvent {
+    at: u64,
+    error: Option<ErrorKind>,
+    stage: Option<DialStage>,
 }
 
 #[derive(Default)]
@@ -203,6 +211,18 @@ pub struct NodeDiagnostics(Mutex<NodeState>);
 impl NodeDiagnostics {
     pub fn record(&self, result: Result<(), &anyhow::Error>, timings: DialTimings) {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.events.len() == 16 {
+            state.events.pop_front();
+        }
+        state.events.push_back(DialEvent {
+            at: unix_now(),
+            error: result.as_ref().err().map(|error| classify(error)),
+            stage: if result.is_err() {
+                timings.last_stage
+            } else {
+                None
+            },
+        });
         match result {
             Ok(()) => {
                 state.dials.succeeded += 1;
@@ -245,8 +265,155 @@ impl NodeDiagnostics {
         serde_json::json!({"health":health, "ech_dials":state.dials,
             "consecutive_failures":state.consecutive_failures, "last_timings":state.last_timings,
             "last_failure_stage":state.last_failure_stage,
-            "successful_latency_ms":{"samples":samples.len(),"p50":percentile(50),"p95":percentile(95)}})
+            "successful_latency_ms":{"samples":samples.len(),"p50":percentile(50),"p95":percentile(95)},
+            "recent_events":state.events})
     }
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    CatalogRefresh,
+    ConfigReload,
+}
+
+#[derive(Serialize)]
+struct ServiceEvent {
+    at: u64,
+    kind: EventKind,
+    error: Option<ErrorKind>,
+}
+
+pub struct EventLog {
+    started_at: u64,
+    events: Mutex<VecDeque<ServiceEvent>>,
+}
+
+impl Default for EventLog {
+    fn default() -> Self {
+        Self {
+            started_at: unix_now(),
+            events: Mutex::new(VecDeque::new()),
+        }
+    }
+}
+
+impl EventLog {
+    pub fn record(&self, kind: EventKind, error: Option<&anyhow::Error>) {
+        let mut events = self.events.lock().unwrap_or_else(PoisonError::into_inner);
+        if events.len() == 128 {
+            events.pop_front();
+        }
+        events.push_back(ServiceEvent {
+            at: unix_now(),
+            kind,
+            error: error.map(classify),
+        });
+    }
+    pub fn snapshot(&self) -> serde_json::Value {
+        let events = self.events.lock().unwrap_or_else(PoisonError::into_inner);
+        serde_json::json!({"started_at":self.started_at,
+            "uptime_seconds":unix_now().saturating_sub(self.started_at), "recent_events":*events})
+    }
+}
+
+/// Positive field selection: new status fields must opt into bundle export.
+fn select_fields(value: &serde_json::Value, keys: &[&str]) -> serde_json::Value {
+    serde_json::Value::Object(
+        keys.iter()
+            .filter_map(|key| value.get(*key).map(|v| ((*key).to_owned(), v.clone())))
+            .collect(),
+    )
+}
+
+pub fn bundle_status(status: &serde_json::Value) -> serde_json::Value {
+    let mut safe = select_fields(status, &["ready", "total_nodes", "published_nodes"]);
+    safe["catalog"] = select_fields(
+        &status["catalog"],
+        &[
+            "started_from_cache",
+            "last_attempt_at",
+            "last_success_at",
+            "last_error",
+            "refresh_failures",
+            "cache_age_seconds",
+        ],
+    );
+    const DIAL_KEYS: &[&str] = &[
+        "succeeded",
+        "failed",
+        "failures_by_kind",
+        "last_error",
+        "last_success_at",
+        "last_failure_at",
+    ];
+    safe["transport"] = serde_json::json!({
+        "network":select_fields(&status["transport"]["network"], &["generation", "mode"]),
+        "tls_roots":select_fields(&status["transport"]["tls_roots"], &["count", "generation", "last_load_complete", "auto_reload_pending"]),
+        "ech_dials":select_fields(&status["transport"]["ech_dials"], DIAL_KEYS),
+    });
+    safe["nodes"] = serde_json::Value::Array(
+        status["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(index, node)| {
+                let transport = &node["transport"];
+                let mut data = select_fields(
+                    transport,
+                    &["health", "consecutive_failures", "last_failure_stage"],
+                );
+                data["ech_dials"] = select_fields(&transport["ech_dials"], DIAL_KEYS);
+                data["last_timings"] = if transport["last_timings"].is_null() {
+                    serde_json::Value::Null
+                } else {
+                    select_fields(
+                        &transport["last_timings"],
+                        &["dns_ms", "tcp_ms", "tls_ms", "total_ms"],
+                    )
+                };
+                data["successful_latency_ms"] = select_fields(
+                    &transport["successful_latency_ms"],
+                    &["samples", "p50", "p95"],
+                );
+                data["recent_events"] = serde_json::Value::Array(
+                    transport["recent_events"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|event| select_fields(event, &["at", "error", "stage"]))
+                        .collect(),
+                );
+                serde_json::json!({"id":format!("node-{}",index+1),"transport":data})
+            })
+            .collect(),
+    );
+    safe
+}
+
+pub fn config_summary(
+    config: &crate::config::ProxyConfig,
+    disable_filter: bool,
+) -> serde_json::Value {
+    let runtime = &config.runtime;
+    serde_json::json!({
+        "remote_listener":!config.listen.ip().is_loopback(),
+        "pinned_egress":!config.outbound_ip.is_loopback(),
+        "fixed_udp_port_count":config.udp_port_range.map(|range| range.port_count()),
+        "api_fallback_count":runtime.api_fallback_urls.len(),
+        "filter":if disable_filter { "disabled" } else if runtime.node_filter.is_custom() { "custom" } else { "default" },
+        "request_timeout_ms":runtime.request_timeout.as_millis(),
+        "tcp_idle_timeout_ms":runtime.tcp_idle_timeout.as_millis(),
+        "udp_idle_timeout_ms":runtime.udp_idle_timeout.as_millis(),
+        "node_refresh_interval_ms":config.node_refresh_interval.as_millis(),
+        "max_client_connections":runtime.max_client_connections,
+        "dial_concurrency":runtime.dial_concurrency,
+        "per_node_dial_concurrency":runtime.per_node_dial_concurrency,
+        "reuse_max_idle":runtime.reuse_max_idle,"reuse_max_uses":runtime.reuse_max_uses,
+        "reuse_idle_timeout_ms":runtime.reuse_idle_timeout.as_millis(),
+        "perf_trace_sample_every":runtime.perf_trace_sample_every,
+    })
 }
 
 #[cfg(test)]
@@ -280,6 +447,36 @@ mod tests {
         assert_eq!(value["successful_latency_ms"]["samples"], 64);
         assert_eq!(value["successful_latency_ms"]["p50"], 68);
         assert_eq!(value["successful_latency_ms"]["p95"], 97);
+        assert_eq!(value["recent_events"].as_array().unwrap().len(), 16);
+    }
+
+    #[test]
+    fn bundle_uses_an_allowlist_and_events_never_store_error_text() {
+        let secret = "SECRET_TOKEN_HOST_PATH_NODE";
+        let status = serde_json::json!({"ready":true,"token":secret,
+            "catalog":{"refresh_failures":1,"raw_error":secret},
+            "transport":{"network":{"generation":"3","mode":"automatic","ipv4":secret,"interface":secret},
+                "tls_roots":{"count":42,"path":secret},"ech_dials":{"failed":1,"extra":secret}},
+            "nodes":[{"name":secret,"server":secret,"transport":{"health":"degraded",
+                "last_timings":{"total_ms":10,"address":secret},"psk":secret,
+                "recent_events":[{"at":1,"error":"timeout","stage":"tcp","message":secret}]}}]});
+        let bundle = bundle_status(&status);
+        assert!(!bundle.to_string().contains(secret));
+        assert_eq!(bundle["nodes"][0]["id"], "node-1");
+        assert_eq!(bundle["transport"]["tls_roots"]["count"], 42);
+        assert_eq!(
+            bundle["nodes"][0]["transport"]["recent_events"][0]["error"],
+            "timeout"
+        );
+        let events = EventLog::default();
+        let error = anyhow::anyhow!("{secret}");
+        for _ in 0..200 {
+            events.record(EventKind::ConfigReload, Some(&error));
+        }
+        let snapshot = events.snapshot();
+        assert_eq!(snapshot["recent_events"].as_array().unwrap().len(), 128);
+        assert!(!snapshot.to_string().contains(secret));
+        assert_eq!(snapshot["recent_events"][0]["kind"], "config_reload");
     }
 
     #[test]

@@ -32,6 +32,7 @@ const USAGE: &str = "Usage:
   oixc-proxy preview-nodes [--config PATH] [--refresh] [--disable-node-filter]
   oixc-proxy refresh-nodes [--config PATH]
   oixc-proxy reload-config [--config PATH]
+  oixc-proxy diagnose [--config PATH] --output PATH
   oixc-proxy serve [--config PATH] [--disable-node-filter]
   oixc-proxy serve-map [--token-file PATH] [--listen IP] [--base-port PORT] [--disable-node-filter]
   oixc-proxy version
@@ -70,6 +71,7 @@ pub async fn run(args: Vec<String>) -> i32 {
         "preview-nodes" => run_preview_nodes(&args[1..]).await,
         "refresh-nodes" => run_control(&args[1..], crate::control::Command::RefreshNodes).await,
         "reload-config" => run_control(&args[1..], crate::control::Command::ReloadConfig).await,
+        "diagnose" => run_diagnose(&args[1..]).await,
         "serve" => run_serve(&args[1..]).await,
         "serve-map" => run_serve_map(&args[1..]).await,
         "install-launch-agent" => run_install_launch_agent(&args[1..]),
@@ -181,6 +183,28 @@ async fn run_control(args: &[String], command: crate::control::Command) -> Resul
     Ok(())
 }
 
+async fn run_diagnose(args: &[String]) -> Result<()> {
+    let default = default_proxy_config_path()?;
+    let flags = parse_flags(args, &[("config", true), ("output", true)])?;
+    let output = flags
+        .get("output")
+        .and_then(|v| v.as_ref())
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| UsageError("diagnose requires --output PATH".to_owned()))?;
+    let response = crate::control::send(
+        &flag_path(&flags, "config", &default),
+        crate::control::Command::Diagnostics,
+    )
+    .await?;
+    if !response.ok {
+        bail!("diagnostic export failed");
+    }
+    write_exclusive(&output, &serde_json::to_vec_pretty(&response.payload)?)?;
+    println!("Diagnostic bundle written to {}", output.display());
+    Ok(())
+}
+
 struct CatalogService {
     service: crate::config::ProxyConfig,
     managed: ManagedConfig,
@@ -190,10 +214,32 @@ struct CatalogService {
     context: GatewayContext,
     manager: Arc<GatewayManager>,
     disable_filter: bool,
+    events: crate::diagnostics::EventLog,
 }
 
 impl CatalogService {
+    async fn bundle(&self) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version":1, "collected_at":crate::diagnostics::unix_now(),
+            "process":{"version":crate::VERSION,"commit":env!("OIXC_COMMIT_ID"),
+                "build_time":env!("OIXC_BUILD_TIME"), "os":std::env::consts::OS,
+                "arch":std::env::consts::ARCH,"pid":std::process::id()},
+            "active_config":crate::diagnostics::config_summary(&self.service,self.disable_filter),
+            "status":crate::diagnostics::bundle_status(&self.manager.status().await),
+            "service":self.events.snapshot(),
+        })
+    }
+
     async fn reload(&mut self, path: &Path) -> Result<()> {
+        let result = self.reload_inner(path).await;
+        self.events.record(
+            crate::diagnostics::EventKind::ConfigReload,
+            result.as_ref().err(),
+        );
+        result
+    }
+
+    async fn reload_inner(&mut self, path: &Path) -> Result<()> {
         let next = load_proxy_config(path)
             .map_err(|_| anyhow::anyhow!("invalid configuration; active configuration retained"))?;
         if next.listen != self.service.listen
@@ -252,6 +298,10 @@ impl CatalogService {
         self.manager.refresh_started();
         let result = self.refresh_inner().await;
         self.manager.refresh_finished(result.as_ref().err());
+        self.events.record(
+            crate::diagnostics::EventKind::CatalogRefresh,
+            result.as_ref().err(),
+        );
         if let Err(error) = &result {
             if matches!(
                 crate::diagnostics::classify(error),
@@ -309,6 +359,7 @@ async fn run_serve(args: &[String]) -> Result<()> {
     let config_path = flag_path(&flags, "config", &default);
     let disable_node_filter = flags.contains_key("disable-node-filter");
     let service = load_proxy_config(&config_path)?;
+    let events = crate::diagnostics::EventLog::default();
     crate::perftrace::configure(service.runtime.perf_trace_sample_every);
     let network = service_network(service.outbound_ip);
     let cache = CatalogCache::beside_config(&config_path, &service.runtime.access_token);
@@ -409,6 +460,7 @@ async fn run_serve(args: &[String]) -> Result<()> {
         context: gateway_context,
         manager: manager.clone(),
         disable_filter: disable_node_filter,
+        events,
     };
     loop {
         let request = tokio::select! {
@@ -427,6 +479,19 @@ async fn run_serve(args: &[String]) -> Result<()> {
             .as_ref()
             .is_some_and(|request| request.reply.is_closed())
         {
+            continue;
+        }
+        if request
+            .as_ref()
+            .is_some_and(|r| matches!(r.command, crate::control::Command::Diagnostics))
+        {
+            if let Some(request) = request {
+                let response = crate::control::Response::success(
+                    "sanitized diagnostic bundle",
+                    catalog.bundle().await,
+                );
+                let _ = request.reply.send(response);
+            }
             continue;
         }
         let reloading = request
@@ -1410,6 +1475,7 @@ mod tests {
             context,
             manager: manager.clone(),
             disable_filter: false,
+            events: crate::diagnostics::EventLog::default(),
         };
         assert!(catalog.refresh().await.is_err());
         assert!(Arc::ptr_eq(&previous, &manager.current().await.unwrap()));
@@ -1425,6 +1491,20 @@ mod tests {
             assert!(Arc::ptr_eq(&previous, &manager.current().await.unwrap()));
             assert_eq!(catalog.service.runtime.access_token, "test");
             assert_eq!(catalog.cache.load().unwrap(), managed);
+            let bundle = catalog.bundle().await;
+            assert_eq!(bundle["active_config"]["request_timeout_ms"], 100);
+            assert_eq!(bundle["status"]["nodes"][0]["id"], "node-1");
+            let serialized = bundle.to_string();
+            for private in [
+                "香港 Fusion 01",
+                "https://127.0.0.1:9",
+                "new-account",
+                "unknown-key",
+                "\"test\"",
+            ] {
+                assert!(!serialized.contains(private));
+            }
+            assert!(!serialized.contains(&directory.path().to_string_lossy().to_string()));
         }
         std::fs::write(&path, "token=test\napi-base-url=https://127.0.0.1:9\nrequest-timeout=200ms\nnode-filter-lines=Fusion\nmax-client-connections=2\ndial-concurrency=3\nper-node-dial-concurrency=2\ntcp-idle-timeout=2m\nnode-refresh-interval=2m\n").unwrap();
         catalog.reload(&path).await.unwrap();
@@ -1489,6 +1569,23 @@ mod tests {
             .unwrap();
         assert_eq!(updated.tcp_idle_timeout, Duration::from_secs(120));
         drop(third);
+    }
+
+    #[test]
+    fn diagnostic_output_is_private_and_refuses_overwrites() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("diagnostics.json");
+        write_exclusive(&output, b"{}").unwrap();
+        assert!(write_exclusive(&output, b"replacement").is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"{}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]

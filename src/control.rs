@@ -20,6 +20,7 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(180);
 pub enum Command {
     RefreshNodes,
     ReloadConfig,
+    Diagnostics,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
