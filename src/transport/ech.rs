@@ -21,6 +21,7 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
 use crate::catalog_refresh::CatalogRefresh;
+use crate::diagnostics::{DialStage, DialTimings, NodeDiagnostics};
 use crate::network::{NetworkMonitor, NetworkSnapshot};
 use crate::nodes::Proxy;
 use crate::snell::Exporter;
@@ -55,6 +56,7 @@ struct CachedTlsConfig {
 
 #[derive(Clone)]
 pub struct EchDialer {
+    pub diagnostics: Arc<NodeDiagnostics>,
     server: String,
     sni: String,
     port: u16,
@@ -113,6 +115,7 @@ impl EchDialer {
         let ech = parse_ech_config(&proxy.obfs.ech_config)?;
         Ok(Self {
             server: proxy.server.clone(),
+            diagnostics: Arc::new(NodeDiagnostics::default()),
             sni: proxy.obfs.sni.clone(),
             port: proxy.port,
             alpn: proxy.obfs.alpn.as_bytes().to_vec(),
@@ -128,7 +131,8 @@ impl EchDialer {
 
     pub async fn dial(&self) -> Result<EchConnection> {
         let started = Instant::now();
-        let result = timeout(self.timeout, self.dial_inner())
+        let mut timings = DialTimings::default();
+        let result = timeout(self.timeout, self.dial_inner(&mut timings))
             .await
             .unwrap_or_else(|_| {
                 Err(
@@ -136,14 +140,18 @@ impl EchDialer {
                         .into(),
                 )
             });
+        timings.finish();
+        timings.total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.diagnostics
+            .record(result.as_ref().map(|_| ()), timings);
         self.context.diagnostics.record(result.as_ref().map(|_| ()));
         crate::perftrace::stage("ech.dial", started, result.is_ok(), &[]);
         result
     }
 
-    async fn dial_inner(&self) -> Result<EchConnection> {
+    async fn dial_inner(&self, timings: &mut DialTimings) -> Result<EchConnection> {
         let trust = self.context.roots.snapshot().await;
-        match self.dial_with_trust(&trust).await {
+        match self.dial_with_trust(&trust, timings).await {
             Err(error)
                 if error.chain().any(|cause| {
                     cause
@@ -154,7 +162,7 @@ impl EchDialer {
                 let refreshed = self.context.roots.refresh(trust.generation).await;
                 if refreshed.generation != trust.generation {
                     // Retry only the handshake, before any application payload is sent.
-                    self.dial_with_trust(&refreshed).await
+                    self.dial_with_trust(&refreshed, timings).await
                 } else {
                     Err(error)
                 }
@@ -197,8 +205,12 @@ impl EchDialer {
         Ok(config)
     }
 
-    async fn dial_with_trust(&self, trust: &TrustSnapshot) -> Result<EchConnection> {
-        let result = self.dial_once(trust).await;
+    async fn dial_with_trust(
+        &self,
+        trust: &TrustSnapshot,
+        timings: &mut DialTimings,
+    ) -> Result<EchConnection> {
+        let result = self.dial_once(trust, timings).await;
         if result.as_ref().is_err_and(ech_rejected) && self.context.catalog_refresh.request() {
             eprintln!("ech.rejected: requested node catalog refresh");
         }
@@ -211,7 +223,7 @@ impl EchDialer {
                         *ech = Arc::new(retry);
                     }
                     crate::perftrace::event("ech.retry_config", &[]);
-                    self.dial_once(trust).await
+                    self.dial_once(trust, timings).await
                 }
                 None => Err(error),
             },
@@ -219,9 +231,13 @@ impl EchDialer {
         }
     }
 
-    async fn dial_once(&self, trust: &TrustSnapshot) -> Result<EchConnection> {
+    async fn dial_once(
+        &self,
+        trust: &TrustSnapshot,
+        timings: &mut DialTimings,
+    ) -> Result<EchConnection> {
         let tcp_started = Instant::now();
-        let raw = self.dial_tcp().await;
+        let raw = self.dial_tcp(timings).await;
         crate::perftrace::stage("ech.tcp_connect", tcp_started, raw.is_ok(), &[]);
         let (raw, network_generation) = raw?;
         raw.set_nodelay(true).ok();
@@ -229,7 +245,9 @@ impl EchDialer {
             .map_err(|_| anyhow::anyhow!("ECH-TLS server name is invalid"))?;
         let connector = TlsConnector::from(self.config_for(trust)?);
         let handshake_started = Instant::now();
+        timings.start(DialStage::Tls);
         let stream = connector.connect(server_name, raw).await;
+        timings.finish();
         crate::perftrace::stage("ech.tls_handshake", handshake_started, stream.is_ok(), &[]);
         if let Err(error) = &stream {
             // Fixed categories avoid leaking hostnames or certificate contents.
@@ -272,12 +290,13 @@ impl EchDialer {
         self.network.snapshot().await.generation()
     }
 
-    async fn dial_tcp(&self) -> Result<(TcpStream, u64)> {
+    async fn dial_tcp(&self, timings: &mut DialTimings) -> Result<(TcpStream, u64)> {
         let network = self.network.snapshot().await;
         if crate::perftrace::enabled() {
             crate::perftrace::event("network.snapshot", &network.diagnostic_fields());
         }
         let dns_started = Instant::now();
+        timings.start(DialStage::Dns);
         let addresses = match self.resolver.lookup(&self.server, &network).await {
             Ok(Some(addresses)) => Ok(addresses
                 .into_iter()
@@ -286,9 +305,10 @@ impl EchDialer {
             Ok(None) => lookup_host((self.server.as_str(), self.port))
                 .await
                 .map(|addresses| addresses.collect())
-                .map_err(|_| anyhow::anyhow!("resolve ECH-TLS node")),
+                .map_err(|error| anyhow::Error::new(error).context("resolve ECH-TLS node")),
             Err(error) => Err(error),
         };
+        timings.finish();
         crate::perftrace::stage("ech.dns", dns_started, addresses.is_ok(), &[]);
         let addresses = addresses?
             .into_iter()
@@ -317,22 +337,17 @@ impl EchDialer {
                 ],
             );
         }
+        timings.start(DialStage::Tcp);
         let connected = connect_happy_eyeballs(addresses, network.clone()).await;
+        timings.finish();
         if let Err(error) = &connected {
             crate::perftrace::event(
                 "network.connect_error",
                 &[("kind", format!("{:?}", error.kind()))],
             );
         }
-        let (stream, address) = connected.map_err(|error| match error.kind() {
-            io::ErrorKind::ConnectionRefused => {
-                anyhow::anyhow!("ECH-TLS node refused the connection")
-            }
-            io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable => {
-                anyhow::anyhow!("ECH-TLS node network is unreachable")
-            }
-            _ => anyhow::anyhow!("connect to ECH-TLS node"),
-        })?;
+        let (stream, address) = connected
+            .map_err(|error| anyhow::Error::new(error).context("connect to ECH-TLS node"))?;
         if crate::perftrace::enabled() {
             let local = stream.local_addr().ok();
             crate::perftrace::event(
@@ -736,7 +751,10 @@ mod tests {
         let dialer =
             EchDialer::new_with_context(proxy, Duration::from_secs(15), context.clone()).unwrap();
         let before = context.roots.snapshot().await;
-        let error = match dialer.dial_with_trust(&before).await {
+        let error = match dialer
+            .dial_with_trust(&before, &mut DialTimings::default())
+            .await
+        {
             Err(error) => error,
             Ok(_) => panic!("incomplete trust unexpectedly accepted server"),
         };

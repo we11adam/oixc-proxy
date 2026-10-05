@@ -174,4 +174,19 @@ async fn isolated_service_publishes_metadata_status_and_filtered_preview() {
             .unwrap()
             > 0
     );
+    let observed = after["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| {
+            node["transport"]["ech_dials"]["succeeded"]
+                .as_u64()
+                .unwrap()
+                > 0
+        })
+        .unwrap();
+    assert_eq!(observed["transport"]["health"], "healthy");
+    for stage in ["dns_ms", "tcp_ms", "tls_ms", "total_ms"] {
+        assert!(observed["transport"]["last_timings"][stage].is_u64());
+    }
 }

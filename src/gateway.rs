@@ -31,6 +31,7 @@ pub struct Route {
 struct NodeRuntime {
     proxy: Proxy,
     route: Route,
+    diagnostics: Arc<crate::diagnostics::NodeDiagnostics>,
 }
 
 #[derive(Clone)]
@@ -84,6 +85,12 @@ impl GatewayContext {
 }
 
 impl Router {
+    fn node_statuses(&self) -> Vec<serde_json::Value> {
+        let mut nodes: Vec<_> = self.runtimes.iter().collect();
+        nodes.sort_by_key(|(name, _)| *name);
+        nodes.into_iter().map(|(name, node)| serde_json::json!({"name":name,"transport":node.diagnostics.snapshot()})).collect()
+    }
+
     pub fn build(
         proxies: &[Proxy],
         published: &[Proxy],
@@ -124,6 +131,7 @@ impl Router {
                     runtime.request_timeout,
                     context.transport.clone(),
                 )?;
+                let diagnostics = dialer.diagnostics.clone();
                 let client = SnellClient::new_with_node_dial_limit(
                     SnellClientOptions {
                         node_name: proxy.name.clone(),
@@ -142,6 +150,7 @@ impl Router {
                 )?;
                 Arc::new(NodeRuntime {
                     proxy: proxy.clone(),
+                    diagnostics,
                     route: Route {
                         client,
                         udp: proxy.udp,
@@ -278,18 +287,18 @@ impl GatewayManager {
         catalog.cache_age_seconds = catalog
             .last_success_at
             .map(|time| crate::diagnostics::unix_now().saturating_sub(time));
-        let (ready, total, published) = {
+        let (ready, total, published, nodes) = {
             let router = self.router.read().await;
             router
                 .as_ref()
-                .map(|r| (true, r.runtimes.len(), r.published_count))
-                .unwrap_or((false, 0, 0))
+                .map(|r| (true, r.runtimes.len(), r.published_count, r.node_statuses()))
+                .unwrap_or((false, 0, 0, Vec::new()))
         };
         let transport = match &self.transport {
             Some(transport) => transport.status().await,
             None => serde_json::Value::Null,
         };
-        serde_json::json!({"version": crate::VERSION, "ready": ready, "total_nodes": total, "published_nodes": published, "catalog": catalog, "transport": transport})
+        serde_json::json!({"version": crate::VERSION, "ready": ready, "total_nodes": total, "published_nodes": published, "catalog": catalog, "transport": transport, "nodes":nodes})
     }
 
     pub fn new(router: Router) -> Self {

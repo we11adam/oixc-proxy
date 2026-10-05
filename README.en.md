@@ -272,6 +272,14 @@ upstream nodes. HTTP 401/403/407/429 have distinct sanitized error categories,
 and valid `Retry-After` seconds appear in rate-limit errors. Status omits tokens,
 PSKs, node addresses and remote error bodies. Expose it only to trusted networks.
 
+`nodes` reports per-node ECH health (`unobserved`, `healthy`, `degraded`), consecutive
+failures, last DNS/TCP/TLS/total timings in milliseconds, last failure stage, and
+p50/p95 over the last 64 successful physical connections. Retries accumulate stage
+time; timeouts retain partial timings. Reused sessions do not create samples.
+`healthy` describes the latest ECH connection, not reachability of every destination.
+Unchanged nodes retain statistics across refreshes; changed connection parameters
+or process restarts reset them.
+
 ```text
 oixc-proxy information [--config PATH] --output PATH
 
