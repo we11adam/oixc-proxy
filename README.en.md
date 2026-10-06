@@ -260,8 +260,11 @@ cancelled partial writes can be undercounted.
 ```sh
 # All retained history, including previous service runs
 oixc-proxy traffic --all
-# UTC range; either endpoint can also be omitted
-oixc-proxy traffic --from 2026-10-06T00:00Z --to 2026-10-07T00:00Z
+# Local-time range; either endpoint can also be omitted
+oixc-proxy traffic --from 2026-10-06T00:00 --to 2026-10-07T00:00
+# Explicit UTC offsets, or select the query timezone through TZ
+oixc-proxy traffic --from 2026-10-06T00:00+08:00 --to 2026-10-07T00:00+08:00
+TZ=Asia/Shanghai oixc-proxy traffic --from 2026-10-06T00:00 --to 2026-10-07T00:00
 # Default journal beside a custom config, or an explicit journal with JSON output
 oixc-proxy traffic --config /path/to/oixc-proxy.conf --json
 oixc-proxy traffic --file /path/to/traffic.jsonl --all --json
@@ -275,8 +278,17 @@ sample. The journal and writer lock have mode `0600`; no accounts, nodes,
 destinations or credentials are recorded. Query as the service user (`sudo` for
 root-owned services).
 
-Times accept Unix seconds or UTC `YYYY-MM-DDTHH:MM[:SS]Z`, never implicit local
-time. Ranges are `[from, to)` and select entire records by their **sample timestamp**,
+Times accept Unix seconds or `YYYY-MM-DDTHH:MM[:SS]` (a space can replace `T`
+if the whole argument is quoted). Without a suffix, use the query process's local
+timezone: the system default or `TZ` environment variable. Named `TZ` zones need
+the corresponding system timezone data. `Z` means UTC; explicit offsets such as
+`+08:00` or `-04:00` are independent of the local zone. Nonexistent or ambiguous
+local times at DST transitions are rejected; specify `Z` or an explicit offset.
+The unknown offset `-00:00` is rejected. Human-readable bounds and first/last sample
+times display local time with the UTC offset applicable at each instant. JSON and
+on-disk timestamps remain Unix seconds, independent of timezone.
+
+Ranges remain `[from, to)` and select entire records by their **sample timestamp**,
 not individual packet timestamps, with normally one-minute precision. Queries
 read persisted history only, make no API requests, and exclude the current
 unflushed interval. Traffic before enabling recording cannot be recovered.
