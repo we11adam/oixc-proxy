@@ -130,8 +130,8 @@ impl Server {
         let mut clients = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
-                connection = self.listener.accept() => {
-                    let (stream, _) = connection?;
+                connection = crate::accept::accept_unix(&self.listener, "control") => {
+                    let stream = connection.context("accept service control connection")?;
                     if clients.len() >= 16 { drop(stream); continue; }
                     let sender = sender.clone();
                     clients.spawn(async move { let _ = handle(stream, sender).await; });

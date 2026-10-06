@@ -1,7 +1,8 @@
+use std::future::Future;
 use std::io;
 use std::time::Duration;
 
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 
 const RESOURCE_BACKOFF: Duration = Duration::from_secs(1);
 
@@ -14,9 +15,26 @@ const RESOURCE_BACKOFF: Duration = Duration::from_secs(1);
 /// itself is unusable and is returned, so the server stops instead of
 /// retrying forever.
 pub async fn accept(listener: &TcpListener, label: &str) -> io::Result<TcpStream> {
+    retry(label, || listener.accept())
+        .await
+        .map(|(connection, _)| connection)
+}
+
+/// [`accept`] for the local Unix control socket.
+pub async fn accept_unix(listener: &UnixListener, label: &str) -> io::Result<UnixStream> {
+    retry(label, || listener.accept())
+        .await
+        .map(|(connection, _)| connection)
+}
+
+async fn retry<T, F, Fut>(label: &str, mut accept: F) -> io::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = io::Result<T>>,
+{
     loop {
-        match listener.accept().await {
-            Ok((connection, _)) => return Ok(connection),
+        match accept().await {
+            Ok(accepted) => return Ok(accepted),
             Err(error) => match classify(&error) {
                 AcceptError::Connection => {}
                 AcceptError::Resource => {
