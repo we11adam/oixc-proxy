@@ -4,13 +4,20 @@
 
 本文件记录 `oixc-proxy` 各版本中值得注意的变更。版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## 未发布
+## [0.6.0] - 2026-10-06
+
+### 新功能
 
 - `traffic` 查询和人类可读输出尊重本机时区及 `TZ`；时间参数支持无后缀本地时间、`Z` 和显式 UTC 偏移，夏令时不存在/歧义时间要求显式偏移。磁盘及 JSON 仍保留 Unix 秒，旧统计文件无需迁移。
 - 新增本地 TCP/UDP 应用层上传、下载流量统计，`serve`/`serve-map` 默认每分钟将时间戳和增量同步到配置/token 文件旁的 `0600` JSONL 文件；独立线程写盘，正常退出补写，重启保留历史。支持 `--traffic-file`，避免多实例共用文件；写入失败保留内存增量重试，未完成末行可恢复。
 - 新增 `traffic [--all] [--from TIME] [--to TIME] [--json]`，只读查询累计历史或按采样时间筛选时段，分列 TCP/UDP 上传、下载；仅包含已落盘样本，不等同账户计费，异常退出可能丢失未落盘部分。中英文文档说明统计精度、故障和存储边界。
 - 控制面请求对齐官方 v0.0.39 的 `User-Agent: oixCloud Helper` 和 `X-oixCloud-Client: oixcloud-helper`。
 - 新增 `login --output PATH`，显式导入配置中的旧 token，调用官方重绑定接口取得 Helper 专属 token，并保存到新的 `0600` 配置；保留其他设置、不覆盖原配置、不自动重载服务，也不重试或回退到备用 API。启动和只读命令不会自动迁移 token；暂不提供邮箱/密码登录。
+
+### 使用说明与验证
+
+- SIGTERM、SIGINT（Ctrl-C）及正常退出会补写并同步不足一分钟的流量；新增真实进程信号和 TCP/UDP 流量回归测试。SIGKILL、崩溃或断电仍可能丢失未落盘部分。
+- macOS 更新流程改为显式 SIGTERM 并等待 KeepAlive 拉起新进程；中英文 README、部署文档和部署 Skill 统一说明优雅重启、systemd 默认信号及生成 unit 的 10 秒停止超时。
 
 ## [0.5.0] - 2026-10-05
 
@@ -132,6 +139,7 @@
 - DNS 与 TCP 竞速：共享传输上下文、合并签名 DNS 查询、A/AAAA 并发查询、错开的连接尝试。
 - 拨号时间预算、采样的性能 tracing 和连接复用调优。
 
+[0.6.0]: https://github.com/we11adam/oixc-proxy/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/we11adam/oixc-proxy/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/we11adam/oixc-proxy/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/we11adam/oixc-proxy/compare/v0.2.2...v0.3.0

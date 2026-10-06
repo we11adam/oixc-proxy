@@ -4,13 +4,20 @@
 
 Notable changes to `oixc-proxy` are recorded in this file. Versions follow [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## [0.6.0] - 2026-10-06
+
+### Added
 
 - Make `traffic` query bounds and human-readable output respect the local timezone or `TZ`. Accept local timestamps without a suffix, `Z` and explicit UTC offsets; require an explicit offset for nonexistent/ambiguous DST times. Preserve Unix seconds in journals and JSON, with no history migration needed.
 - Record local TCP/UDP application upload/download deltas and timestamps every minute in a synced mode-0600 JSONL journal beside the config/token file for `serve`/`serve-map`. A dedicated writer thread keeps disk I/O off the forwarding path, flushes on normal exit and retains history across restarts. Add `--traffic-file`, exclusive writer ownership, retry retained deltas after write failures and recover incomplete tails.
 - Add `traffic [--all] [--from TIME] [--to TIME] [--json]` for read-only lifetime or sample-time range queries with TCP/UDP upload/download breakdowns. Reports include persisted samples only, not account billing; abnormal exits may lose unflushed traffic. Document precision, failure and storage boundaries in both READMEs.
 - Match official v0.0.39 API identity with `User-Agent: oixCloud Helper` and `X-oixCloud-Client: oixcloud-helper`.
 - Add `login --output PATH` to explicitly import the configured token through the official rebind API and save the Helper token in a new mode `0600` config. Other settings are preserved; the original config and running service are unchanged. Login never retries or uses fallback APIs, and startup/read-only commands never rebind automatically. Email/password login is not supported.
+
+### Usage notes and verification
+
+- SIGTERM, SIGINT (Ctrl-C) and normal exit write and sync a final partial-minute sample. Add real-process signal and TCP/UDP accounting regression tests. SIGKILL, crashes or power loss can still lose unflushed traffic.
+- macOS updates explicitly send SIGTERM and wait for KeepAlive to relaunch the service. Align bilingual READMEs, deployment instructions and the deployment Skill on graceful restarts, default systemd signals and the generated unit's 10-second stop timeout.
 
 ## [0.5.0] - 2026-10-05
 
@@ -132,6 +139,7 @@ First Rust release.
 - DNS and TCP racing: a shared transport context, coalesced signed DNS queries, concurrent A/AAAA lookups and staggered connection attempts.
 - Dial time budgets, sampled performance tracing and connection reuse tuning.
 
+[0.6.0]: https://github.com/we11adam/oixc-proxy/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/we11adam/oixc-proxy/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/we11adam/oixc-proxy/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/we11adam/oixc-proxy/compare/v0.2.2...v0.3.0
