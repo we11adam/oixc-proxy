@@ -251,7 +251,7 @@ impl Recorder {
     }
 
     pub fn stop(mut self) -> Result<()> {
-        self.counters.enabled.store(false, Ordering::Relaxed);
+        // Keep counting until the final snapshot so in-flight transfers reach the flush.
         let _ = self.stop.send(());
         self.worker
             .take()
