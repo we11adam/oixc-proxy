@@ -205,6 +205,7 @@ proxies:
         .timeout(Duration::from_secs(1))
         .build()
         .unwrap();
+    let socket = oixc_proxy::control::socket_path(&config).unwrap();
     let mut previous_samples = 1;
     for signal in [libc::SIGTERM, libc::SIGINT] {
         let mut service = Service(
@@ -229,7 +230,7 @@ proxies:
                     .send()
                     .await
                 {
-                    if response.status().is_success() {
+                    if response.status().is_success() && socket.exists() {
                         break;
                     }
                 }
@@ -261,6 +262,10 @@ proxies:
         .await
         .unwrap();
         assert!(status.success());
+        assert!(
+            !socket.exists(),
+            "signal {signal} must remove the control socket"
+        );
         let output = query(&journal, &["--all", "--json"]);
         assert!(output.status.success());
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();

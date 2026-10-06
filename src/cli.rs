@@ -665,9 +665,9 @@ async fn run_serve(args: &[String]) -> Result<()> {
     });
     let mut socks_task = tokio::spawn(serve_dynamic_listener(socks_listener, settings_rx));
     let mut http_task = tokio::spawn(http_server::serve(nodelist_listener, manager.clone()));
-    let control = crate::control::Server::bind(&config_path).await?;
     let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<crate::control::Request>(8);
-    let mut control_task = tokio::spawn(control.serve(control_tx));
+    // Owned here so a graceful stop, which drops this future, removes the socket.
+    let mut control = crate::control::start(&config_path, control_tx).await?;
     let mut refresh = tokio::time::interval(service.node_refresh_interval);
     if !from_cache {
         refresh.tick().await;
@@ -691,7 +691,7 @@ async fn run_serve(args: &[String]) -> Result<()> {
             result = &mut http_task => {
                 return result.context("nodelist HTTP task failed")?;
             }
-            result = &mut control_task => { return result.context("service control task failed")?; }
+            result = control.finished() => return result,
             request = control_rx.recv() => Some(request.context("service control queue closed")?),
             _ = refresh.tick() => None,
             _ = catalog_refresh.notified() => None,

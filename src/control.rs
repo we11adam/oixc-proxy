@@ -87,8 +87,33 @@ impl Drop for SocketFile {
 
 pub struct Server {
     listener: UnixListener,
+    file: SocketFile,
+}
+
+/// A running control server. Dropping it stops accepting and removes the
+/// socket file at once, without waiting for the runtime to shut down.
+pub struct Running {
+    task: tokio::task::JoinHandle<Result<()>>,
     _file: SocketFile,
 }
+impl Running {
+    pub async fn finished(&mut self) -> Result<()> {
+        (&mut self.task)
+            .await
+            .context("service control task failed")?
+    }
+}
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Binds and starts the control server.
+pub async fn start(config: &Path, sender: mpsc::Sender<Request>) -> Result<Running> {
+    Ok(Server::bind(config).await?.spawn(sender))
+}
+
 impl Server {
     pub async fn bind(config: &Path) -> Result<Self> {
         let path = socket_path(config)?;
@@ -120,24 +145,28 @@ impl Server {
             device: metadata.dev(),
         };
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        Ok(Self {
-            listener,
-            _file: file,
-        })
+        Ok(Self { listener, file })
     }
 
-    pub async fn serve(self, sender: mpsc::Sender<Request>) -> Result<()> {
-        let mut clients = tokio::task::JoinSet::new();
-        loop {
-            tokio::select! {
-                connection = crate::accept::accept_unix(&self.listener, "control") => {
-                    let stream = connection.context("accept service control connection")?;
-                    if clients.len() >= 16 { drop(stream); continue; }
-                    let sender = sender.clone();
-                    clients.spawn(async move { let _ = handle(stream, sender).await; });
-                }
-                _ = clients.join_next(), if !clients.is_empty() => {}
+    pub fn spawn(self, sender: mpsc::Sender<Request>) -> Running {
+        Running {
+            task: tokio::spawn(serve(self.listener, sender)),
+            _file: self.file,
+        }
+    }
+}
+
+async fn serve(listener: UnixListener, sender: mpsc::Sender<Request>) -> Result<()> {
+    let mut clients = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            connection = crate::accept::accept_unix(&listener, "control") => {
+                let stream = connection.context("accept service control connection")?;
+                if clients.len() >= 16 { drop(stream); continue; }
+                let sender = sender.clone();
+                clients.spawn(async move { let _ = handle(stream, sender).await; });
             }
+            _ = clients.join_next(), if !clients.is_empty() => {}
         }
     }
 }
@@ -230,7 +259,7 @@ mod tests {
         );
         assert!(Server::bind(&config).await.is_err());
         let (sender, mut receive) = mpsc::channel(1);
-        let task = tokio::spawn(server.serve(sender));
+        let running = server.spawn(sender);
         let client = tokio::spawn({
             let config = config.clone();
             async move { send(&config, Command::RefreshNodes).await.unwrap() }
@@ -245,8 +274,9 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(client.await.unwrap().payload["nodes"], 3);
-        task.abort();
-        let _ = task.await;
+        // Dropping must remove the file synchronously: the binary exits with
+        // process::exit, so no task is ever dropped after the runtime stops.
+        drop(running);
         assert!(!path.exists());
         let stale = UnixListener::bind(&path).unwrap();
         drop(stale);
