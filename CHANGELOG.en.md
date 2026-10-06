@@ -6,6 +6,8 @@ Notable changes to `oixc-proxy` are recorded in this file. Versions follow [Sema
 
 ## Unreleased
 
+- Record local TCP/UDP application upload/download deltas and timestamps every minute in a synced mode-0600 JSONL journal beside the config/token file for `serve`/`serve-map`. A dedicated writer thread keeps disk I/O off the forwarding path, flushes on normal exit and retains history across restarts. Add `--traffic-file`, exclusive writer ownership, retry retained deltas after write failures and recover incomplete tails.
+- Add `traffic [--all] [--from TIME] [--to TIME] [--json]` for read-only lifetime or UTC/Unix-second sample-time range queries with TCP/UDP upload/download breakdowns. Reports include persisted samples only, not account billing; abnormal exits may lose unflushed traffic. Document precision, failure and storage boundaries in both READMEs.
 - Match official v0.0.39 API identity with `User-Agent: oixCloud Helper` and `X-oixCloud-Client: oixcloud-helper`.
 - Add `login --output PATH` to explicitly import the configured token through the official rebind API and save the Helper token in a new mode `0600` config. Other settings are preserved; the original config and running service are unchanged. Login never retries or uses fallback APIs, and startup/read-only commands never rebind automatically. Email/password login is not supported.
 

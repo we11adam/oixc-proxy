@@ -248,6 +248,65 @@ removed profiles are rotated atomically.
 
 ## Commands
 
+### Query local traffic
+
+`serve` and `serve-map` automatically record TCP/UDP application upload/download
+bytes forwarded through Snell. These are local counters, not oixCloud billing:
+Snell/TLS handshakes, encryption, padding, provider requests and API calls are
+excluded. Downloads count when read from upstream, even if delivery to the local
+client subsequently fails. Uploads count completed successful writes; failed or
+cancelled partial writes can be undercounted.
+
+```sh
+# All retained history, including previous service runs
+oixc-proxy traffic --all
+# UTC range; either endpoint can also be omitted
+oixc-proxy traffic --from 2026-10-06T00:00Z --to 2026-10-07T00:00Z
+# Default journal beside a custom config, or an explicit journal with JSON output
+oixc-proxy traffic --config /path/to/oixc-proxy.conf --json
+oixc-proxy traffic --file /path/to/traffic.jsonl --all --json
+```
+
+The default journal is `traffic.jsonl` beside the service config, or beside the
+token file for `serve-map`. A dedicated thread normally samples at each UTC
+minute boundary, appends one JSON line and syncs it to disk. Forwarding performs
+no file I/O. SIGTERM, Ctrl-C or normal return flushes a final partial-minute
+sample. The journal and writer lock have mode `0600`; no accounts, nodes,
+destinations or credentials are recorded. Query as the service user (`sudo` for
+root-owned services).
+
+Times accept Unix seconds or UTC `YYYY-MM-DDTHH:MM[:SS]Z`, never implicit local
+time. Ranges are `[from, to)` and select entire records by their **sample timestamp**,
+not individual packet timestamps, with normally one-minute precision. Queries
+read persisted history only, make no API requests, and exclude the current
+unflushed interval. Traffic before enabling recording cannot be recovered.
+Lifetime means all retained history in this file, across restarts, refreshes and
+token changes; it is not account-wide lifetime usage.
+
+Crashes, forced kills or power loss can lose the unflushed interval, normally up
+to roughly one minute. Disk-write failures retain in-memory deltas for the next
+successful append, reported as `extended_windows`; exiting after prolonged
+failures can lose more. Queries ignore an incomplete final line and startup
+repairs it when the format is recognizable. If the first record is too truncated
+to identify, startup refuses to avoid truncating an unrelated file.
+Corrupt complete records cause errors rather than being silently
+skipped. History is append-only, with no automatic rotation or pruning, using
+roughly 100 MB/year continuously. Deleting it loses history; include it in backups.
+
+Separate instances must use separate journals; only one writer can own a file:
+
+```sh
+oixc-proxy serve --config /path/to/oixc-proxy.conf --traffic-file /path/to/traffic.jsonl
+oixc-proxy serve-map --token-file /path/to/token.txt --traffic-file /path/to/map-traffic.jsonl
+```
+
+The parent directory must exist and be writable. Existing files must be private
+regular journals owned by the service user; symlinks and broad permissions are
+rejected. Use the matching `traffic --file` when overriding the default location.
+The path is a startup option and cannot be hot-reloaded.
+
+### Management and diagnostics
+
 Run `oixc-proxy refresh-nodes [--config PATH]` to refresh the running `serve`
 instance manually. Configuration changes can be applied with
 `oixc-proxy reload-config [--config PATH]`. Reload supports the token, API URLs,
@@ -340,11 +399,12 @@ Unchanged nodes retain statistics across refreshes; changed connection parameter
 or process restarts reset them.
 
 ```text
+oixc-proxy traffic [--config PATH | --file PATH] [--all] [--from TIME] [--to TIME] [--json]
 oixc-proxy login [--config PATH] --output PATH
 oixc-proxy information [--config PATH] --output PATH
 
-oixc-proxy serve [--config PATH]
-oixc-proxy serve-map [--token-file PATH] [--listen IP] [--base-port PORT]
+oixc-proxy serve [--config PATH] [--traffic-file PATH]
+oixc-proxy serve-map [--token-file PATH] [--listen IP] [--base-port PORT] [--traffic-file PATH]
 oixc-proxy version
 oixc-proxy install-launch-agent [--config PATH]
 oixc-proxy install-systemd [--config PATH]

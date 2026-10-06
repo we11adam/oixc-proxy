@@ -162,6 +162,37 @@ node-refresh-interval=1h
 
 ## 命令
 
+### 查询本地流量
+
+`serve` 和 `serve-map` 自动记录本机经 Snell 转发的 TCP/UDP 应用层上传、下载字节数。这是本地统计，不是 oixCloud 的账户计费流量：不包含 Snell/TLS 握手、加密和填充开销，也不统计 provider/API 请求。下载在读取上游数据时计入，即使随后未成功交付本地客户端；上传只计成功完成的写入，失败或取消的部分写入可能少计。
+
+```sh
+# 同一个统计文件的全部历史（包括重启前的数据）
+oixc-proxy traffic --all
+# 查询 UTC 时段，也可以仅传 --from 或 --to
+oixc-proxy traffic --from 2026-10-06T00:00Z --to 2026-10-07T00:00Z
+# 自定义配置的默认统计文件，或直接指定文件并输出 JSON
+oixc-proxy traffic --config /path/to/oixc-proxy.conf --json
+oixc-proxy traffic --file /path/to/traffic.jsonl --all --json
+```
+
+默认在服务配置文件旁写入 `traffic.jsonl`；`serve-map` 则在 token 文件旁。独立线程通常在每个 UTC 整分钟采样并追加一行 JSON，随后同步到磁盘，不在转发路径做文件 I/O。收到 SIGTERM/Ctrl-C 或正常返回时补写最后一条部分分钟记录。文件和写入锁权限为 `0600`，不保存账户、节点、访问目标或凭据；查询需以服务用户运行（root 服务使用 `sudo`）。
+
+时间参数接受 Unix 秒或 UTC `YYYY-MM-DDTHH:MM[:SS]Z`，不隐式使用本地时区。区间为 `[from, to)`，按**采样时间**归入整条记录，不按包时间分摊，通常只有一分钟精度。查询只读取已落盘记录，不调用 API，也不包含当前尚未采样的流量；启用前的历史无法追溯。“全部历史”指文件内保留的累计值，重启、刷新及 token 变化均不清零，不代表整个账户的生命周期。
+
+强制杀进程、断电等异常退出会丢失未落盘的部分；正常情况下最多约一分钟。磁盘写入失败时保留内存增量，下次成功再写，查询以 `extended_windows` 提示超长采样窗口；若持续失败后退出，可能丢失更长时间。查询忽略未完成的末行，服务启动会修复能识别格式的未完成末行；若首条记录已残缺到无法识别，则拒绝启动，避免误截断其他文件。已完成但损坏的记录会报错，不静默跳过。文件一直追加，不自动轮转或删除，持续运行约占用 100 MB/年；删除文件会失去其历史，备份时应同时保留它。
+
+多个实例必须使用不同的统计文件，同一个文件只允许一个写入进程：
+
+```sh
+oixc-proxy serve --config /path/to/oixc-proxy.conf --traffic-file /path/to/traffic.jsonl
+oixc-proxy serve-map --token-file /path/to/token.txt --traffic-file /path/to/map-traffic.jsonl
+```
+
+自定义路径的父目录必须已存在且可写；已有文件必须是服务用户的私有常规统计文件，不接受符号链接或宽松权限。使用 `--traffic-file` 后，查询请对应指定 `--file`；路径是启动选项，不能热重载。
+
+### 管理与诊断
+
 立即刷新运行实例中的节点目录，无需重启：
 
 ```sh
@@ -217,12 +248,13 @@ curl -fsS http://127.0.0.1:6173/status
 `GET`/`HEAD /status` 返回 JSON（HEAD 无正文）。`ready` 表示目录已装载；`catalog` 包含最近刷新时间、累计失败次数及错误类别；`transport` 包含物理出口、根证书数量/代次/加载完整性和 ECH 建连结果。时间使用 Unix 秒，计数从进程启动累计，不主动测速；最近一次失败不会因为后来成功而从计数中消失。HTTP 401、403、407、429 分别归类为认证失效、拒绝访问、代理认证和限流，日志中的限流错误会附带有效的 `Retry-After` 秒数。状态不包含 token、PSK、节点地址或远端错误正文；和 provider 一样，仅向受信任网络开放诊断监听端口。
 
 ```text
+oixc-proxy traffic [--config PATH | --file PATH] [--all] [--from TIME] [--to TIME] [--json]
 oixc-proxy login [--config PATH] --output PATH
 oixc-proxy information [--config PATH] --output PATH
 oixc-proxy preview-nodes [--config PATH] [--refresh] [--disable-node-filter]
 
-oixc-proxy serve [--config PATH]
-oixc-proxy serve-map [--token-file PATH] [--listen IP] [--base-port PORT]
+oixc-proxy serve [--config PATH] [--traffic-file PATH]
+oixc-proxy serve-map [--token-file PATH] [--listen IP] [--base-port PORT] [--traffic-file PATH]
 oixc-proxy version
 oixc-proxy install-launch-agent [--config PATH]
 oixc-proxy install-systemd [--config PATH]
