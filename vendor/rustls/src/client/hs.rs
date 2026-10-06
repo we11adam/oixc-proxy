@@ -9,13 +9,14 @@ use pki_types::ServerName;
 #[cfg(feature = "tls12")]
 use super::tls12;
 use super::{ResolvesClientCert, Tls12Resumption};
+use crate::SupportedCipherSuite;
 #[cfg(feature = "logging")]
 use crate::bs_debug;
 use crate::check::inappropriate_handshake_message;
 use crate::client::client_conn::ClientConnectionData;
 use crate::client::common::ClientHelloDetails;
 use crate::client::ech::EchState;
-use crate::client::{tls13, ClientConfig, EchMode, EchStatus};
+use crate::client::{ClientConfig, EchMode, EchStatus, tls13};
 use crate::common_state::{CommonState, HandshakeKind, KxState, State};
 use crate::conn::ConnectionRandoms;
 use crate::crypto::{ActiveKeyExchange, KeyExchangeAlgorithm};
@@ -39,7 +40,6 @@ use crate::msgs::persist;
 use crate::sync::Arc;
 use crate::tls13::key_schedule::KeyScheduleEarly;
 use crate::verify::ServerCertVerifier;
-use crate::SupportedCipherSuite;
 
 pub(super) type NextState<'a> = Box<dyn State<ClientConnectionData> + 'a>;
 pub(super) type NextStateOrError<'a> = Result<NextState<'a>, Error>;
@@ -120,7 +120,10 @@ impl ClientHelloInput {
         };
 
         let hello = ClientHelloDetails::new(
-            extra_exts.protocols.clone().unwrap_or_default(),
+            extra_exts
+                .protocols
+                .clone()
+                .unwrap_or_default(),
             crate::rand::random_u16(config.provider.secure_random)?,
         );
 
@@ -142,7 +145,11 @@ impl ClientHelloInput {
         cx: &mut ClientContext<'_>,
     ) -> NextStateOrError<'static> {
         let mut transcript_buffer = HandshakeHashBuffer::new();
-        if self.config.client_auth_cert_resolver.has_certs() {
+        if self
+            .config
+            .client_auth_cert_resolver
+            .has_certs()
+        {
             transcript_buffer.set_client_auth_enabled();
         }
 
@@ -217,7 +224,11 @@ fn emit_client_hello_for_retry(
                 .collect(),
         ),
         supported_versions: Some(supported_versions),
-        signature_schemes: Some(config.verifier.supported_verify_schemes()),
+        signature_schemes: Some(
+            config
+                .verifier
+                .supported_verify_schemes(),
+        ),
         extended_master_secret_request: Some(()),
         certificate_status_request: Some(CertificateStatusRequest::build_ocsp()),
         protocols: extra_exts.protocols.clone(),
@@ -277,11 +288,13 @@ fn emit_client_hello_for_retry(
             // algorithm is also supported separately by our provider for this version
             // (`find_kx_group` looks that up).
             if let Some((component_group, component_share)) =
-                key_share.hybrid_component().filter(|(group, _)| {
-                    config
-                        .find_kx_group(*group, ProtocolVersion::TLSv1_3)
-                        .is_some()
-                })
+                key_share
+                    .hybrid_component()
+                    .filter(|(group, _)| {
+                        config
+                            .find_kx_group(*group, ProtocolVersion::TLSv1_3)
+                            .is_some()
+                    })
             {
                 shares.push(KeyShareEntry::new(component_group, component_share));
             }
@@ -324,11 +337,17 @@ fn emit_client_hello_for_retry(
             false
         };
 
-    if config.client_auth_cert_resolver.only_raw_public_keys() {
+    if config
+        .client_auth_cert_resolver
+        .only_raw_public_keys()
+    {
         exts.client_certificate_types = Some(vec![CertificateType::RawPublicKey]);
     }
 
-    if config.verifier.requires_raw_public_keys() {
+    if config
+        .verifier
+        .requires_raw_public_keys()
+    {
         exts.server_certificate_types = Some(vec![CertificateType::RawPublicKey]);
     }
 
@@ -372,14 +391,17 @@ fn emit_client_hello_for_retry(
         extensions: exts,
     };
 
-    let ech_grease_ext = config.ech_mode.as_ref().and_then(|mode| match mode {
-        EchMode::Grease(cfg) => Some(cfg.grease_ext(
-            config.provider.secure_random,
-            input.server_name.clone(),
-            &chp_payload,
-        )),
-        _ => None,
-    });
+    let ech_grease_ext = config
+        .ech_mode
+        .as_ref()
+        .and_then(|mode| match mode {
+            EchMode::Grease(cfg) => Some(cfg.grease_ext(
+                config.provider.secure_random,
+                input.server_name.clone(),
+                &chp_payload,
+            )),
+            _ => None,
+        });
 
     match (cx.data.ech_status, &mut ech_state) {
         // If we haven't offered ECH, or have offered ECH but got a non-rejecting HRR, then
@@ -394,7 +416,9 @@ fn emit_client_hello_for_retry(
             )?;
             cx.data.ech_status = EchStatus::Offered;
             // Store the ECH extension in case we need to carry it forward in a subsequent hello.
-            input.prev_ech_ext = chp_payload.encrypted_client_hello.clone();
+            input.prev_ech_ext = chp_payload
+                .encrypted_client_hello
+                .clone();
         }
         // If we haven't offered ECH, and have no ECH state, then consider whether to use GREASE
         // ECH.
@@ -626,7 +650,9 @@ pub(super) fn process_server_cert_type_extension(
 ) -> Result<Option<(ExtensionType, CertificateType)>, Error> {
     process_cert_type_extension(
         common,
-        config.verifier.requires_raw_public_keys(),
+        config
+            .verifier
+            .requires_raw_public_keys(),
         server_cert_extension.copied(),
         ExtensionType::ServerCertificateType,
     )
@@ -639,7 +665,9 @@ pub(super) fn process_client_cert_type_extension(
 ) -> Result<Option<(ExtensionType, CertificateType)>, Error> {
     process_cert_type_extension(
         common,
-        config.client_auth_cert_resolver.only_raw_public_keys(),
+        config
+            .client_auth_cert_resolver
+            .only_raw_public_keys(),
         client_cert_extension.copied(),
         ExtensionType::ClientCertificateType,
     )
@@ -729,7 +757,10 @@ impl State<ClientConnectionData> for ExpectServerHello {
             process_alpn_protocol(
                 cx.common,
                 &self.input.hello.alpn_protocols,
-                server_hello.selected_protocol.as_ref().map(|s| s.as_ref()),
+                server_hello
+                    .selected_protocol
+                    .as_ref()
+                    .map(|s| s.as_ref()),
                 self.input.config.check_selected_alpn,
             )?;
         }
@@ -784,7 +815,9 @@ impl State<ClientConnectionData> for ExpectServerHello {
         }
 
         // Start our handshake hash, and input the server-hello.
-        let mut transcript = self.transcript_buffer.start_hash(suite.hash_provider());
+        let mut transcript = self
+            .transcript_buffer
+            .start_hash(suite.hash_provider());
         transcript.add_message(&m);
 
         let randoms = ConnectionRandoms::new(self.input.random, server_hello.random);
@@ -965,7 +998,10 @@ impl ExpectServerHelloOrHelloRetryRequest {
         };
 
         // This is the draft19 change where the transcript became a tree
-        let transcript = self.next.transcript_buffer.start_hash(cs.hash_provider());
+        let transcript = self
+            .next
+            .transcript_buffer
+            .start_hash(cs.hash_provider());
         let mut transcript_buffer = transcript.into_hrr_buffer();
         transcript_buffer.add_message(&m);
 
@@ -1021,7 +1057,9 @@ impl State<ClientConnectionData> for ExpectServerHelloOrHelloRetryRequest {
             MessagePayload::Handshake {
                 parsed: HandshakeMessagePayload(HandshakePayload::ServerHello(..)),
                 ..
-            } => self.into_expect_server_hello().handle(cx, m),
+            } => self
+                .into_expect_server_hello()
+                .handle(cx, m),
             MessagePayload::Handshake {
                 parsed: HandshakeMessagePayload(HandshakePayload::HelloRetryRequest(..)),
                 ..
@@ -1112,7 +1150,9 @@ impl ClientSessionValue {
 
         if let Some(resuming) = &found {
             if cx.common.is_quic() {
-                cx.common.quic.params = resuming.tls13().map(|v| v.quic_params());
+                cx.common.quic.params = resuming
+                    .tls13()
+                    .map(|v| v.quic_params());
             }
         }
 

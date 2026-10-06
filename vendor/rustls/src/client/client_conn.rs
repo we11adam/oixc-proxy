@@ -7,6 +7,8 @@ use pki_types::{ServerName, UnixTime};
 
 use super::handy::NoClientSessionStorage;
 use super::hs::{self, ClientHelloInput};
+#[cfg(feature = "std")]
+use crate::WantsVerifier;
 use crate::builder::ConfigBuilder;
 use crate::client::{EchMode, EchStatus};
 use crate::common_state::{CommonState, Protocol, Side};
@@ -25,11 +27,9 @@ use crate::sync::Arc;
 use crate::time_provider::DefaultTimeProvider;
 use crate::time_provider::TimeProvider;
 use crate::unbuffered::{EncryptError, TransmitTlsData};
-#[cfg(feature = "std")]
-use crate::WantsVerifier;
-use crate::{compress, sign, verify, versions, KeyLog, WantsVersions};
 #[cfg(doc)]
-use crate::{crypto, DistinguishedName};
+use crate::{DistinguishedName, crypto};
+use crate::{KeyLog, WantsVersions, compress, sign, verify, versions};
 
 /// A trait for the ability to store client session data, so that sessions
 /// can be resumed in future connections.
@@ -564,8 +564,8 @@ pub enum Tls12Resumption {
 
 /// Container for unsafe APIs
 pub(super) mod danger {
-    use super::verify::ServerCertVerifier;
     use super::ClientConfig;
+    use super::verify::ServerCertVerifier;
     use crate::sync::Arc;
 
     /// Accessor for dangerous configuration options.
@@ -671,13 +671,13 @@ mod connection {
     use pki_types::ServerName;
 
     use super::{ClientConnectionData, ClientExtensionsInput};
+    use crate::ClientConfig;
     use crate::client::EchStatus;
     use crate::common_state::Protocol;
     use crate::conn::{ConnectionCommon, ConnectionCore};
     use crate::error::Error;
     use crate::suites::ExtractedSecrets;
     use crate::sync::Arc;
-    use crate::ClientConfig;
 
     /// Stub that implements io::Write and dispatches to `write_early_data`.
     pub struct WriteEarlyData<'a> {
@@ -692,7 +692,12 @@ mod connection {
         /// How many bytes you may send.  Writes will become short
         /// once this reaches zero.
         pub fn bytes_left(&self) -> usize {
-            self.sess.inner.core.data.early_data.bytes_left()
+            self.sess
+                .inner
+                .core
+                .data
+                .early_data
+                .bytes_left()
         }
     }
 
@@ -724,7 +729,8 @@ mod connection {
 
     impl fmt::Debug for ClientConnection {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("ClientConnection").finish()
+            f.debug_struct("ClientConnection")
+                .finish()
         }
     }
 
@@ -770,7 +776,13 @@ mod connection {
         /// in this case the data is lost but the connection continues.  You
         /// can tell this happened using `is_early_data_accepted`.
         pub fn early_data(&mut self) -> Option<WriteEarlyData<'_>> {
-            if self.inner.core.data.early_data.is_enabled() {
+            if self
+                .inner
+                .core
+                .data
+                .early_data
+                .is_enabled()
+            {
                 Some(WriteEarlyData::new(self))
             } else {
                 None
@@ -817,7 +829,10 @@ mod connection {
                 .data
                 .early_data
                 .check_write(data.len())
-                .map(|sz| self.inner.send_early_plaintext(&data[..sz]))
+                .map(|sz| {
+                    self.inner
+                        .send_early_plaintext(&data[..sz])
+                })
         }
     }
 
@@ -955,7 +970,9 @@ impl UnbufferedClientConnection {
     pub fn dangerous_into_kernel_connection(
         self,
     ) -> Result<(ExtractedSecrets, KernelConnection<ClientConnectionData>), Error> {
-        self.inner.core.dangerous_into_kernel_connection()
+        self.inner
+            .core
+            .dangerous_into_kernel_connection()
     }
 
     /// Returns the number of TLS1.3 tickets that have been received.
@@ -984,7 +1001,13 @@ impl TransmitTlsData<'_, ClientConnectionData> {
     ///
     /// IF allowed by the protocol
     pub fn may_encrypt_early_data(&mut self) -> Option<MayEncryptEarlyData<'_>> {
-        if self.conn.core.data.early_data.is_enabled() {
+        if self
+            .conn
+            .core
+            .data
+            .early_data
+            .is_enabled()
+        {
             Some(MayEncryptEarlyData { conn: self.conn })
         } else {
             None

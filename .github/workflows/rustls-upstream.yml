@@ -1,0 +1,27 @@
+name: Vendored rustls
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  upstream:
+    name: Check upstream rustls
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # cargo-audit cannot see a path dependency, so watch upstream releases directly.
+      - name: Verify vendored tree
+        shell: bash
+        run: scripts/vendor-rustls.sh check
+
+      - name: Fail when a newer rustls 0.23.x is published
+        shell: bash
+        run: scripts/vendor-rustls.sh outdated

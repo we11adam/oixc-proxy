@@ -25,6 +25,10 @@ jobs:
         shell: bash
         run: rustup toolchain install 1.85.0 --profile minimal
 
+      - name: Verify vendored rustls
+        shell: bash
+        run: scripts/vendor-rustls.sh check
+
       - name: Run tests
         shell: bash
         run: cargo +1.85.0 test --locked --all-features

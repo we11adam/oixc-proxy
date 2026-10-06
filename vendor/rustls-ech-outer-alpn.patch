@@ -1,0 +1,108 @@
+--- a/src/client/builder.rs
++++ b/src/client/builder.rs
+@@ -168,6 +168,7 @@
+         ClientConfig {
+             provider: self.provider,
+             alpn_protocols: Vec::new(),
++            ech_outer_alpn_protocols: None,
+             check_selected_alpn: true,
+             resumption: Resumption::default(),
+             max_fragment_size: None,
+--- a/src/client/client_conn.rs
++++ b/src/client/client_conn.rs
+@@ -166,6 +166,11 @@
+     /// If empty, no ALPN extension is sent.
+     pub alpn_protocols: Vec<Vec<u8>>,
+ 
++    /// Optional cover ALPN for ClientHelloOuter when offering real ECH.
++    /// The encrypted inner hello still uses `alpn_protocols`.
++    /// `None` preserves upstream behavior; this has no effect without real ECH.
++    pub ech_outer_alpn_protocols: Option<Vec<Vec<u8>>>,
++
+     /// Whether to check the selected ALPN was offered.
+     ///
+     /// The default is true.
+--- a/src/client/ech.rs
++++ b/src/client/ech.rs
+@@ -253,7 +253,7 @@
+ 
+         // Construct an inner hello using the outer hello - this allows us to know the size of
+         // dummy payload we should use for the GREASE extension.
+-        let encoded_inner_hello = grease_state.encode_inner_hello(outer_hello, None, &None);
++        let encoded_inner_hello = grease_state.encode_inner_hello(outer_hello, None, &None, true);
+ 
+         // Generate a payload of random data equivalent in length to a real inner hello.
+         let payload_len = encoded_inner_hello.len()
+@@ -386,6 +386,7 @@
+         mut outer_hello: ClientHelloPayload,
+         retry_req: Option<&HelloRetryRequest>,
+         resuming: &Option<Retrieved<&persist::Tls13ClientSessionValue>>,
++        outer_alpn: Option<&[Vec<u8>]>,
+     ) -> Result<ClientHelloPayload, Error> {
+         trace!(
+             "Preparing ECH offer {}",
+@@ -393,8 +394,21 @@
+         );
+ 
+         // Construct the encoded inner hello and update the transcript.
+-        let encoded_inner_hello = self.encode_inner_hello(&outer_hello, retry_req, resuming);
++        let encoded_inner_hello =
++            self.encode_inner_hello(&outer_hello, retry_req, resuming, outer_alpn.is_none());
+ 
++        // Build the inner transcript first, then alter the authenticated outer AAD.
++        // ALPN must not be compressed by reference to the outer extension below.
++        if let Some(protocols) = outer_alpn {
++            outer_hello.protocols = (!protocols.is_empty()).then(|| {
++                protocols
++                    .iter()
++                    .cloned()
++                    .map(crate::msgs::handshake::ProtocolName::from)
++                    .collect()
++            });
++        }
++
+         // Complete the ClientHelloOuterAAD with an ech extension, the payload should be a placeholder
+         // of size L, all zeroes. L == length of encrypting encoded client hello inner w/ the selected
+         // HPKE AEAD. (sum of plaintext + tag length, typically).
+@@ -572,6 +586,7 @@
+         outer_hello: &ClientHelloPayload,
+         retryreq: Option<&HelloRetryRequest>,
+         resuming: &Option<Retrieved<&persist::Tls13ClientSessionValue>>,
++        compress_alpn: bool,
+     ) -> Vec<u8> {
+         // Start building an inner hello using the outer_hello as a template.
+         let mut inner_hello = ClientHelloPayload {
+@@ -643,7 +658,8 @@
+ 
+             // Compressed extensions need to be put aside to include in one contiguous block.
+             // Uncompressed extensions get added directly to the inner hello.
+-            if ext.ech_compress() {
++            if ext.ech_compress() && (compress_alpn || ext != ExtensionType::ALProtocolNegotiation)
++            {
+                 compressed_exts.push(ext);
+             }
+ 
+@@ -982,6 +998,7 @@
+             },
+             None,
+             &None,
++            true,
+         )
+     }
+ 
+--- a/src/client/hs.rs
++++ b/src/client/hs.rs
+@@ -419,7 +419,12 @@
+         // we need to replace the client hello payload with an ECH client hello payload.
+         (EchStatus::NotOffered | EchStatus::Offered, Some(ech_state)) => {
+             // Replace the client hello payload with an ECH client hello payload.
+-            chp_payload = ech_state.ech_hello(chp_payload, retryreq, &tls13_session)?;
++            chp_payload = ech_state.ech_hello(
++                chp_payload,
++                retryreq,
++                &tls13_session,
++                config.ech_outer_alpn_protocols.as_deref(),
++            )?;
+             cx.data.ech_status = EchStatus::Offered;
+             // Store the ECH extension in case we need to carry it forward in a subsequent hello.
+             input.prev_ech_ext = chp_payload

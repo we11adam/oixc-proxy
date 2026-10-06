@@ -6,10 +6,11 @@ use core::iter;
 use pki_types::{DnsName, EchConfigListBytes, ServerName};
 use subtle::ConstantTimeEq;
 
+use crate::CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV;
 use crate::client::tls13;
+use crate::crypto::SecureRandom;
 use crate::crypto::hash::Hash;
 use crate::crypto::hpke::{EncapsulatedSecret, Hpke, HpkePublicKey, HpkeSealer, HpkeSuite};
-use crate::crypto::SecureRandom;
 use crate::hash_hs::{HandshakeHash, HandshakeHashBuffer};
 use crate::log::{debug, trace, warn};
 use crate::msgs::base::{Payload, PayloadU16};
@@ -25,9 +26,8 @@ use crate::msgs::message::{Message, MessagePayload};
 use crate::msgs::persist;
 use crate::msgs::persist::Retrieved;
 use crate::tls13::key_schedule::{
-    server_ech_hrr_confirmation_secret, KeyScheduleEarly, KeyScheduleHandshakeStart,
+    KeyScheduleEarly, KeyScheduleHandshakeStart, server_ech_hrr_confirmation_secret,
 };
-use crate::CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV;
 use crate::{
     AlertDescription, ClientConfig, CommonState, EncryptedClientHelloError, Error,
     PeerIncompatible, PeerMisbehaved, ProtocolVersion, Tls13CipherSuite,
@@ -139,7 +139,10 @@ impl EchConfig {
                     kem: key_config.kem_id,
                     sym: *cipher_suite,
                 };
-                if let Some(hpke) = hpke_suites.iter().find(|hpke| hpke.suite() == suite) {
+                if let Some(hpke) = hpke_suites
+                    .iter()
+                    .find(|hpke| hpke.suite() == suite)
+                {
                     debug!(
                         "selected ECH config ID {:?} suite {:?} public_name {:?}",
                         key_config.config_id, suite, contents.public_name
@@ -163,7 +166,9 @@ impl EchConfig {
         EchState::new(
             self,
             server_name.clone(),
-            config.client_auth_cert_resolver.has_certs(),
+            config
+                .client_auth_cert_resolver
+                .has_certs(),
             config.provider.secure_random,
             config.enable_sni,
         )
@@ -463,7 +468,9 @@ impl EchState {
         hash: &'static dyn Hash,
     ) -> Result<Option<EchAccepted>, Error> {
         // Start the inner transcript hash now that we know the hash algorithm to use.
-        let inner_transcript = self.inner_hello_transcript.start_hash(hash);
+        let inner_transcript = self
+            .inner_hello_transcript
+            .start_hash(hash);
 
         // Fork the transcript that we've started with the inner hello to use for a confirmation step.
         // We need to preserve the original inner_transcript to use if this confirmation succeeds.
@@ -556,7 +563,10 @@ impl EchState {
     pub(crate) fn transcript_hrr_update(&mut self, hash: &'static dyn Hash, m: &Message<'_>) {
         trace!("Updating ECH inner transcript for HRR");
 
-        let inner_transcript = self.inner_hello_transcript.clone().start_hash(hash);
+        let inner_transcript = self
+            .inner_hello_transcript
+            .clone()
+            .start_hash(hash);
 
         let mut inner_transcript_buffer = inner_transcript.into_hrr_buffer();
         inner_transcript_buffer.add_message(m);
@@ -727,7 +737,8 @@ impl EchState {
         };
 
         // Update the inner transcript buffer with the inner hello message.
-        self.inner_hello_transcript.add_message(&inner_hello_msg);
+        self.inner_hello_transcript
+            .add_message(&inner_hello_msg);
 
         encoded_hello
     }
@@ -737,11 +748,13 @@ impl EchState {
         for ident in psk_offer.identities.iter_mut() {
             // "For each PSK identity advertised in the ClientHelloInner, the
             // client generates a random PSK identity with the same length."
-            self.secure_random.fill(&mut ident.identity.0)?;
+            self.secure_random
+                .fill(&mut ident.identity.0)?;
             // "It also generates a random, 32-bit, unsigned integer to use as
             // the obfuscated_ticket_age."
             let mut ticket_age = [0_u8; 4];
-            self.secure_random.fill(&mut ticket_age)?;
+            self.secure_random
+                .fill(&mut ticket_age)?;
             ident.obfuscated_ticket_age = u32::from_be_bytes(ticket_age);
         }
 
@@ -754,7 +767,8 @@ impl EchState {
                 // We can't access the wrapped binder PresharedKeyBinder's PayloadU8 mutably,
                 // so we construct new PresharedKeyBinder's from scratch with the same length.
                 let mut new_binder = vec![0; old_binder.as_ref().len()];
-                self.secure_random.fill(&mut new_binder)?;
+                self.secure_random
+                    .fill(&mut new_binder)?;
                 Ok::<PresharedKeyBinder, Error>(PresharedKeyBinder::from(new_binder))
             })
             .collect::<Result<_, _>>()?;
