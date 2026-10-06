@@ -282,10 +282,20 @@ async fn run_login(args: &[String]) -> Result<()> {
             return Err(error.context("Helper login failed; no automatic retry was made"));
         }
     };
-    let updated = replace_config_token(&template, "pending", &token)?;
-    file.write_all(updated.as_bytes())
-        .context("save Helper login config; server may already have issued a new token")?;
-    file.sync_all().context("sync Helper login config")?;
+    let saved = replace_config_token(&template, "pending", &token).and_then(|updated| {
+        file.write_all(updated.as_bytes())
+            .context("save Helper login config")?;
+        file.sync_all().context("sync Helper login config")
+    });
+    if let Err(error) = saved {
+        // The server already issued this token and the old one may be invalid;
+        // it exists nowhere else, so hand it to the operator before failing.
+        eprintln!(
+            "Helper login succeeded but the new config was not saved.\n\
+             Put this token in the config manually (keep it private):\ntoken={token}"
+        );
+        return Err(error);
+    }
     println!(
         "Wrote oixCloud Helper config to {}; the running service is unchanged",
         output.display()
