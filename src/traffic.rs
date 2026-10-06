@@ -419,21 +419,19 @@ fn decode_sample(line: &[u8], index: u64) -> Result<Sample> {
     Ok(sample)
 }
 
-/// Accept Unix seconds or RFC3339 UTC minute/second timestamps. No implicit local timezone.
+/// Unix seconds, explicit Z/offset timestamps, or wall-clock time in the process timezone.
 pub fn parse_time(value: &str) -> Result<u64> {
     if value.bytes().all(|b| b.is_ascii_digit()) && !value.is_empty() {
         return value.parse().context("invalid Unix timestamp");
     }
     let bytes = value.as_bytes();
-    if !matches!(bytes.len(), 17 | 20)
+    if bytes.len() < 16
         || bytes[4] != b'-'
         || bytes[7] != b'-'
-        || bytes[10] != b'T'
+        || !matches!(bytes[10], b'T' | b' ')
         || bytes[13] != b':'
-        || bytes[bytes.len() - 1] != b'Z'
-        || (bytes.len() == 20 && bytes[16] != b':')
     {
-        bail!("timestamp must be Unix seconds or UTC YYYY-MM-DDTHH:MM[:SS]Z");
+        bail!("timestamp must be Unix seconds or YYYY-MM-DDTHH:MM[:SS][Z|+HH:MM|-HH:MM]");
     }
     let number = |start: usize, end: usize| -> Result<i64> {
         let part = &bytes[start..end];
@@ -449,10 +447,30 @@ pub fn parse_time(value: &str) -> Result<u64> {
     let day = number(8, 10)?;
     let hour = number(11, 13)?;
     let minute = number(14, 16)?;
-    let second = if bytes.len() == 20 {
-        number(17, 19)?
+    let (second, end) = if bytes.get(16) == Some(&b':') {
+        if bytes.len() < 19 {
+            bail!("incomplete timestamp seconds");
+        }
+        (number(17, 19)?, 19)
     } else {
-        0
+        (0, 16)
+    };
+    let offset = match &bytes[end..] {
+        [] => None,
+        [b'Z'] => Some(0),
+        [sign @ (b'+' | b'-'), _, _, b':', _, _] => {
+            let hour = number(end + 1, end + 3)?;
+            let minute = number(end + 4, end + 6)?;
+            if hour > 23 || minute > 59 {
+                bail!("invalid timezone offset");
+            }
+            // RFC3339 -00:00 means the local offset is unknown, not UTC.
+            if *sign == b'-' && hour == 0 && minute == 0 {
+                bail!("unknown -00:00 offset; use Z or +00:00");
+            }
+            Some((hour * 3600 + minute * 60) * if *sign == b'-' { -1 } else { 1 })
+        }
+        _ => bail!("invalid timestamp timezone suffix"),
     };
     let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
     let days = match month {
@@ -468,7 +486,10 @@ pub fn parse_time(value: &str) -> Result<u64> {
         _ => 0,
     };
     if year < 1970 || day < 1 || day > days || hour > 23 || minute > 59 || second > 59 {
-        bail!("invalid UTC timestamp");
+        bail!("invalid calendar timestamp");
+    }
+    if offset.is_none() {
+        return local_timestamp(year, month, day, hour, minute, second);
     }
     let y = year - i64::from(month <= 2);
     let era = y / 400;
@@ -476,7 +497,107 @@ pub fn parse_time(value: &str) -> Result<u64> {
     let m = month + if month > 2 { -3 } else { 9 };
     let doy = (153 * m + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Ok(((era * 146097 + doe - 719468) * 86400 + hour * 3600 + minute * 60 + second) as u64)
+    let timestamp = (era * 146097 + doe - 719468) * 86400 + hour * 3600 + minute * 60 + second
+        - offset.unwrap();
+    timestamp
+        .try_into()
+        .context("timestamp precedes Unix epoch")
+}
+
+fn initialize_local_timezone() {
+    unsafe extern "C" {
+        fn tzset();
+    }
+    static INITIALIZED: std::sync::Once = std::sync::Once::new();
+    // POSIX does not require localtime_r to initialize timezone state itself.
+    // TZ is fixed at process startup; never mutate the environment from worker threads.
+    INITIALIZED.call_once(|| unsafe { tzset() });
+}
+
+fn local_parts(timestamp: libc::time_t) -> Result<libc::tm> {
+    initialize_local_timezone();
+    let mut parts = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // localtime_r writes the entire tm on success; TZ (or the system zone) is handled by libc.
+    if unsafe { libc::localtime_r(&timestamp, parts.as_mut_ptr()) }.is_null() {
+        bail!("local timestamp is outside the platform range");
+    }
+    Ok(unsafe { parts.assume_init() })
+}
+
+fn local_timestamp(
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+) -> Result<u64> {
+    initialize_local_timezone();
+    let mut candidates = Vec::new();
+    // Check automatic, standard and daylight mappings by round-trip. mktime alone
+    // silently normalizes gaps and chooses one side of a repeated DST hour.
+    for isdst in [-1, 0, 1] {
+        let mut parts: libc::tm = unsafe { std::mem::zeroed() };
+        parts.tm_year = (year - 1900) as i32;
+        parts.tm_mon = (month - 1) as i32;
+        parts.tm_mday = day as i32;
+        parts.tm_hour = hour as i32;
+        parts.tm_min = minute as i32;
+        parts.tm_sec = second as i32;
+        parts.tm_isdst = isdst;
+        let timestamp = unsafe { libc::mktime(&mut parts) };
+        if timestamp < 0 {
+            continue;
+        }
+        let round_trip = local_parts(timestamp)?;
+        if round_trip.tm_year == (year - 1900) as i32
+            && round_trip.tm_mon == (month - 1) as i32
+            && round_trip.tm_mday == day as i32
+            && round_trip.tm_hour == hour as i32
+            && round_trip.tm_min == minute as i32
+            && round_trip.tm_sec == second as i32
+            && !candidates.contains(&timestamp)
+        {
+            candidates.push(timestamp);
+        }
+    }
+    match candidates.as_slice() {
+        [timestamp] => Ok(*timestamp as u64),
+        [] => bail!(
+            "local time does not exist or is outside the platform range; specify Z or an explicit offset"
+        ),
+        _ => {
+            bail!("ambiguous local time at a timezone transition; specify Z or an explicit offset")
+        }
+    }
+}
+
+/// Human-readable process-local time, including its UTC offset at this instant.
+pub fn format_local_time(timestamp: u64) -> Result<String> {
+    let timestamp = timestamp
+        .try_into()
+        .context("timestamp exceeds platform time range")?;
+    let parts = local_parts(timestamp)?;
+    let offset = parts.tm_gmtoff;
+    let magnitude = offset.unsigned_abs();
+    let mut suffix = format!(
+        "{}{:02}:{:02}",
+        if offset < 0 { '-' } else { '+' },
+        magnitude / 3600,
+        magnitude % 3600 / 60
+    );
+    if magnitude % 60 != 0 {
+        suffix.push_str(&format!(":{:02}", magnitude % 60));
+    }
+    Ok(format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{suffix}",
+        i64::from(parts.tm_year) + 1900,
+        parts.tm_mon + 1,
+        parts.tm_mday,
+        parts.tm_hour,
+        parts.tm_min,
+        parts.tm_sec
+    ))
 }
 
 #[cfg(test)]
@@ -654,11 +775,15 @@ mod tests {
     }
 
     #[test]
-    fn timestamps_are_strict_utc_and_calendar_validated() {
+    fn timestamps_validate_calendar_and_respect_explicit_offsets() {
         assert_eq!(parse_time("1970-01-01T00:00Z").unwrap(), 0);
         assert_eq!(parse_time("2000-02-29T12:34:56Z").unwrap(), 951827696);
         assert_eq!(parse_time("2026-10-06T00:00Z").unwrap(), 1791244800);
         assert_eq!(parse_time("1791244800").unwrap(), 1791244800);
+        assert_eq!(parse_time("2026-10-06T08:00+08:00").unwrap(), 1791244800);
+        assert_eq!(parse_time("2026-10-05T20:00:00-04:00").unwrap(), 1791244800);
+        assert_eq!(parse_time("2026-10-06 05:30+05:30").unwrap(), 1791244800);
+        assert_eq!(parse_time("2026-10-06T00:00+00:00").unwrap(), 1791244800);
         for bad in [
             "",
             "-1",
@@ -670,8 +795,13 @@ mod tests {
             "2026-01-01T24:00Z",
             "2026-01-01T12:60Z",
             "2026-01-01T12:00:60Z",
-            "2026-01-01T12:00+08:00",
-            "2026-01-01 12:00Z",
+            "2026-01-01T12:00+24:00",
+            "2026-01-01T12:00+08:60",
+            "2026-01-01T12:00+0800",
+            "2026-01-01T12:00-00:00",
+            "2026-01-01T12:00:Z",
+            "2026-01-01T12:00:00Zextra",
+            "1970-01-01T00:00+08:00",
             "1969-12-31T23:59Z",
         ] {
             assert!(parse_time(bad).is_err(), "{bad}");

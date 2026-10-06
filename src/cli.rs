@@ -46,7 +46,9 @@ It changes server-side token ownership, sends one request to the primary API,
 and does not overwrite the current config or reload the running service.
 
 traffic reads persisted minute samples, selecting timestamps in [--from, --to).
-TIME is Unix seconds or UTC YYYY-MM-DDTHH:MM[:SS]Z. With no range, it reports
+TIME is Unix seconds or YYYY-MM-DDTHH:MM[:SS] with optional Z/+HH:MM/-HH:MM.
+Without a suffix, use the local timezone (system default or TZ environment).
+DST gaps/ambiguous local times require an explicit offset. With no range, report
 all history in the file (across restarts and token changes). Unflushed traffic
 is not included. Default: traffic.jsonl beside the service config/token file.
 
@@ -141,9 +143,9 @@ fn run_traffic(args: &[String]) -> Result<()> {
             .and_then(Option::as_deref)
             .map(crate::traffic::parse_time)
             .transpose()
-            .map_err(|_| {
+            .map_err(|error| {
                 UsageError(format!(
-                    "--{key} requires Unix seconds or UTC YYYY-MM-DDTHH:MM[:SS]Z"
+                    "--{key}: {error}; expected Unix seconds or YYYY-MM-DDTHH:MM[:SS][Z|+HH:MM|-HH:MM]"
                 ))
                 .into()
             })
@@ -167,9 +169,26 @@ fn run_traffic(args: &[String]) -> Result<()> {
             report.bytes.udp_upload,
             report.bytes.udp_download
         );
+        let local = |timestamp: Option<u64>| {
+            timestamp.map_or_else(
+                || "unbounded/none".to_owned(),
+                |value| {
+                    crate::traffic::format_local_time(value).unwrap_or_else(|_| {
+                        format!("{value} (Unix seconds; local formatting unavailable)")
+                    })
+                },
+            )
+        };
         println!(
-            "Samples: {}; first={:?}, last={:?} (UTC Unix seconds)",
-            report.samples, report.first_sample_at, report.last_sample_at
+            "Range (local time): [{}, {})",
+            local(report.from),
+            local(report.to)
+        );
+        println!(
+            "Samples: {}; first={}, last={} (local time)",
+            report.samples,
+            local(report.first_sample_at),
+            local(report.last_sample_at)
         );
         println!("Persisted samples only; normally sampled every 60 seconds.");
         if report.incomplete_tail_ignored

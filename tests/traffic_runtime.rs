@@ -32,6 +32,133 @@ fn unused_port() -> u16 {
         .port()
 }
 
+#[test]
+fn query_respects_process_timezone_explicit_offsets_and_dst() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("traffic.jsonl");
+    // Samples immediately before, at, and at the end of a UTC+08 local day.
+    let start = 1791216000u64;
+    let mut text = String::new();
+    for timestamp in [start - 1, start, start + 86400] {
+        text.push_str(&format!("{{\"version\":1,\"timestamp\":{timestamp},\"since\":{},\"bytes\":{{\"tcp_upload\":10,\"tcp_download\":20,\"udp_upload\":0,\"udp_download\":0}}}}\n", timestamp - 60));
+    }
+    std::fs::write(&path, text).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let run = |zone: &str, args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_oixc-proxy"))
+            .env("TZ", zone)
+            .args(["traffic", "--file"])
+            .arg(&path)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let local = run(
+        "Asia/Shanghai",
+        &[
+            "--from",
+            "2026-10-06T00:00",
+            "--to",
+            "2026-10-07T00:00",
+            "--json",
+        ],
+    );
+    assert!(
+        local.status.success(),
+        "{}",
+        String::from_utf8_lossy(&local.stderr)
+    );
+    let expected: serde_json::Value = serde_json::from_slice(&local.stdout).unwrap();
+    assert_eq!(expected["from"], start);
+    assert_eq!(expected["to"], start + 86400);
+    assert_eq!(expected["samples"], 1);
+    assert_eq!(expected["total_bytes"], 30);
+    for (zone, from, to) in [
+        ("UTC0", "2026-10-06 00:00+08:00", "2026-10-07 00:00+08:00"),
+        ("Asia/Shanghai", "2026-10-05T16:00Z", "2026-10-06T16:00Z"),
+        ("UTC0", "1791216000", "1791302400"),
+    ] {
+        let output = run(zone, &["--from", from, "--to", to, "--json"]);
+        assert!(output.status.success());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+            expected
+        );
+    }
+    let human = run(
+        "Asia/Shanghai",
+        &["--from", "2026-10-06T00:00", "--to", "2026-10-07T00:00"],
+    );
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(
+        human
+            .contains("Range (local time): [2026-10-06T00:00:00+08:00, 2026-10-07T00:00:00+08:00)")
+    );
+    assert!(human.contains("first=2026-10-06T00:00:00+08:00"));
+    // UTC display differs, but numeric JSON remains stable. No parent-process TZ mutation.
+    let utc = run("UTC0", &["--all"]);
+    assert!(String::from_utf8_lossy(&utc.stdout).contains("first=2026-10-05T15:59:59+00:00"));
+    let eastern = "EST5EDT,M3.2.0/2,M11.1.0/2";
+    for (from, to, hours) in [
+        ("2026-03-08T00:00", "2026-03-09T00:00", 23),
+        ("2026-11-01T00:00", "2026-11-02T00:00", 25),
+    ] {
+        let output = run(eastern, &["--from", from, "--to", to, "--json"]);
+        assert!(output.status.success());
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report["to"].as_u64().unwrap() - report["from"].as_u64().unwrap(),
+            hours * 3600
+        );
+    }
+    for (time, error) in [
+        ("2026-03-08T02:30", "does not exist"),
+        ("2026-11-01T01:30", "ambiguous"),
+    ] {
+        let output = run(eastern, &["--from", time]);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(error),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    for (local, explicit) in [
+        ("2026-01-01T12:00", "2026-01-01T12:00-05:00"),
+        ("2026-07-01T12:00", "2026-07-01T12:00-04:00"),
+    ] {
+        let local = run(eastern, &["--from", local, "--json"]);
+        let explicit = run("UTC0", &["--from", explicit, "--json"]);
+        assert!(local.status.success());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&local.stdout).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(&explicit.stdout).unwrap()
+        );
+    }
+    let early = run(eastern, &["--from", "2026-11-01T01:30-04:00", "--json"]);
+    let late = run(eastern, &["--from", "2026-11-01T01:30-05:00", "--json"]);
+    assert!(early.status.success() && late.status.success());
+    let early: serde_json::Value = serde_json::from_slice(&early.stdout).unwrap();
+    let late: serde_json::Value = serde_json::from_slice(&late.stdout).unwrap();
+    assert_eq!(
+        late["from"].as_u64().unwrap() - early["from"].as_u64().unwrap(),
+        3600
+    );
+    let repeated = run(
+        eastern,
+        &[
+            "--from",
+            "2026-11-01T01:30-04:00",
+            "--to",
+            "2026-11-01T01:30-05:00",
+        ],
+    );
+    assert!(
+        String::from_utf8_lossy(&repeated.stdout)
+            .contains("Range (local time): [2026-11-01T01:30:00-04:00, 2026-11-01T01:30:00-05:00)")
+    );
+}
+
 #[tokio::test]
 async fn service_flushes_on_sigterm_and_keeps_history_across_restarts() {
     let directory = tempfile::tempdir().unwrap();
