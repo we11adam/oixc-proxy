@@ -179,7 +179,7 @@ oixc-proxy traffic --config /path/to/oixc-proxy.conf --json
 oixc-proxy traffic --file /path/to/traffic.jsonl --all --json
 ```
 
-默认在服务配置文件旁写入 `traffic.jsonl`；`serve-map` 则在 token 文件旁。独立线程通常在每个 UTC 整分钟采样并追加一行 JSON，随后同步到磁盘，不在转发路径做文件 I/O。收到 SIGTERM/Ctrl-C 或正常返回时补写最后一条部分分钟记录。文件和写入锁权限为 `0600`，不保存账户、节点、访问目标或凭据；查询需以服务用户运行（root 服务使用 `sudo`）。
+默认在服务配置文件旁写入 `traffic.jsonl`；`serve-map` 则在 token 文件旁。独立线程通常在每个 UTC 整分钟采样并追加一行 JSON，随后同步到磁盘，不在转发路径做文件 I/O。收到 SIGTERM、SIGINT（Ctrl-C）或正常返回时，退出前补写并同步最后一条不足一分钟的记录；SIGKILL（`kill -9`）无法触发补写。文件和写入锁权限为 `0600`，不保存账户、节点、访问目标或凭据；查询需以服务用户运行（root 服务使用 `sudo`）。
 
 时间参数接受 Unix 秒或 `YYYY-MM-DDTHH:MM[:SS]`（日期与时间之间也可用空格，但需给整个参数加引号）。无时区后缀时按运行查询命令的本机时区解释，遵循系统时区或 `TZ` 环境变量；`TZ` 的命名时区需要系统安装对应时区数据。`Z` 表示 UTC，`+08:00`、`-04:00` 等后缀使用明确偏移，与系统时区无关。夏令时跳过的本地时间或重复小时内的歧义时间会报错，需用 `Z` 或显式偏移消除歧义；未知偏移 `-00:00` 不接受。人类可读输出显示查询边界及首末样本的本地时间和当时的 UTC 偏移；JSON 和磁盘格式继续使用 Unix 秒，不随时区变化。
 
@@ -298,6 +298,14 @@ target/release/oixc-proxy install-launch-agent
 launchctl print "gui/$(id -u)/io.oixc.proxy"
 ```
 
+需要重启时，显式发送 SIGTERM，让服务先补写流量再退出：
+
+```sh
+launchctl kill SIGTERM "gui/$(id -u)/io.oixc.proxy"
+```
+
+安装器生成的 `KeepAlive=true` 会自动拉起新进程。命令返回仅表示信号已发送，应等待新 PID 和健康检查恢复。不要用 `kickstart -k` 保证补写：本机手册未承诺其具体停止信号。系统级 LaunchDaemon 使用 `sudo launchctl kill SIGTERM system/io.oixc.proxy`，以实际服务域和标签为准；更多更新步骤见 [部署文档](DEPLOY.md)。
+
 当 `perf-trace-sample-every` 非零时，stderr 日志会包含已脱敏、按请求划分的性能事件，覆盖 SOCKS 解析、物理出口初始化与切换、连接使用的接口/源地址/地址族、DNS/TCP/TLS 建连、Snell transport 新建与复用、首个 Snell flight、双向首包和 relay 清理。追踪默认关闭，避免同步日志输出拖慢数据面。它绝不会记录 token、PSK、目标名称、远端地址、ECH 配置或派生密钥材料。
 
 ## 在 Linux 上安装服务
@@ -314,6 +322,8 @@ target/release/oixc-proxy install-systemd
 systemctl --user status oixc-proxy.service
 journalctl --user -u oixc-proxy.service
 ```
+
+重启使用 `systemctl --user restart oixc-proxy.service`。生成的 unit 默认先发送 SIGTERM，让进程补写流量后退出；`TimeoutStopSec=10s` 到期仍未退出才强杀。自定义 unit 的信号和超时设置可能不同，核对方法见 [部署文档](DEPLOY.md)。
 
 在无头主机上，管理员可运行 `loginctl enable-linger USER`，使用户服务在注销后继续运行。
 

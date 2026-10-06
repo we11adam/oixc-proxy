@@ -45,8 +45,23 @@ bit, and `oixc-proxy version` output.
    health endpoint, and provider endpoint without exposing the token.
 2. Upload the new binary beside the installed one as `oixc-proxy.new`. Keep the
    old binary as `oixc-proxy.previous`, then atomically rename the new file.
-3. Restart with the existing mechanism: LaunchAgent on macOS, systemd user unit
-   on ordinary Linux, or procd init script on OpenWrt.
+3. Restart through the existing service manager, allowing pending traffic to
+   flush before exit:
+
+   - macOS: use `launchctl kill SIGTERM <service-target>` in the actual GUI or
+     system domain. With `KeepAlive=true`, wait for the old PID to exit and a
+     new PID to appear. Without KeepAlive, wait for exit, then use `kickstart`
+     without `-k`. Do not follow SIGTERM immediately with `kickstart -k`, whose
+     stop signal is not guaranteed by the local manual.
+   - Linux: use `systemctl [--user] restart oixc-proxy.service` for the existing
+     unit. The generated unit uses default SIGTERM and `TimeoutStopSec=10s`;
+     inspect effective kill/timeout settings for custom units. Do not substitute
+     a direct PID signal: `Restart=on-failure` may not relaunch a graceful exit.
+   - OpenWrt: use the existing procd init script's restart operation.
+
+   SIGKILL cannot flush traffic. Reserve forced termination for an unresponsive
+   service within authorized recovery scope, and report potential journal loss.
+
 4. Verify the installed hash and version, a new running PID, unchanged listener
    addresses, HTTP 204 from `/healthz`, and HTTP 200 from a provider endpoint.
 5. If the new process does not become healthy, restore `oixc-proxy.previous`,

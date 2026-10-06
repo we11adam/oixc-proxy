@@ -222,7 +222,8 @@ target/release/oixc-proxy install-launch-agent
    会**只为复制二进制这一步**请求 `sudo`；用 `sudo` 整体运行安装器会被拒绝；
 3. 创建 `~/Library/LaunchAgents/io.oixc.proxy.plist`（已存在则报错，
    见故障排查）；
-4. 创建日志目录并 `launchctl bootstrap` 注册、`kickstart -k` 启动。
+4. 创建日志目录并 `launchctl bootstrap` 注册、`kickstart -k` 启动
+   （首次安装流程；已有实例的常规重启见“更新”一节）。
 
 成功输出：
 
@@ -233,7 +234,7 @@ Installed /usr/local/bin/oixc-proxy and started LaunchAgent io.oixc.proxy from /
 ### 运行行为与日志
 
 - plist 中 `RunAtLoad` + `KeepAlive` 均为 `true`：**登录后自动启动**，
-  进程异常退出时自动拉起；
+  进程退出后自动拉起，包括收到 SIGTERM 后正常退出；
 - 服务以登录用户身份运行；
 - 日志保存在 `~/Library/Logs/oixc-proxy.stdout.log` / `oixc-proxy.stderr.log`，
   不含任何敏感信息（stderr 日志只含脱敏的、按请求统计的性能事件；从不
@@ -292,13 +293,26 @@ mv /usr/local/bin/oixc-proxy.new /usr/local/bin/oixc-proxy
 # 若提示权限不足：
 # sudo mv /usr/local/bin/oixc-proxy.new /usr/local/bin/oixc-proxy
 
-# 3. 重启服务（kill 并立即重启，KeepAlive 也会兜底）
-launchctl kickstart -k "gui/$(id -u)/io.oixc.proxy"
+# 3. 优雅重启：SIGTERM 触发补写，退出后由 KeepAlive 自动拉起
+launchctl kill SIGTERM "gui/$(id -u)/io.oixc.proxy"
 
-# 4. 确认新版本运行
-launchctl print "gui/$(id -u)/io.oixc.proxy" | grep -i "state"
+# 4. 等待旧 PID 退出、新 PID 出现，并按“验证运行”一节检查健康与转发
+launchctl print "gui/$(id -u)/io.oixc.proxy" | grep -E 'state =|pid ='
+/usr/local/bin/oixc-proxy version
 tail -3 ~/Library/Logs/oixc-proxy.stderr.log
 ```
+
+`launchctl kill` 返回仅表示信号已发送，不代表退出或重新启动已完成。
+SIGTERM / SIGINT（Ctrl-C）会让 oixc-proxy 在退出前补写并同步不足一分钟的
+流量；若同步失败，会报告错误。不要在旧进程退出前紧接着执行 `kickstart -k`：
+本机 `launchctl` 手册未承诺 `-k` 使用哪种停止信号，不能依赖它保证补写。
+SIGKILL（`kill -9`）无法捕获，强杀、崩溃或断电可能丢失尚未落盘的流量。
+
+上述命令针对安装器生成的用户级 LaunchAgent。系统级 LaunchDaemon 使用
+`sudo launchctl kill SIGTERM system/io.oixc.proxy`，标签以实际安装为准。
+若自定义 plist 未启用 `KeepAlive`，发送 SIGTERM 后应等待旧 PID 退出，
+再用 `launchctl kickstart <服务目标>` 启动（不加 `-k`）。修改 plist 的服务定义
+还需重新注册才能生效，单纯重启进程不会重读磁盘上的 plist。
 
 ### 卸载
 
@@ -323,8 +337,8 @@ rm -f ~/Library/Logs/oixc-proxy.stdout.log ~/Library/Logs/oixc-proxy.stderr.log
 | --- | --- | --- |
 | `do not run install-launch-agent with sudo` | 用 sudo 整体运行了安装器 | 以登录用户身份运行；sudo 只会在复制二进制时按需请求 |
 | 安装报 `service definition already exists` | plist 已存在（服务已装过） | 先 `launchctl bootout "gui/$(id -u)/io.oixc.proxy"`，`rm ~/Library/LaunchAgents/io.oixc.proxy.plist`，再重跑安装器 |
-| `launchctl bootstrap failed: 5: Input/output error` | 服务已在运行，重复注册 | 用 `launchctl kickstart -k "gui/$(id -u)/io.oixc.proxy"` 重启即可 |
-| 更新后启动报 `Killed: 9`（日志含 `OS_REASON_CODESIGNING`） | 用 `cp` 原地覆写了正在运行的签名可执行文件，内核代码签名缓存失效 | 用「临时文件 + `mv`」原子替换二进制（见“更新”一节），再 `launchctl kickstart -k` |
+| `launchctl bootstrap failed: 5: Input/output error` | 服务已在运行，重复注册 | 先检查服务状态；确需重启时按“更新”一节发送 SIGTERM，由 KeepAlive 自动拉起 |
+| 更新后启动报 `Killed: 9`（日志含 `OS_REASON_CODESIGNING`） | 用 `cp` 原地覆写了正在运行的签名可执行文件，内核代码签名缓存失效 | 用「临时文件 + `mv`」原子替换二进制（见“更新”一节）；运行中的实例优雅重启，已停止的实例用不带 `-k` 的 `launchctl kickstart` 启动 |
 | 启动报 `permissions` 错误 | 配置文件权限过宽 | `chmod 600 ~/.config/oixc-proxy/oixc-proxy.conf` |
 | 启动报 `outbound-ip is required` | listen 为 `0.0.0.0` 但未设 outbound-ip | 在配置中添加 `outbound-ip=<本机局域网 IP>` |
 | 切换网络后新连接提示 outbound IP 不可用 | 固定的 `outbound-ip` 已不属于活动网卡 | 将 `outbound-ip` 改为新网卡地址并重启；仅本机使用时可恢复回环监听，让程序自动选择物理出口 |
@@ -332,11 +346,11 @@ rm -f ~/Library/Logs/oixc-proxy.stdout.log ~/Library/Logs/oixc-proxy.stderr.log
 | 启动报 TLS / certificate 错误 | 系统时间不正确 | 系统设置 → 通用 → 日期与时间，打开“自动设置时间与日期” |
 | 启动报 DNS 解析失败 | 无法解析 `oix-api.dler.io` | `nslookup oix-api.dler.io`；检查网络与 DNS 设置 |
 | provider 返回 503 | 节点目录尚未加载完成 | 等待 5~10 秒后重试 |
-| provider 节点数为 0 | token 无效，或账户无 Fusion/CIA 节点 | `oixc-proxy information` 先验证 token；若账户确实无此类节点，手动编辑 `~/Library/LaunchAgents/io.oixc.proxy.plist`，在 `ProgramArguments` 数组中 `serve` 之后追加 `--disable-node-filter`，再 `launchctl kickstart -k "gui/$(id -u)/io.oixc.proxy"` |
+| provider 节点数为 0 | token 无效，或账户无 Fusion/CIA 节点 | `oixc-proxy information` 先验证 token；若账户确实无此类节点，手动编辑 `~/Library/LaunchAgents/io.oixc.proxy.plist`，在 `ProgramArguments` 数组中 `serve` 之后追加 `--disable-node-filter`；修改服务定义需重新注册，不能仅重启进程 |
 | 端口被占用 | 其他服务占用 6172/6173 | `lsof -nP -i :6172 -i :6173`；换端口或停掉冲突服务 |
 | 客户端连不上 SOCKS5 | 未允许 macOS 防火墙传入连接 | 系统设置 → 网络 → 防火墙 → 选项，允许 `oixc-proxy` 接受传入连接；确认监听为 `0.0.0.0` 且配置了 `outbound-ip` |
 | 局域网其他设备连不上 | 不在同一子网或路由不通 | 确认设备与本机同网段；从其他设备 `curl http://<本机IP>:6173/healthz` 测试 |
-| 运行一段时间后节点不再更新 | token 过期 | 更新配置文件中的 token 后 `launchctl kickstart -k "gui/$(id -u)/io.oixc.proxy"` |
+| 运行一段时间后节点不再更新 | token 过期 | 更新配置文件中的 token 后，按“更新”一节发送 SIGTERM 优雅重启 |
 
 ---
 
@@ -419,6 +433,22 @@ systemctl --user restart oixc-proxy.service
 systemctl --user status oixc-proxy.service | head -3
 journalctl --user -u oixc-proxy.service | tail -3
 ```
+
+`systemctl restart` 先停止再启动。默认停止信号是 SIGTERM；本仓库生成的 unit
+没有覆盖 `KillSignal` / `RestartKillSignal`，并设置 `TimeoutStopSec=10s`，
+因此正常重启会给 oixc-proxy 补写流量的机会，超时未退出则默认发送 SIGKILL。
+自定义 unit 或 drop-in 可改变这些设置，参见
+[systemd 官方信号说明](https://github.com/systemd/systemd/blob/main/man/systemd.kill.xml)。
+核对实际生效配置：
+
+```sh
+systemctl --user show oixc-proxy.service \
+  --property=KillSignal,RestartKillSignal,KillMode,TimeoutStopUSec,SendSIGKILL,FinalKillSignal
+```
+
+系统级 unit 改用 `sudo systemctl`，不加 `--user`。不要用直接向 PID 发送
+SIGTERM 代替 systemd 重启：生成的 unit 为 `Restart=on-failure`，正常退出
+未必自动拉起，而 `systemctl restart` 会显式启动新实例。
 
 ### 卸载
 

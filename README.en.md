@@ -273,8 +273,9 @@ oixc-proxy traffic --file /path/to/traffic.jsonl --all --json
 The default journal is `traffic.jsonl` beside the service config, or beside the
 token file for `serve-map`. A dedicated thread normally samples at each UTC
 minute boundary, appends one JSON line and syncs it to disk. Forwarding performs
-no file I/O. SIGTERM, Ctrl-C or normal return flushes a final partial-minute
-sample. The journal and writer lock have mode `0600`; no accounts, nodes,
+no file I/O. SIGTERM, SIGINT (Ctrl-C) or normal return writes and syncs a final
+partial-minute sample before exiting. SIGKILL (`kill -9`) cannot flush it.
+The journal and writer lock have mode `0600`; no accounts, nodes,
 destinations or credentials are recorded. Query as the service user (`sudo` for
 root-owned services).
 
@@ -477,6 +478,19 @@ Inspect the service:
 launchctl print "gui/$(id -u)/io.oixc.proxy"
 ```
 
+For a restart that lets the service flush pending traffic, explicitly send SIGTERM:
+
+```sh
+launchctl kill SIGTERM "gui/$(id -u)/io.oixc.proxy"
+```
+
+The generated `KeepAlive=true` setting relaunches it after exit. The command only
+sends the signal; wait for a new PID and restored health. Do not rely on
+`kickstart -k` for flushing: the local manual does not promise a specific stop
+signal. For a system LaunchDaemon, use
+`sudo launchctl kill SIGTERM system/io.oixc.proxy`, with the actual domain and
+label. See [DEPLOY.md](DEPLOY.md) for update procedures.
+
 When `perf-trace-sample-every` is nonzero, the stderr log contains sanitized,
 request-scoped performance events for SOCKS parsing, DNS/TCP/TLS setup, the
 initial Snell flight, first data in both directions and relay cleanup. Tracing
@@ -500,6 +514,10 @@ enables the service. It refuses to overwrite an existing unit.
 systemctl --user status oixc-proxy.service
 journalctl --user -u oixc-proxy.service
 ```
+
+Restart with `systemctl --user restart oixc-proxy.service`. The generated unit
+uses SIGTERM for a graceful traffic flush, with a 10-second stop timeout before
+forced termination. Custom units may differ; see [DEPLOY.md](DEPLOY.md).
 
 On a headless machine, an administrator can preserve the user service after
 logout with `loginctl enable-linger USER`.
