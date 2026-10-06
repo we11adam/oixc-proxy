@@ -70,6 +70,16 @@ pub fn socket_path(config: &Path) -> Result<PathBuf> {
     Ok(parent.join(format!(".oixc-{}.sock", &digest[..8])))
 }
 
+/// Unix socket paths must fit in `sockaddr_un.sun_path` (104 bytes on macOS,
+/// 108 on Linux) including the terminating NUL.
+fn fits_socket_address(path: &Path) -> bool {
+    let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    path.as_os_str().len() < address.sun_path.len()
+}
+
+const PATH_TOO_LONG: &str = "service control socket path exceeds the platform limit; \
+     move the config to a shorter directory to use refresh-nodes, reload-config and diagnose";
+
 struct SocketFile {
     path: PathBuf,
     inode: u64,
@@ -94,7 +104,7 @@ pub struct Server {
 /// socket file at once, without waiting for the runtime to shut down.
 pub struct Running {
     task: tokio::task::JoinHandle<Result<()>>,
-    _file: SocketFile,
+    _file: Option<SocketFile>,
 }
 impl Running {
     pub async fn finished(&mut self) -> Result<()> {
@@ -109,14 +119,30 @@ impl Drop for Running {
     }
 }
 
-/// Binds and starts the control server.
+/// Binds and starts the control server. The channel is optional for serving
+/// traffic, so a socket path the platform cannot represent disables it with a
+/// warning instead of refusing to start.
 pub async fn start(config: &Path, sender: mpsc::Sender<Request>) -> Result<Running> {
+    if !fits_socket_address(&socket_path(config)?) {
+        eprintln!("{PATH_TOO_LONG}");
+        return Ok(Running {
+            // Hold the sender so the service loop never sees a closed queue.
+            task: tokio::spawn(async move {
+                let _sender = sender;
+                std::future::pending().await
+            }),
+            _file: None,
+        });
+    }
     Ok(Server::bind(config).await?.spawn(sender))
 }
 
 impl Server {
     pub async fn bind(config: &Path) -> Result<Self> {
         let path = socket_path(config)?;
+        if !fits_socket_address(&path) {
+            bail!(PATH_TOO_LONG);
+        }
         if let Ok(metadata) = std::fs::symlink_metadata(&path) {
             if !metadata.file_type().is_socket() {
                 bail!("control socket path is occupied by a non-socket file");
@@ -151,7 +177,7 @@ impl Server {
     pub fn spawn(self, sender: mpsc::Sender<Request>) -> Running {
         Running {
             task: tokio::spawn(serve(self.listener, sender)),
-            _file: self.file,
+            _file: Some(self.file),
         }
     }
 }
@@ -218,8 +244,12 @@ async fn handle(stream: UnixStream, sender: mpsc::Sender<Request>) -> Result<()>
 }
 
 pub async fn send(config: &Path, command: Command) -> Result<Response> {
+    let path = socket_path(config)?;
+    if !fits_socket_address(&path) {
+        bail!(PATH_TOO_LONG);
+    }
     tokio::time::timeout(CONTROL_TIMEOUT, async {
-        let mut stream = UnixStream::connect(socket_path(config)?)
+        let mut stream = UnixStream::connect(path)
             .await
             .context("connect service control socket; run the command as the service user")?;
         let mut bytes = serde_json::to_vec(&command)?;
@@ -283,5 +313,28 @@ mod tests {
         let server = Server::bind(&config).await.unwrap();
         drop(server);
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn overlong_socket_path_disables_control_without_failing() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("d".repeat(120));
+        std::fs::create_dir(&nested).unwrap();
+        let config = nested.join("test.conf");
+        assert!(!fits_socket_address(&socket_path(&config).unwrap()));
+        assert!(Server::bind(&config).await.is_err());
+        let (sender, mut receive) = mpsc::channel(1);
+        let mut running = start(&config, sender).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), running.finished())
+                .await
+                .is_err()
+        );
+        assert!(
+            receive
+                .try_recv()
+                .is_err_and(|e| e == mpsc::error::TryRecvError::Empty)
+        );
+        assert!(send(&config, Command::RefreshNodes).await.is_err());
     }
 }
