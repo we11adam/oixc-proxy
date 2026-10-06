@@ -160,7 +160,7 @@ fn query_respects_process_timezone_explicit_offsets_and_dst() {
 }
 
 #[tokio::test]
-async fn service_flushes_on_sigterm_and_keeps_history_across_restarts() {
+async fn service_flushes_on_term_and_int_and_keeps_history_across_restarts() {
     let directory = tempfile::tempdir().unwrap();
     let config = directory.path().join("test.conf");
     let journal = directory.path().join("custom-traffic.jsonl");
@@ -206,7 +206,7 @@ proxies:
         .build()
         .unwrap();
     let mut previous_samples = 1;
-    for _ in 0..2 {
+    for signal in [libc::SIGTERM, libc::SIGINT] {
         let mut service = Service(
             Command::new(env!("CARGO_BIN_EXE_oixc-proxy"))
                 .args(["serve", "--config"])
@@ -249,10 +249,7 @@ proxies:
             .unwrap();
         assert!(!duplicate.status.success());
         assert!(String::from_utf8_lossy(&duplicate.stderr).contains("another process"));
-        assert_eq!(
-            unsafe { libc::kill(service.0.id() as i32, libc::SIGTERM) },
-            0
-        );
+        assert_eq!(unsafe { libc::kill(service.0.id() as i32, signal) }, 0);
         let status = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Some(status) = service.0.try_wait().unwrap() {
@@ -271,7 +268,7 @@ proxies:
         let samples = report["samples"].as_u64().unwrap();
         assert!(
             samples > previous_samples,
-            "SIGTERM must persist a final sample"
+            "signal {signal} must persist a final sample"
         );
         previous_samples = samples;
     }

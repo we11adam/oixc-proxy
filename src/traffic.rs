@@ -719,6 +719,12 @@ mod tests {
         let (sender, stop) = mpsc::channel();
         sender.send(()).unwrap();
         collect(journal, counters, stop).unwrap();
+        let row: Sample = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(row.timestamp >= row.since);
+        assert!(
+            row.timestamp - row.since < 60,
+            "must flush the partial minute without waiting for the next tick"
+        );
         let all = query(&path, None, None).unwrap();
         assert_eq!(
             all.bytes,
