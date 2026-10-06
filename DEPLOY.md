@@ -387,6 +387,8 @@ Installed /usr/local/bin/oixc-proxy and started systemd user service oixc-proxy.
 - 服务以登录用户身份运行，并启用加固（`NoNewPrivileges`、`PrivateTmp`、
   `ProtectSystem=strict`、`ProtectHome=read-only`、受限地址族等）；地址族白名单
   包含 `AF_NETLINK`，供程序读取物理网卡和地址变化；
+- 只有配置文件所在目录可写（`ReadWritePaths`），用于节点缓存、流量日志和
+  本地控制 socket；
 - 标准输出/错误进入 journal，不落敏感信息（同 macOS，见上一节说明）。
 
 查看状态与日志：

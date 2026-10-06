@@ -1455,6 +1455,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
+ReadWritePaths={}
 RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
 LockPersonality=true
 MemoryDenyWriteExecute=true
@@ -1464,7 +1465,8 @@ WantedBy=default.target
 "#,
         systemd_quote(executable),
         systemd_quote(config),
-        systemd_path(working)
+        systemd_path(working),
+        systemd_list_quote(working)
     )
 }
 
@@ -1483,6 +1485,16 @@ fn systemd_quote(path: &Path) -> String {
         .replace('"', "\\\"")
         .replace('%', "%%")
         .replace('$', "$$")
+}
+
+fn systemd_list_quote(path: &Path) -> String {
+    format!(
+        "\"{}\"",
+        path.to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%")
+    )
 }
 
 fn systemd_path(path: &Path) -> String {
@@ -1848,5 +1860,15 @@ mod tests {
             Path::new("/home/user/.config/oixc-proxy"),
         );
         assert!(unit.contains("RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX"));
+    }
+
+    #[test]
+    fn systemd_unit_allows_writes_beside_config() {
+        let unit = render_systemd(
+            Path::new("/usr/local/bin/oixc-proxy"),
+            Path::new("/home/user/my config/oixc-proxy.conf"),
+            Path::new("/home/user/my config"),
+        );
+        assert!(unit.contains("ProtectHome=read-only\nReadWritePaths=\"/home/user/my config\"\n"));
     }
 }
