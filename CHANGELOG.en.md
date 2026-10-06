@@ -4,6 +4,20 @@
 
 Notable changes to `oixc-proxy` are recorded in this file. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.6.1] - 2026-10-07
+
+### Fixed
+
+- Update the vendored rustls to 0.23.45, fixing GHSA-2mjx-qc3c-rqvc (affecting 0.23.13–0.23.44). After an ECH rejection, the server certificate is now verified against the public name as RFC 9849 requires.
+- Generated systemd units allow writes to the config directory, so node caches, traffic journals and the local control socket no longer fail under `ProtectSystem=strict`.
+- Remove the local control socket on SIGTERM, SIGINT and normal exit. Keep serving after transient accept errors such as descriptor exhaustion. A socket path over the system length limit now disables control commands with a warning instead of failing startup.
+- Keep counting traffic until the final flush on shutdown, so in-flight transfers are no longer dropped.
+- When `login --output` obtains a new token but cannot save it, print the token for manual configuration so it is not lost after the old token was rebound.
+
+### Usage notes and verification
+
+- Keep the rustls change as `vendor/rustls-ech-outer-alpn.patch`; `scripts/vendor-rustls.sh` generates and verifies the vendored tree from the published release. The release workflow verifies the tree, and a weekly workflow checks for newer rustls 0.23.x releases.
+
 ## [0.6.0] - 2026-10-06
 
 ### Added
@@ -139,6 +153,7 @@ First Rust release.
 - DNS and TCP racing: a shared transport context, coalesced signed DNS queries, concurrent A/AAAA lookups and staggered connection attempts.
 - Dial time budgets, sampled performance tracing and connection reuse tuning.
 
+[0.6.1]: https://github.com/we11adam/oixc-proxy/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/we11adam/oixc-proxy/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/we11adam/oixc-proxy/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/we11adam/oixc-proxy/compare/v0.3.0...v0.4.0

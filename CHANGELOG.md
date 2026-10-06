@@ -4,6 +4,20 @@
 
 本文件记录 `oixc-proxy` 各版本中值得注意的变更。版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.6.1] - 2026-10-07
+
+### 修复
+
+- 内置 rustls 更新到 0.23.45，修复 GHSA-2mjx-qc3c-rqvc（影响 0.23.13–0.23.44）；ECH 被服务端拒绝时，按 RFC 9849 改为以公开名称校验证书。
+- 生成的 systemd unit 允许写入配置文件所在目录，节点缓存、流量日志和本地控制 socket 不再因 `ProtectSystem=strict` 写入失败。
+- 本地控制 socket 在 SIGTERM、SIGINT 及正常退出时删除；accept 遇到临时错误（如文件描述符耗尽）时继续服务；路径超过系统 socket 长度限制时仅停用控制命令并告警，不再导致服务启动失败。
+- 停止时直到最终补写前持续计入流量，退出过程中仍在传输的数据不再漏计。
+- `login --output` 取得新 token 但保存失败时，输出该 token 供手动写入配置，避免原 token 已被重绑定而新 token 丢失。
+
+### 使用说明与验证
+
+- rustls 修改改为 `vendor/rustls-ech-outer-alpn.patch`，由 `scripts/vendor-rustls.sh` 从官方发布版本生成和校验；发布流程校验内置源码，并每周检查是否有更新的 rustls 0.23.x。
+
 ## [0.6.0] - 2026-10-06
 
 ### 新功能
@@ -139,6 +153,7 @@
 - DNS 与 TCP 竞速：共享传输上下文、合并签名 DNS 查询、A/AAAA 并发查询、错开的连接尝试。
 - 拨号时间预算、采样的性能 tracing 和连接复用调优。
 
+[0.6.1]: https://github.com/we11adam/oixc-proxy/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/we11adam/oixc-proxy/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/we11adam/oixc-proxy/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/we11adam/oixc-proxy/compare/v0.3.0...v0.4.0
