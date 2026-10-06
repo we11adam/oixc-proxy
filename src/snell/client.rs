@@ -566,7 +566,9 @@ impl SnellSession {
     }
 
     pub async fn read(&mut self, destination: &mut [u8]) -> Result<usize> {
-        self.physical.reader.read_application(destination).await
+        let length = self.physical.reader.read_application(destination).await?;
+        crate::traffic::record(crate::traffic::Direction::TcpDownload, length);
+        Ok(length)
     }
 
     pub async fn write(&mut self, content: &[u8]) -> Result<usize> {
@@ -601,7 +603,9 @@ impl SnellSessionReader<'_> {
     /// Returns the next chunk of server data, borrowed from the decrypted
     /// record. An empty slice means the server finished sending.
     pub async fn read_chunk(&mut self) -> Result<&[u8]> {
-        self.reader.read_application_chunk().await
+        let chunk = self.reader.read_application_chunk().await?;
+        crate::traffic::record(crate::traffic::Direction::TcpDownload, chunk.len());
+        Ok(chunk)
     }
 }
 
@@ -630,6 +634,7 @@ impl SnellPacketSession {
         encode_udp_request(frame, host, port, payload)
             .map_err(|error| error.context(DatagramError))?;
         records.write_frame(frame, 0).await?;
+        crate::traffic::record(crate::traffic::Direction::UdpUpload, payload.len());
         Ok(payload.len())
     }
 
@@ -643,6 +648,7 @@ impl SnellPacketSession {
         }
         let (address, payload) =
             decode_udp_response(frame).map_err(|error| error.context(DatagramError))?;
+        crate::traffic::record(crate::traffic::Direction::UdpDownload, payload.len());
         Ok((address, frame.len() - payload.len()))
     }
 
@@ -804,6 +810,7 @@ async fn write_application(
     content: &[u8],
 ) -> Result<usize> {
     writer.write_payload(content).await?;
+    crate::traffic::record(crate::traffic::Direction::TcpUpload, content.len());
     Ok(content.len())
 }
 

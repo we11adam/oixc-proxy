@@ -6,6 +6,8 @@
 /config.json
 /oixc-proxy.conf
 /token.txt
+/traffic.jsonl
+/traffic.jsonl.lock
 /information*.json
 /managed*.dat
 /surge*.conf

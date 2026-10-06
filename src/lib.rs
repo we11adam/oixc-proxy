@@ -18,6 +18,7 @@ pub mod snell;
 pub mod socks5;
 pub mod subscription;
 pub mod surge;
+pub mod traffic;
 pub mod transport;
 
 pub const APP_NAME: &str = "oixc-proxy";

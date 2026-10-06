@@ -28,14 +28,15 @@ use crate::transport::{EchDialer, TransportContext};
 const SERVE_MAP_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
 
 const USAGE: &str = "Usage:
+  oixc-proxy traffic [--config PATH | --file PATH] [--all] [--from TIME] [--to TIME] [--json]
   oixc-proxy login [--config PATH] --output PATH
   oixc-proxy information [--config PATH] --output PATH
   oixc-proxy preview-nodes [--config PATH] [--refresh] [--disable-node-filter]
   oixc-proxy refresh-nodes [--config PATH]
   oixc-proxy reload-config [--config PATH]
   oixc-proxy diagnose [--config PATH] --output PATH
-  oixc-proxy serve [--config PATH] [--disable-node-filter]
-  oixc-proxy serve-map [--token-file PATH] [--listen IP] [--base-port PORT] [--disable-node-filter]
+  oixc-proxy serve [--config PATH] [--disable-node-filter] [--traffic-file PATH]
+  oixc-proxy serve-map [--token-file PATH] [--listen IP] [--base-port PORT] [--disable-node-filter] [--traffic-file PATH]
   oixc-proxy version
   oixc-proxy install-launch-agent [--config PATH]
   oixc-proxy install-systemd [--config PATH]
@@ -43,6 +44,11 @@ const USAGE: &str = "Usage:
 login imports the configured token as oixCloud Helper and writes a new config.
 It changes server-side token ownership, sends one request to the primary API,
 and does not overwrite the current config or reload the running service.
+
+traffic reads persisted minute samples, selecting timestamps in [--from, --to).
+TIME is Unix seconds or UTC YYYY-MM-DDTHH:MM[:SS]Z. With no range, it reports
+all history in the file (across restarts and token changes). Unflushed traffic
+is not included. Default: traffic.jsonl beside the service config/token file.
 
 The information command is read-only. Its output file is created with mode
 0600 and must not already exist.
@@ -72,14 +78,15 @@ pub async fn run(args: Vec<String>) -> i32 {
         return 2;
     }
     let result = match args[0].as_str() {
+        "traffic" => run_traffic(&args[1..]),
         "login" => run_login(&args[1..]).await,
         "information" => run_information(&args[1..]).await,
         "preview-nodes" => run_preview_nodes(&args[1..]).await,
         "refresh-nodes" => run_control(&args[1..], crate::control::Command::RefreshNodes).await,
         "reload-config" => run_control(&args[1..], crate::control::Command::ReloadConfig).await,
         "diagnose" => run_diagnose(&args[1..]).await,
-        "serve" => run_serve(&args[1..]).await,
-        "serve-map" => run_serve_map(&args[1..]).await,
+        "serve" => run_with_traffic(&args[1..], false).await,
+        "serve-map" => run_with_traffic(&args[1..], true).await,
         "install-launch-agent" => run_install_launch_agent(&args[1..]),
         "install-systemd" => run_install_systemd(&args[1..]),
         "version" | "-V" | "--version" => run_version(&args[1..]),
@@ -103,6 +110,132 @@ pub async fn run(args: Vec<String>) -> i32 {
             1
         }
     }
+}
+
+fn run_traffic(args: &[String]) -> Result<()> {
+    let flags = parse_flags(
+        args,
+        &[
+            ("config", true),
+            ("file", true),
+            ("from", true),
+            ("to", true),
+            ("json", false),
+            ("all", false),
+        ],
+    )?;
+    if flags.contains_key("config") && flags.contains_key("file") {
+        return Err(UsageError("choose --config or --file, not both".into()).into());
+    }
+    if flags.contains_key("all") && (flags.contains_key("from") || flags.contains_key("to")) {
+        return Err(UsageError("--all cannot be combined with --from or --to".into()).into());
+    }
+    let path = if let Some(Some(path)) = flags.get("file") {
+        PathBuf::from(path)
+    } else {
+        crate::traffic::beside_config(&flag_path(&flags, "config", &default_proxy_config_path()?))
+    };
+    let time = |key: &str| -> Result<Option<u64>> {
+        flags
+            .get(key)
+            .and_then(Option::as_deref)
+            .map(crate::traffic::parse_time)
+            .transpose()
+            .map_err(|_| {
+                UsageError(format!(
+                    "--{key} requires Unix seconds or UTC YYYY-MM-DDTHH:MM[:SS]Z"
+                ))
+                .into()
+            })
+    };
+    let report = crate::traffic::query(&path, time("from")?, time("to")?)?;
+    if flags.contains_key("json") {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        let format_bytes =
+            |value: u64| format!("{value} bytes ({:.2} MiB)", value as f64 / 1048576.0);
+        println!(
+            "Upload:   {}\nDownload: {}\nTotal:    {}",
+            format_bytes(report.upload_bytes),
+            format_bytes(report.download_bytes),
+            format_bytes(report.total_bytes)
+        );
+        println!(
+            "TCP: upload={} download={} bytes; UDP: upload={} download={} bytes",
+            report.bytes.tcp_upload,
+            report.bytes.tcp_download,
+            report.bytes.udp_upload,
+            report.bytes.udp_download
+        );
+        println!(
+            "Samples: {}; first={:?}, last={:?} (UTC Unix seconds)",
+            report.samples, report.first_sample_at, report.last_sample_at
+        );
+        println!("Persisted samples only; normally sampled every 60 seconds.");
+        if report.incomplete_tail_ignored
+            || report.extended_windows != 0
+            || report.clock_reversals != 0
+        {
+            println!(
+                "Warning: incomplete_tail={}, extended_windows={}, clock_reversals={}",
+                report.incomplete_tail_ignored, report.extended_windows, report.clock_reversals
+            );
+        }
+    }
+    Ok(())
+}
+
+fn serve_flags(args: &[String], map: bool) -> Result<HashMap<String, Option<String>>> {
+    let mut allowed = vec![("disable-node-filter", false), ("traffic-file", true)];
+    if map {
+        allowed.extend([
+            ("token-file", true),
+            ("listen", true),
+            ("base-port", true),
+            ("node-filter-lines", true),
+            ("node-filter-regions", true),
+            ("node-filter-include", true),
+            ("node-filter-exclude", true),
+        ]);
+    } else {
+        allowed.push(("config", true));
+    }
+    parse_flags(args, &allowed)
+}
+
+async fn run_with_traffic(args: &[String], map: bool) -> Result<()> {
+    let flags = serve_flags(args, map)?;
+    let config = if map {
+        flag_path(&flags, "token-file", Path::new("token.txt"))
+    } else {
+        flag_path(&flags, "config", &default_proxy_config_path()?)
+    };
+    // Validate secrets/config before creating a journal, without logging their contents.
+    if map {
+        load_token_file(&config)?;
+    } else {
+        load_proxy_config(&config)?;
+    }
+    let path = flag_path(
+        &flags,
+        "traffic-file",
+        &crate::traffic::beside_config(&config),
+    );
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let recorder = crate::traffic::Recorder::start(&path)?;
+    let result = tokio::select! {
+        result = async { if map { run_serve_map(args).await } else { run_serve(args).await } } => result,
+        signal = tokio::signal::ctrl_c() => signal.context("receive interrupt"),
+        _ = terminate.recv() => Ok(()),
+    };
+    let saved = tokio::task::spawn_blocking(move || recorder.stop())
+        .await
+        .context("join traffic recorder")?;
+    if let Err(error) = saved {
+        eprintln!("traffic.final_flush_failed");
+        return result.and(Err(error));
+    }
+    result
 }
 
 async fn run_login(args: &[String]) -> Result<()> {
@@ -424,7 +557,7 @@ impl CatalogService {
 async fn run_serve(args: &[String]) -> Result<()> {
     rlimit::raise_nofile_limit();
     let default = default_proxy_config_path()?;
-    let flags = parse_flags(args, &[("config", true), ("disable-node-filter", false)])?;
+    let flags = serve_flags(args, false)?;
     let config_path = flag_path(&flags, "config", &default);
     let disable_node_filter = flags.contains_key("disable-node-filter");
     let service = load_proxy_config(&config_path)?;
@@ -621,19 +754,7 @@ async fn run_serve(args: &[String]) -> Result<()> {
 
 async fn run_serve_map(args: &[String]) -> Result<()> {
     rlimit::raise_nofile_limit();
-    let flags = parse_flags(
-        args,
-        &[
-            ("token-file", true),
-            ("listen", true),
-            ("base-port", true),
-            ("disable-node-filter", false),
-            ("node-filter-lines", true),
-            ("node-filter-regions", true),
-            ("node-filter-include", true),
-            ("node-filter-exclude", true),
-        ],
-    )?;
+    let flags = serve_flags(args, true)?;
     let disable_node_filter = flags.contains_key("disable-node-filter");
     let token_file = flags
         .get("token-file")
