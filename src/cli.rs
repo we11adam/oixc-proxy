@@ -1256,6 +1256,7 @@ fn create_exclusive(path: &Path) -> Result<fs::File> {
     #[cfg(windows)]
     {
         crate::windows::files::open_private(path, true, true)
+            .with_context(|| format!("create output file {}", path.display()))
     }
     #[cfg(not(windows))]
     {
