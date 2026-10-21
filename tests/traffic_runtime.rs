@@ -230,10 +230,10 @@ proxies:
                     .get(format!("http://127.0.0.1:{http_port}/status"))
                     .send()
                     .await
+                    && response.status().is_success()
+                    && socket.exists()
                 {
-                    if response.status().is_success() && socket.exists() {
-                        break;
-                    }
+                    break;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }

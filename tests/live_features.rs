@@ -75,10 +75,10 @@ async fn isolated_service_publishes_metadata_status_and_filtered_preview() {
                 service.0.try_wait().unwrap().is_none(),
                 "isolated service exited before readiness"
             );
-            if let Ok(response) = http.get(format!("{base}/status")).send().await {
-                if response.status().is_success() {
-                    break response.json::<serde_json::Value>().await.unwrap();
-                }
+            if let Ok(response) = http.get(format!("{base}/status")).send().await
+                && response.status().is_success()
+            {
+                break response.json::<serde_json::Value>().await.unwrap();
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }

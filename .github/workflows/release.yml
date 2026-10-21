@@ -27,7 +27,7 @@ jobs:
 
       - name: Install Rust toolchain
         shell: bash
-        run: rustup toolchain install 1.85.0 --profile minimal
+        run: rustup toolchain install 1.99.0 --profile minimal
 
       - name: Verify vendored rustls
         shell: bash
@@ -35,7 +35,7 @@ jobs:
 
       - name: Run tests
         shell: bash
-        run: cargo +1.85.0 test --locked --all-features
+        run: cargo +1.99.0 test --locked --all-features
 
   build:
     name: Build ${{ matrix.target }}
@@ -80,7 +80,7 @@ jobs:
 
       - name: Install Rust toolchain
         shell: bash
-        run: rustup toolchain install 1.85.0 --profile minimal --target "${{ matrix.target }}"
+        run: rustup toolchain install 1.99.0 --profile minimal --target "${{ matrix.target }}"
 
       - name: Install musl tools
         if: matrix.install_musl
@@ -96,7 +96,7 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           CC_x86_64_unknown_linux_musl: musl-gcc
           CC_aarch64_unknown_linux_musl: musl-gcc
-        run: cargo +1.85.0 build --locked --release --target "${{ matrix.target }}"
+        run: cargo +1.99.0 build --locked --release --target "${{ matrix.target }}"
 
       - name: Verify and package binary
         if: runner.os != 'Windows'

@@ -184,10 +184,11 @@ impl EchDialer {
             .tls_config
             .lock()
             .map_err(|_| anyhow::anyhow!("TLS configuration lock poisoned"))?;
-        if let Some(cached) = &*cached {
-            if cached.generation == trust.generation && Arc::ptr_eq(&cached.ech, &ech) {
-                return Ok(cached.config.clone());
-            }
+        if let Some(cached) = &*cached
+            && cached.generation == trust.generation
+            && Arc::ptr_eq(&cached.ech, &ech)
+        {
+            return Ok(cached.config.clone());
         }
         let mut config = ClientConfig::builder_with_provider(self.context.provider.clone())
             .with_ech(EchMode::Enable((*ech).clone()))
@@ -428,11 +429,11 @@ fn interleave_addresses(
         .into_iter()
         .filter(|address| seen.insert(*address))
         .collect::<Vec<_>>();
-    if let Some(preferred) = preferred {
-        if let Some(index) = unique.iter().position(|address| *address == preferred) {
-            let preferred = unique.remove(index);
-            unique.insert(0, preferred);
-        }
+    if let Some(preferred) = preferred
+        && let Some(index) = unique.iter().position(|address| *address == preferred)
+    {
+        let preferred = unique.remove(index);
+        unique.insert(0, preferred);
     }
 
     let prefer_ipv4 = unique.first().is_none_or(SocketAddr::is_ipv4);

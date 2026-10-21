@@ -6,6 +6,10 @@ Notable changes to `oixc-proxy` are recorded in this file. Versions follow [Sema
 
 ## [Unreleased]
 
+### Changed
+
+- Raise the minimum Rust version to 1.99 and pin local, CI and release toolchains to 1.99.0.
+
 ### Added
 
 - Support Windows x64 with native SCM service installation/removal, delayed automatic start, failure restart, private logs and a final traffic flush on Stop/Shutdown.

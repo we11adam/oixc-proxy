@@ -560,19 +560,19 @@ impl CatalogService {
             crate::diagnostics::EventKind::CatalogRefresh,
             result.as_ref().err(),
         );
-        if let Err(error) = &result {
-            if matches!(
+        if let Err(error) = &result
+            && matches!(
                 crate::diagnostics::classify(error),
                 crate::diagnostics::ErrorKind::Authentication
                     | crate::diagnostics::ErrorKind::Forbidden
-            ) {
-                self.manager.update_subscription(None, None).await;
-                if let Err(error) = self
-                    .cache
-                    .store_snapshot(&self.managed, None, self.fetched_at)
-                {
-                    eprintln!("clear cached account metadata: {error:#}");
-                }
+            )
+        {
+            self.manager.update_subscription(None, None).await;
+            if let Err(error) = self
+                .cache
+                .store_snapshot(&self.managed, None, self.fetched_at)
+            {
+                eprintln!("clear cached account metadata: {error:#}");
             }
         }
         result
@@ -1618,9 +1618,9 @@ fn home_directory() -> Result<PathBuf> {
 }
 
 fn format_duration(duration: Duration) -> String {
-    if duration.as_secs() % 3600 == 0 {
+    if duration.as_secs().is_multiple_of(3600) {
         format!("{}h0m0s", duration.as_secs() / 3600)
-    } else if duration.as_secs() % 60 == 0 {
+    } else if duration.as_secs().is_multiple_of(60) {
         format!("{}m0s", duration.as_secs() / 60)
     } else {
         format!("{duration:?}")

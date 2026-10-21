@@ -48,7 +48,7 @@ Windows 使用 [`install.ps1`](install.ps1)，支持校验发布资产及安装�
 
 ## 构建
 
-需要 Rust 1.85 或更高版本。
+需要 Rust 1.99 或更高版本；仓库通过 `rust-toolchain.toml` 固定使用 1.99.0，与 CI/release 保持一致。
 
 ```sh
 cargo test

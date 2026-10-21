@@ -65,10 +65,10 @@ pub fn is_service() -> bool {
 /// Called only after listeners and the private control endpoint are bound.
 pub fn ready() -> Result<()> {
     let handle = state().handle.lock().unwrap();
-    if let Some(handle) = *handle {
-        if !state().stopping.load(Ordering::Acquire) {
-            handle.set_service_status(status(ServiceState::Running, 0))?;
-        }
+    if let Some(handle) = *handle
+        && !state().stopping.load(Ordering::Acquire)
+    {
+        handle.set_service_status(status(ServiceState::Running, 0))?;
     }
     Ok(())
 }

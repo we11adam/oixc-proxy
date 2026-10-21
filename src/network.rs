@@ -537,14 +537,13 @@ fn default_physical_interface() -> Option<String> {
         .args(["-n", "get", "default"])
         .output()
         .ok()?;
-    if output.status.success() {
-        if let Some(name) = String::from_utf8_lossy(&output.stdout)
+    if output.status.success()
+        && let Some(name) = String::from_utf8_lossy(&output.stdout)
             .lines()
             .find_map(|line| line.trim().strip_prefix("interface:").map(str::trim))
             .filter(|name| !is_virtual_interface(name))
-        {
-            return Some(name.to_owned());
-        }
+    {
+        return Some(name.to_owned());
     }
 
     let output = std::process::Command::new("/usr/sbin/netstat")

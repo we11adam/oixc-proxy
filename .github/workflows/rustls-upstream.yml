@@ -8,6 +8,9 @@ on:
 permissions:
   contents: read
 
+env:
+  RUSTUP_TOOLCHAIN: "1.99.0"
+
 jobs:
   upstream:
     name: Check upstream rustls
@@ -16,6 +19,10 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: rustup toolchain install 1.99.0 --profile minimal
 
       # cargo-audit cannot see a path dependency, so watch upstream releases directly.
       - name: Verify vendored tree

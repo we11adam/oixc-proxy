@@ -71,12 +71,11 @@ impl TrustStore {
             let state = lock(&self.state);
             (state.snapshot.clone(), state.settled)
         };
-        if !settled {
-            if let Ok(last_attempt) = self.reload.clone().try_lock_owned() {
-                if !cooling_down(&last_attempt) {
-                    drop(self.start_reload(last_attempt));
-                }
-            }
+        if !settled
+            && let Ok(last_attempt) = self.reload.clone().try_lock_owned()
+            && !cooling_down(&last_attempt)
+        {
+            drop(self.start_reload(last_attempt));
         }
         snapshot
     }

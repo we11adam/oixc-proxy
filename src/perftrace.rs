@@ -100,7 +100,7 @@ fn append_fields(message: &mut String, fields: &[(&str, String)]) {
 }
 
 fn should_sample(request: u64, sample_every: u64) -> bool {
-    request.saturating_sub(1) % sample_every == 0
+    request.saturating_sub(1).is_multiple_of(sample_every)
 }
 
 fn format_duration(duration: Duration) -> String {

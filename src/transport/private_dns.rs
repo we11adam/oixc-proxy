@@ -184,10 +184,11 @@ impl PrivateDnsResolver {
     async fn cached(&self, host: &str, network_generation: u64) -> Option<Vec<IpAddr>> {
         let now = Instant::now();
         let mut cache = self.cache.lock().await;
-        if let Some(entry) = cache.get(host) {
-            if now < entry.expires && entry.network_generation == network_generation {
-                return Some(entry.addresses.clone());
-            }
+        if let Some(entry) = cache.get(host)
+            && now < entry.expires
+            && entry.network_generation == network_generation
+        {
+            return Some(entry.addresses.clone());
         }
         cache.remove(host);
         None

@@ -33,12 +33,11 @@ pub(crate) enum Direction {
 }
 
 pub(crate) fn record(direction: Direction, bytes: usize) {
-    if bytes != 0 {
-        if let Some(counters) = ACTIVE.get() {
-            if counters.enabled.load(Ordering::Relaxed) {
-                counters.values[direction as usize].fetch_add(bytes as u64, Ordering::Relaxed);
-            }
-        }
+    if bytes != 0
+        && let Some(counters) = ACTIVE.get()
+        && counters.enabled.load(Ordering::Relaxed)
+    {
+        counters.values[direction as usize].fetch_add(bytes as u64, Ordering::Relaxed);
     }
 }
 

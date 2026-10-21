@@ -143,10 +143,9 @@ proxies:
                 .get(format!("http://127.0.0.1:{http}/healthz"))
                 .send()
                 .await
+                && response.status().as_u16() == 204
             {
-                if response.status().as_u16() == 204 {
-                    break;
-                }
+                break;
             }
             assert!(Instant::now() < deadline, "service did not become healthy");
             tokio::time::sleep(Duration::from_millis(100)).await;

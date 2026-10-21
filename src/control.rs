@@ -112,10 +112,11 @@ struct SocketFile {
 #[cfg(unix)]
 impl Drop for SocketFile {
     fn drop(&mut self) {
-        if let Ok(metadata) = std::fs::symlink_metadata(&self.path) {
-            if metadata.ino() == self.inode && metadata.dev() == self.device {
-                let _ = std::fs::remove_file(&self.path);
-            }
+        if let Ok(metadata) = std::fs::symlink_metadata(&self.path)
+            && metadata.ino() == self.inode
+            && metadata.dev() == self.device
+        {
+            let _ = std::fs::remove_file(&self.path);
         }
     }
 }
