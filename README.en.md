@@ -16,7 +16,7 @@ behavior are intentionally compatible.
 ## Install a release
 
 GitHub Releases provide native macOS binaries and static musl Linux binaries
-for x86-64 and aarch64. With an authenticated GitHub CLI, download and inspect
+for x86-64 and aarch64, plus a Windows x64 executable ZIP. On macOS/Linux, with an authenticated GitHub CLI, download and inspect
 the installer, then run it:
 
 ```sh
@@ -42,6 +42,10 @@ sh install.sh --install-dir "$HOME/.local/bin"
 It installs only the binary; it does not create a config, install a service or
 restart an existing process. Continue with the platform service instructions
 below or the complete [deployment guide](DEPLOY.md).
+
+Windows uses [`install.ps1`](install.ps1), with optional native Windows service
+installation; see [Windows setup](#install-on-windows). Windows assets will be
+available starting with the next release containing this feature, not older tags.
 
 ## Use the deployment Skill with an agent
 
@@ -92,7 +96,7 @@ support at runtime and safely fall back when the extensions are unavailable.
 
 Set the package version in `Cargo.toml`, commit the release, then push a matching
 `vVERSION` tag. For example, package version `0.1.0` requires tag `v0.1.0`.
-The release workflow rejects mismatches, builds all four supported targets,
+The release workflow rejects mismatches, tests the native Windows service, builds all five supported targets,
 generates `SHA256SUMS` and creates or updates the GitHub Release.
 
 ## Configure and run
@@ -148,9 +152,13 @@ listener. Append `socks=1` when the client should use SOCKS5.
 
 ## Service configuration
 
-`serve`, `login`, `information`, `install-launch-agent` and `install-systemd` read
+On macOS/Linux, `serve`, `login`, `information`, `install-launch-agent` and `install-systemd` read
 `~/.config/oixc-proxy/oixc-proxy.conf` by default. `--config PATH` selects a
 different file.
+
+Windows defaults to `%ProgramData%\oixc-proxy\oixc-proxy.conf` and uses private
+NTFS ACLs instead of Unix mode `0600`. Its `TZ` override follows Windows CRT
+syntax (for example `CST-8`), not IANA names; explicit UTC offsets are portable.
 
 ### Log in as oixCloud Helper
 
@@ -421,6 +429,8 @@ oixc-proxy serve-map [--token-file PATH] [--listen IP] [--base-port PORT] [--tra
 oixc-proxy version
 oixc-proxy install-launch-agent [--config PATH]
 oixc-proxy install-systemd [--config PATH]
+oixc-proxy install-windows-service [--config PATH]
+oixc-proxy uninstall-windows-service
 ```
 
 `information` performs the read-only account/API request and creates a new JSON
@@ -450,6 +460,47 @@ The removed `serve-provider`, single-node `serve --index`, `dump-*`, `probe-*`,
 `seal-bundle`, `install-bundle` and `inspect-binary` commands remain removed.
 The reverse-engineered knowledge they depended on is retained in
 [docs/protocol.md](docs/protocol.md).
+
+## Install on Windows
+
+Windows x64 uses the native Service Control Manager; NSSM/WinSW are not needed.
+Download and inspect the script, then run in **Administrator PowerShell**:
+
+```powershell
+gh release download --repo we11adam/oixc-proxy --pattern install.ps1
+.\install.ps1 -InstallService -Config C:\secure\oixc-proxy.conf
+Get-Service oixc-proxy
+```
+
+The executable goes under `%ProgramFiles%\oixc-proxy`; the initial config is
+copied to `%ProgramData%\oixc-proxy\oixc-proxy.conf`, also the default Windows
+config path. Existing config/service registrations are not overwritten. Relative
+secret-file paths resolve against the copied config's directory; provision those
+files separately with private ACLs, or use absolute paths.
+
+Private directories/new files allow only SYSTEM and Administrators. The service
+runs as LocalSystem with delayed automatic start and a five-second failure restart.
+It reports Running after binding the proxy/control listeners. Logs, cache and
+`traffic.jsonl` live beside the config. Admin commands use a local-only,
+ACL-protected named pipe; no additional HTTP admin port or firewall rule is created.
+
+```powershell
+$proxy = "$env:ProgramFiles\oixc-proxy\oixc-proxy.exe"
+& $proxy reload-config
+& $proxy traffic --all
+Restart-Service oixc-proxy
+& $proxy uninstall-windows-service
+```
+
+SCM Stop/Shutdown flushes the final partial-minute traffic sample;
+`Restart-Service` stops then starts. Forced termination, crashes, power loss or
+system stop timeouts may still lose unflushed traffic. Uninstall removes only the
+service and preserves all files. Logs append indefinitely; archive them as needed.
+
+Before a Windows release is published, install the Rust MSVC toolchain and Visual
+Studio C++ Build Tools, build with `cargo build --release`, then use
+`install.ps1 -BinaryPath .\target\release\oixc-proxy.exe -InstallService -Config C:\secure\oixc-proxy.conf`.
+See [DEPLOY.md](DEPLOY.md#windows原生服务) for upgrades, rollback and timezone notes.
 
 ## Install on macOS
 

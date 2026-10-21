@@ -109,11 +109,21 @@ struct FileConfig {
 }
 
 pub fn default_proxy_config_path() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .context("locate home directory")?;
-    Ok(home.join(".config/oixc-proxy/oixc-proxy.conf"))
+    #[cfg(windows)]
+    {
+        std::env::var_os("ProgramData")
+            .filter(|value| !value.is_empty())
+            .map(|base| PathBuf::from(base).join("oixc-proxy/oixc-proxy.conf"))
+            .context("locate ProgramData directory")
+    }
+    #[cfg(not(windows))]
+    {
+        let home = std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .context("locate home directory")?;
+        Ok(home.join(".config/oixc-proxy/oixc-proxy.conf"))
+    }
 }
 
 pub fn load_proxy_config(path: &Path) -> Result<ProxyConfig> {
@@ -688,6 +698,10 @@ pub(crate) fn require_private_file(path: &Path, allow_insecure: bool) -> Result<
     let metadata = fs::metadata(path)?;
     if !metadata.is_file() {
         bail!("path is not a regular file");
+    }
+    #[cfg(windows)]
+    if !allow_insecure {
+        crate::windows::files::validate_private(&fs::File::open(path)?)?;
     }
     #[cfg(unix)]
     if !allow_insecure {

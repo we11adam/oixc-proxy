@@ -8,7 +8,7 @@
 
 ## 安装发布版
 
-GitHub Releases 提供 x86-64 和 aarch64 的原生 macOS 二进制，以及静态 musl Linux 二进制。使用已登录的 GitHub CLI 下载并检查安装脚本，然后运行：
+GitHub Releases 提供 x86-64 和 aarch64 的原生 macOS 二进制、静态 musl Linux 二进制，以及 Windows x64 的 `.exe` 压缩包。macOS/Linux 使用已登录的 GitHub CLI 下载并检查安装脚本，然后运行：
 
 ```sh
 gh release download --repo we11adam/oixc-proxy --pattern install.sh --clobber
@@ -25,6 +25,8 @@ sh install.sh --install-dir "$HOME/.local/bin"
 ```
 
 安装脚本只安装二进制，不会创建配置、安装服务或重启现有进程。接下来可按照下方平台服务说明操作，也可查阅完整的[部署指南](DEPLOY.md)。
+
+Windows 使用 [`install.ps1`](install.ps1)，支持校验发布资产及安装原生 Windows 服务；见[Windows 部署说明](#在-windows-上安装服务)。这些资产会从包含此功能的下一版 Release 开始提供，旧版 Release 没有 Windows 产物。
 
 ## 让 Agent 使用部署 Skill
 
@@ -57,7 +59,7 @@ cargo build --release
 
 ## 发布版本
 
-修改 `Cargo.toml` 中的包版本，提交发布变更，然后推送对应的 `vVERSION` tag。例如，包版本 `0.1.0` 必须使用 tag `v0.1.0`。Release workflow 会拒绝版本不匹配的 tag，构建全部四个受支持目标，生成 `SHA256SUMS`，并创建或更新 GitHub Release。
+修改 `Cargo.toml` 中的包版本，提交发布变更，然后推送对应的 `vVERSION` tag。例如，包版本 `0.1.0` 必须使用 tag `v0.1.0`。Release workflow 会拒绝版本不匹配的 tag，构建全部五个受支持目标，生成 `SHA256SUMS`，并创建或更新 GitHub Release。发布前还运行 Windows 原生服务测试。
 
 ## 配置并运行
 
@@ -98,7 +100,7 @@ OIXC = select, policy-path=http://127.0.0.1:6173/surge-proxies.conf, update-inte
 
 ## 服务配置
 
-`serve`、`login`、`information`、`install-launch-agent` 和 `install-systemd` 默认读取 `~/.config/oixc-proxy/oixc-proxy.conf`。使用 `--config PATH` 可指定其他文件。
+`serve`、`login`、`information` 等命令在 macOS/Linux 默认读取 `~/.config/oixc-proxy/oixc-proxy.conf`，Windows 默认读取 `%ProgramData%\oixc-proxy\oixc-proxy.conf`。使用 `--config PATH` 可指定其他文件。Windows 用 NTFS ACL 保护私密文件，而不是 Unix `0600`。
 
 ### 以 oixCloud Helper 身份登录
 
@@ -263,6 +265,8 @@ oixc-proxy serve-map [--token-file PATH] [--listen IP] [--base-port PORT] [--tra
 oixc-proxy version
 oixc-proxy install-launch-agent [--config PATH]
 oixc-proxy install-systemd [--config PATH]
+oixc-proxy install-windows-service [--config PATH]
+oixc-proxy uninstall-windows-service
 ```
 
 `information` 发起只读账户/API 请求，并以 `0600` 权限创建新的 JSON 文件；它拒绝覆盖已有文件。
@@ -274,6 +278,32 @@ oixc-proxy install-systemd [--config PATH]
 `version` 会输出包版本、构建二进制时的 Git commit id（短 hash；工作区存在未提交变更时追加 `-dirty`）以及 UTC 构建时间。元数据由 `build.rs` 在编译时捕获；如果不在 Git checkout 中，则 commit id 显示为 `unknown`。
 
 已移除的 `serve-provider`、单节点 `serve --index`、`dump-*`、`probe-*`、`seal-bundle`、`install-bundle` 和 `inspect-binary` 命令不会恢复。它们所依赖的逆向知识保留在 [`docs/protocol.md`](docs/protocol.md) 中。
+
+## 在 Windows 上安装服务
+
+支持 Windows x64，使用 Windows 原生 SCM 服务，不依赖 NSSM/WinSW。在**管理员 PowerShell** 中下载并检查 `install.ps1`，准备好配置后安装：
+
+```powershell
+gh release download --repo we11adam/oixc-proxy --pattern install.ps1
+.\install.ps1 -InstallService -Config C:\secure\oixc-proxy.conf
+Get-Service oixc-proxy
+```
+
+脚本将程序安装到 `%ProgramFiles%\oixc-proxy`，把首次提供的配置复制到 `%ProgramData%\oixc-proxy\oixc-proxy.conf`，并限制目录及新文件仅 SYSTEM/Administrators 可访问。已有配置和服务不会被覆盖。配置中的相对文件路径相对于复制后的配置目录；额外 token/密码文件须单独放到受保护位置或使用绝对路径。
+
+服务以 LocalSystem 运行，延迟自动启动，失败后 5 秒重启；仅在代理与控制端点绑定完成后报告 Running。配置旁保存 `oixc-proxy.log`、节点缓存和 `traffic.jsonl`。管理命令使用受 ACL 保护、拒绝远程连接的本地命名管道，需管理员权限。无需开放额外管理端口，也不会自动修改防火墙。
+
+```powershell
+$proxy = "$env:ProgramFiles\oixc-proxy\oixc-proxy.exe"
+& $proxy reload-config
+& $proxy traffic --all
+Restart-Service oixc-proxy
+& $proxy uninstall-windows-service
+```
+
+SCM Stop/Shutdown 会触发最终不足一分钟的流量回写；`Restart-Service` 先 Stop 再 Start。强制结束进程、崩溃、断电或系统停止超时仍可能丢失未落盘数据。卸载仅停止并删除服务，保留程序、配置和历史。日志持续追加，需自行归档。
+
+尚未发布时可在 Windows 安装 Rust MSVC 工具链和 Visual Studio C++ Build Tools，执行 `cargo build --release`，再用 `install.ps1 -BinaryPath .\target\release\oixc-proxy.exe -InstallService -Config C:\secure\oixc-proxy.conf` 安装本地构建。完整升级、回滚与时区说明见 [DEPLOY.md](DEPLOY.md#windows原生服务)。
 
 ## 在 macOS 上安装服务
 

@@ -1,8 +1,7 @@
 # oixc-proxy 部署指南
 
-本文档描述如何在三种平台上部署 `oixc-proxy`：macOS（LaunchAgent 用户服务）、
-Linux（systemd 用户服务）以及运行 OpenWrt 的嵌入式设备（以斐讯 N1 为例，
-procd 守护进程）。
+本文档描述 macOS（LaunchAgent）、Linux（systemd）、OpenWrt（procd），
+以及 Windows x64（原生 SCM 服务）的部署。
 
 > **约定**：`~` 即用户主目录。示例 token 统一写作
 > `YOUR_OIXCLOUD_ACCESS_TOKEN`，请替换为真实值。命令在**控制机**的终端
@@ -13,6 +12,7 @@ procd 守护进程）。
 | macOS | LaunchAgent 用户服务，登录后开机自启 | 本机代理 | GitHub Release 或 `target/release/oixc-proxy` 本机构建 |
 | Linux | systemd 用户服务 | 本机 / 服务器代理 | GitHub Release 静态产物或本机构建 |
 | OpenWrt（斐讯 N1） | procd 守护进程，断电自启 | 局域网共享、7×24 低功耗 | GitHub Release 或 aarch64 musl 静态交叉编译 |
+| Windows x64 | 原生 Windows 服务，延迟开机自启 | 本机 / 服务器代理 | Windows MSVC ZIP 或本机构建 |
 
 ---
 
@@ -203,6 +203,112 @@ rules:
 - 节点目录每小时自动刷新；客户端按自己的 `interval` 拉取即可感知变更。
 
 ---
+
+## Windows（原生服务）
+
+要求 Windows x64、管理员 PowerShell 5.1+ 和 NTFS 权限支持。不需要 NSSM/WinSW，
+不改变系统代理设置或防火墙。Windows 发布资产从包含此功能的下一版 Release 开始提供；
+已有 0.6.1 Release 没有 Windows 二进制。
+
+### 首次安装
+
+准备好与其他平台同格式的配置（例如 `C:\secure\oixc-proxy.conf`）。不要把 token
+写到命令行或脚本参数中。配置复制后，token-file、密码文件等相对路径以
+`%ProgramData%\oixc-proxy` 为基准；请预先把引用文件放到私有目录，或使用绝对路径。
+
+在管理员 PowerShell 下载并检查脚本后运行：
+
+```powershell
+gh release download --repo we11adam/oixc-proxy --pattern install.ps1
+.\install.ps1 -InstallService -Config C:\secure\oixc-proxy.conf
+Get-Service oixc-proxy
+curl.exe --noproxy '*' -i http://127.0.0.1:16173/healthz
+```
+
+`/healthz` 端口按实际 `nodelist-listen` 修改，正常应返回 204；再检查 provider 返回 200。
+脚本用 `gh` 的已有认证下载私有资产；未认证时仅尝试公开 HTTPS 下载。
+先校验 ZIP 的 SHA256 和唯一文件名，再运行版本检查。
+
+尚未发布或使用本地源码时，在 Windows 安装 Rust MSVC 工具链和 Visual Studio C++
+Build Tools（包括 Windows SDK），然后执行：
+
+```powershell
+cargo build --release
+.\install.ps1 -BinaryPath .\target\release\oixc-proxy.exe -InstallService -Config C:\secure\oixc-proxy.conf
+```
+
+`-BinaryPath` 由使用者提供可信本地构建，不执行 Release 清单校验。
+仅安装二进制时省略 `-InstallService`，不会创建配置或自动启停服务。
+`-Version vVERSION` 可选择已包含 Windows 资产的具体 Release。
+
+| 项目 | 默认值 / 行为 |
+| --- | --- |
+| 程序 | `%ProgramFiles%\oixc-proxy\oixc-proxy.exe` |
+| 默认配置 | `%ProgramData%\oixc-proxy\oixc-proxy.conf`，也支持显式 `--config` |
+| 日志、缓存、流量 | 位于服务配置目录，日志为 `oixc-proxy.log`，流量为 `traffic.jsonl` |
+| 服务身份 | LocalSystem；延迟自动启动，失败 5 秒后重启 |
+| 就绪 | 代理、nodelist 和本地控制端点绑定成功后才报告 Running |
+| 私密文件 | 明确 DACL，仅服务用户、SYSTEM、Administrators；拒绝其他主体的允许 ACE |
+| 管理命令 | 本地命名管道，拒绝远程客户端，系统服务部署需管理员运行 |
+
+脚本为专用目录及新文件设置 SYSTEM/Administrators ACL；已有配置不覆盖，已有服务不重装。
+新进程没有用户桌面会话，不能依赖用户登录后才出现的映射盘、用户代理或用户证书。
+日志持续追加，需自行轮换/归档。Windows 网卡发现使用原生 API；Snell 和私有 DNS
+出站套接字同时绑定选定源地址及接口，网络变化沿用现有 generation 清理机制。
+
+### 管理、停止与流量回写
+
+```powershell
+$proxy = "$env:ProgramFiles\oixc-proxy\oixc-proxy.exe"
+& $proxy reload-config
+& $proxy refresh-nodes
+& $proxy diagnose --output "$env:ProgramData\oixc-proxy\diagnostic.json"
+& $proxy traffic --all
+Stop-Service oixc-proxy
+Start-Service oixc-proxy
+Restart-Service oixc-proxy
+```
+
+SCM 的 Stop/Shutdown 控制消息不是 POSIX 信号，但会进入同一优雅退出流程：停止服务，
+补写并同步不足一分钟的流量，清理运行时，再报告 Stopped。`Restart-Service` 先 Stop 再 Start。
+强杀进程、崩溃、断电及系统停止超时不能保证补写；不要用 `Stop-Process -Force` 代替正常停止。
+
+`traffic` 无后缀时间按 Windows 本机时区解释；如设置 `TZ`，遵循 Windows CRT 格式
+（如 `CST-8` 表示 UTC+08），不是 Unix IANA 名称（如 `Asia/Shanghai`）。
+跨主机查询建议显式 `Z`/UTC 偏移，避免时区歧义；磁盘和 JSON 时间始终是 Unix 秒。
+
+### 升级、回滚和卸载
+
+Windows 正在执行的 `.exe` 不能直接替换，先停止并确认 Stopped，再运行二进制安装：
+
+```powershell
+Stop-Service oixc-proxy
+(Get-Service oixc-proxy).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(60))
+.\install.ps1
+Start-Service oixc-proxy
+Get-Service oixc-proxy
+```
+
+不要传 `-InstallService` 重建已有服务。脚本保留 `oixc-proxy.previous.exe`，配置、
+服务注册和历史不变；更新后重新检查版本、PID、204 健康状态和 200 provider。
+若验证失败，停止服务后将旧程序恢复，再启动并验证：
+
+```powershell
+Stop-Service oixc-proxy
+(Get-Service oixc-proxy).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(60))
+$directory = "$env:ProgramFiles\oixc-proxy"
+Copy-Item "$directory\oixc-proxy.previous.exe" "$directory\oixc-proxy.exe" -Force
+Start-Service oixc-proxy
+```
+
+卸载只删除服务，不删除任何文件：
+
+```powershell
+& "$env:ProgramFiles\oixc-proxy\oixc-proxy.exe" uninstall-windows-service
+```
+
+服务无法启动时查看配置旁日志和 Windows System 事件日志。ACL 错误时先检查引用文件
+权限，不要开启不安全权限选项绕过。现有服务启动失败或停止超时会保留注册和文件供排查。
 
 ## macOS（LaunchAgent 开机自启）
 

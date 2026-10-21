@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::io;
 
 #[cfg(unix)]
@@ -107,7 +108,7 @@ fn darwin_maxfilesperproc() -> Option<rlim_t> {
     (rc == 0 && value > 0).then_some(value as rlim_t)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

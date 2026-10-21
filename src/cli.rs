@@ -40,6 +40,8 @@ const USAGE: &str = "Usage:
   oixc-proxy version
   oixc-proxy install-launch-agent [--config PATH]
   oixc-proxy install-systemd [--config PATH]
+  oixc-proxy install-windows-service [--config PATH]
+  oixc-proxy uninstall-windows-service
 
 login imports the configured token as oixCloud Helper and writes a new config.
 It changes server-side token ownership, sends one request to the primary API,
@@ -52,8 +54,8 @@ DST gaps/ambiguous local times require an explicit offset. With no range, report
 all history in the file (across restarts and token changes). Unflushed traffic
 is not included. Default: traffic.jsonl beside the service config/token file.
 
-The information command is read-only. Its output file is created with mode
-0600 and must not already exist.
+The information command is read-only. Its output file is private (0600 on Unix,
+restricted ACL on Windows) and must not already exist.
 
 --disable-node-filter publishes all managed nodes instead of only those
 whose names contain Fusion or CIA markers. Use this when your
@@ -91,6 +93,8 @@ pub async fn run(args: Vec<String>) -> i32 {
         "serve-map" => run_with_traffic(&args[1..], true).await,
         "install-launch-agent" => run_install_launch_agent(&args[1..]),
         "install-systemd" => run_install_systemd(&args[1..]),
+        "install-windows-service" => run_install_windows_service(&args[1..]),
+        "uninstall-windows-service" => run_uninstall_windows_service(&args[1..]),
         "version" | "-V" | "--version" => run_version(&args[1..]),
         "help" | "-h" | "--help" => {
             print!("{USAGE}");
@@ -240,12 +244,11 @@ async fn run_with_traffic(args: &[String], map: bool) -> Result<()> {
         "traffic-file",
         &crate::traffic::beside_config(&config),
     );
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let shutdown = shutdown_signal()?;
     let recorder = crate::traffic::Recorder::start(&path)?;
     let result = tokio::select! {
         result = async { if map { run_serve_map(args).await } else { run_serve(args).await } } => result,
-        signal = tokio::signal::ctrl_c() => signal.context("receive interrupt"),
-        _ = terminate.recv() => Ok(()),
+        result = shutdown => result,
     };
     let saved = tokio::task::spawn_blocking(move || recorder.stop())
         .await
@@ -255,6 +258,30 @@ async fn run_with_traffic(args: &[String], map: bool) -> Result<()> {
         return result.and(Err(error));
     }
     result
+}
+
+fn shutdown_signal() -> Result<impl std::future::Future<Output = Result<()>>> {
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    Ok(async move {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => result.context("receive interrupt"),
+                _ = terminate.recv() => Ok(()),
+            }
+        }
+        #[cfg(windows)]
+        {
+            if crate::windows::service::is_service() {
+                // SCM processes have no console; installing a console handler can fail.
+                crate::windows::service::stopping().await;
+                Ok(())
+            } else {
+                tokio::signal::ctrl_c().await.context("receive interrupt")
+            }
+        }
+    })
 }
 
 async fn run_login(args: &[String]) -> Result<()> {
@@ -678,6 +705,8 @@ async fn run_serve(args: &[String]) -> Result<()> {
     let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<crate::control::Request>(8);
     // Owned here so a graceful stop, which drops this future, removes the socket.
     let mut control = crate::control::start(&config_path, control_tx).await?;
+    #[cfg(windows)]
+    crate::windows::service::ready()?;
     let mut refresh = tokio::time::interval(service.node_refresh_interval);
     if !from_cache {
         refresh.tick().await;
@@ -1224,16 +1253,23 @@ fn flag_path(flags: &HashMap<String, Option<String>>, name: &str, default: &Path
 }
 
 fn create_exclusive(path: &Path) -> Result<fs::File> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        crate::windows::files::open_private(path, true, true)
     }
-    options
-        .open(path)
-        .with_context(|| format!("create output file {}", path.display()))
+    #[cfg(not(windows))]
+    {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(path)
+            .with_context(|| format!("create output file {}", path.display()))
+    }
 }
 
 fn write_exclusive(path: &Path, content: &[u8]) -> Result<()> {
@@ -1243,6 +1279,38 @@ fn write_exclusive(path: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn run_install_windows_service(args: &[String]) -> Result<()> {
+    let flags = parse_flags(args, &[("config", true)])?;
+    let config = flag_path(&flags, "config", &default_proxy_config_path()?);
+    #[cfg(windows)]
+    {
+        crate::windows::service::install(&config)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = config;
+        bail!("Windows service installation is supported only on Windows");
+    }
+}
+
+fn run_uninstall_windows_service(args: &[String]) -> Result<()> {
+    parse_flags(args, &[])?;
+    #[cfg(windows)]
+    {
+        crate::windows::service::uninstall()
+    }
+    #[cfg(not(windows))]
+    {
+        bail!("Windows service removal is supported only on Windows");
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_install_launch_agent(_args: &[String]) -> Result<()> {
+    bail!("LaunchAgent installation is supported only on macOS");
+}
+
+#[cfg(target_os = "macos")]
 fn run_install_launch_agent(args: &[String]) -> Result<()> {
     if std::env::consts::OS != "macos" {
         bail!("LaunchAgent installation is supported only on macOS");
@@ -1327,11 +1395,14 @@ fn run_install_systemd(args: &[String]) -> Result<()> {
 }
 
 fn ensure_not_root(command: &str) -> Result<()> {
+    #[cfg(unix)]
     if unsafe { libc::geteuid() } == 0 {
         bail!(
             "do not run {command} with sudo; run it as the login user (sudo is requested only for installing /usr/local/bin/oixc-proxy)"
         );
     }
+    #[cfg(not(unix))]
+    let _ = command;
     Ok(())
 }
 
@@ -1400,6 +1471,7 @@ fn write_service_file(path: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn render_launch_agent(
     executable: &Path,
     config: &Path,
@@ -1480,6 +1552,7 @@ WantedBy=default.target
     )
 }
 
+#[cfg(target_os = "macos")]
 fn xml_escape(path: &Path) -> String {
     path.to_string_lossy()
         .replace('&', "&amp;")

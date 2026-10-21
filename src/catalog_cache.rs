@@ -1,4 +1,6 @@
-use std::fs::{self, OpenOptions};
+use std::fs;
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -171,18 +173,26 @@ fn write_private_atomic(path: &Path, content: &[u8]) -> Result<()> {
         std::process::id()
     ));
     let write_result = (|| {
-        let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&temporary)
-            .with_context(|| format!("create node catalog cache {}", temporary.display()))?;
+        #[cfg(windows)]
+        let mut file = crate::windows::files::open_private(&temporary, true, true)?;
+        #[cfg(not(windows))]
+        let mut file = {
+            let mut options = OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options
+                .open(&temporary)
+                .with_context(|| format!("create node catalog cache {}", temporary.display()))?
+        };
         file.write_all(content)?;
         file.sync_all()?;
+        // Private Windows handles deliberately disallow deletion/replacement.
+        // Close before the atomic rename; keep journal handles protected in use.
+        drop(file);
         fs::rename(&temporary, path)
             .with_context(|| format!("replace node catalog cache {}", path.display()))?;
         Ok(())

@@ -1,5 +1,7 @@
 //! Local service control. No administrative endpoint is exposed over HTTP.
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -7,7 +9,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
@@ -66,25 +69,47 @@ pub fn socket_path(config: &Path) -> Result<PathBuf> {
     let name = config
         .file_name()
         .context("config path requires a filename")?;
-    let digest = hex::encode(Sha256::digest(name.as_bytes()));
-    Ok(parent.join(format!(".oixc-{}.sock", &digest[..8])))
+    #[cfg(unix)]
+    {
+        let digest = hex::encode(Sha256::digest(name.as_bytes()));
+        Ok(parent.join(format!(".oixc-{}.sock", &digest[..8])))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let bytes: Vec<u8> = parent
+            .join(name)
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let digest = hex::encode(Sha256::digest(bytes));
+        Ok(PathBuf::from(format!(
+            r"\\.\pipe\oixc-proxy-{}",
+            &digest[..32]
+        )))
+    }
 }
 
 /// Unix socket paths must fit in `sockaddr_un.sun_path` (104 bytes on macOS,
 /// 108 on Linux) including the terminating NUL.
+#[cfg(unix)]
 fn fits_socket_address(path: &Path) -> bool {
     let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     path.as_os_str().len() < address.sun_path.len()
 }
 
+#[cfg(unix)]
 const PATH_TOO_LONG: &str = "service control socket path exceeds the platform limit; \
      move the config to a shorter directory to use refresh-nodes, reload-config and diagnose";
 
+#[cfg(unix)]
 struct SocketFile {
     path: PathBuf,
     inode: u64,
     device: u64,
 }
+#[cfg(unix)]
 impl Drop for SocketFile {
     fn drop(&mut self) {
         if let Ok(metadata) = std::fs::symlink_metadata(&self.path) {
@@ -95,6 +120,7 @@ impl Drop for SocketFile {
     }
 }
 
+#[cfg(unix)]
 pub struct Server {
     listener: UnixListener,
     file: SocketFile,
@@ -104,6 +130,7 @@ pub struct Server {
 /// socket file at once, without waiting for the runtime to shut down.
 pub struct Running {
     task: tokio::task::JoinHandle<Result<()>>,
+    #[cfg(unix)]
     _file: Option<SocketFile>,
 }
 impl Running {
@@ -123,6 +150,7 @@ impl Drop for Running {
 /// traffic, so a socket path the platform cannot represent disables it with a
 /// warning instead of refusing to start.
 pub async fn start(config: &Path, sender: mpsc::Sender<Request>) -> Result<Running> {
+    #[cfg(unix)]
     if !fits_socket_address(&socket_path(config)?) {
         eprintln!("{PATH_TOO_LONG}");
         return Ok(Running {
@@ -137,6 +165,7 @@ pub async fn start(config: &Path, sender: mpsc::Sender<Request>) -> Result<Runni
     Ok(Server::bind(config).await?.spawn(sender))
 }
 
+#[cfg(unix)]
 impl Server {
     pub async fn bind(config: &Path) -> Result<Self> {
         let path = socket_path(config)?;
@@ -182,6 +211,7 @@ impl Server {
     }
 }
 
+#[cfg(unix)]
 async fn serve(listener: UnixListener, sender: mpsc::Sender<Request>) -> Result<()> {
     let mut clients = tokio::task::JoinSet::new();
     loop {
@@ -197,8 +227,85 @@ async fn serve(listener: UnixListener, sender: mpsc::Sender<Request>) -> Result<
     }
 }
 
-async fn handle(stream: UnixStream, sender: mpsc::Sender<Request>) -> Result<()> {
-    let (read, mut write) = stream.into_split();
+#[cfg(windows)]
+pub struct Server {
+    pipe: tokio::net::windows::named_pipe::NamedPipeServer,
+    path: PathBuf,
+}
+
+#[cfg(windows)]
+fn new_pipe(path: &Path, first: bool) -> Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    let security = crate::windows::files::Security::private()?;
+    let mut attributes = security.attributes();
+    // The descriptor remains live throughout CreateNamedPipeW. Reject remote
+    // clients and protect admin commands with an explicit local-user DACL.
+    unsafe {
+        ServerOptions::new()
+            .first_pipe_instance(first)
+            .reject_remote_clients(true)
+            .create_with_security_attributes_raw(
+                path,
+                (&mut attributes as *mut windows_sys::Win32::Security::SECURITY_ATTRIBUTES).cast(),
+            )
+    }
+    .context("create private service control pipe")
+}
+
+#[cfg(windows)]
+impl Server {
+    pub async fn bind(config: &Path) -> Result<Self> {
+        let path = socket_path(config)?;
+        let pipe = new_pipe(&path, true)?;
+        Ok(Self { pipe, path })
+    }
+
+    pub fn spawn(self, sender: mpsc::Sender<Request>) -> Running {
+        Running {
+            task: tokio::spawn(async move {
+                let Self { mut pipe, path } = self;
+                let mut clients = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        result = pipe.connect(), if clients.len() < 16 => {
+                            result.context("accept service control pipe")?;
+                            let connected = std::mem::replace(&mut pipe, new_pipe(&path, false)?);
+                            let sender = sender.clone();
+                            clients.spawn(async move { let _ = handle(connected, sender).await; });
+                        }
+                        _ = clients.join_next(), if !clients.is_empty() => {}
+                    }
+                }
+            }),
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn connect_pipe(path: &Path) -> Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    loop {
+        match tokio::net::windows::named_pipe::ClientOptions::new().open(path) {
+            Ok(client) => return Ok(client),
+            Err(error)
+                if error.raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_PIPE_BUSY as i32) =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => {
+                return Err(error).context(
+                    "connect service control pipe; run as the service user or Administrator",
+                );
+            }
+        }
+    }
+}
+
+async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+    sender: mpsc::Sender<Request>,
+) -> Result<()> {
+    let (read, mut write) = tokio::io::split(stream);
     let mut bytes = Vec::new();
     tokio::time::timeout(
         Duration::from_secs(5),
@@ -245,13 +352,17 @@ async fn handle(stream: UnixStream, sender: mpsc::Sender<Request>) -> Result<()>
 
 pub async fn send(config: &Path, command: Command) -> Result<Response> {
     let path = socket_path(config)?;
+    #[cfg(unix)]
     if !fits_socket_address(&path) {
         bail!(PATH_TOO_LONG);
     }
     tokio::time::timeout(CONTROL_TIMEOUT, async {
+        #[cfg(unix)]
         let mut stream = UnixStream::connect(path)
             .await
             .context("connect service control socket; run the command as the service user")?;
+        #[cfg(windows)]
+        let mut stream = connect_pipe(&path).await?;
         let mut bytes = serde_json::to_vec(&command)?;
         bytes.push(b'\n');
         stream.write_all(&bytes).await?;
@@ -269,7 +380,7 @@ pub async fn send(config: &Path, command: Command) -> Result<Response> {
     .context("service control request timed out")?
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -336,5 +447,33 @@ mod tests {
                 .is_err_and(|e| e == mpsc::error::TryRecvError::Empty)
         );
         assert!(send(&config, Command::RefreshNodes).await.is_err());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    #[tokio::test]
+    async fn named_pipe_is_exclusive_and_returns_control_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("配置 with spaces.conf");
+        let path = socket_path(&config).unwrap();
+        assert!(path.to_string_lossy().starts_with(r"\\.\pipe\oixc-proxy-"));
+        let server = Server::bind(&config).await.unwrap();
+        assert!(Server::bind(&config).await.is_err());
+        let (sender, mut requests) = mpsc::channel(1);
+        let running = server.spawn(sender);
+        let client =
+            tokio::spawn(async move { send(&config, Command::Diagnostics).await.unwrap() });
+        let request = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        request
+            .reply
+            .send(Response::success("ok", serde_json::json!({"test":true})))
+            .unwrap();
+        assert_eq!(client.await.unwrap().payload["test"], true);
+        drop(running);
     }
 }

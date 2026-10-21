@@ -1,0 +1,30 @@
+name: Windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install Rust
+        run: rustup toolchain install 1.85.0 --profile minimal --component clippy,rustfmt
+      - name: Check formatting
+        run: cargo +1.85.0 fmt --all -- --check
+      - name: Lint all targets
+        run: cargo +1.85.0 clippy --locked --all-features --all-targets -- -D warnings
+      - name: Run offline tests
+        run: cargo +1.85.0 test --locked --all-features
+      - name: Test installer and native service lifecycle
+        shell: pwsh
+        run: |
+          cargo +1.85.0 test --locked --test windows_service -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'Windows service smoke test failed' }

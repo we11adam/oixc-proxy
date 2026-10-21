@@ -20,6 +20,8 @@ pub mod subscription;
 pub mod surge;
 pub mod traffic;
 pub mod transport;
+#[cfg(windows)]
+pub mod windows;
 
 pub const APP_NAME: &str = "oixc-proxy";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

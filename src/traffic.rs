@@ -1,7 +1,11 @@
 //! Local, minute-sampled application traffic. No credentials or destinations are stored.
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(any(unix, test))]
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -99,20 +103,30 @@ pub fn beside_config(config: &Path) -> PathBuf {
 }
 
 fn open_private(path: &Path, create: bool) -> Result<File> {
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .write(create)
-        .create(create)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    let file = options.open(path).context("open private traffic file")?;
-    let metadata = file.metadata()?;
-    let uid = unsafe { libc::geteuid() };
-    if !metadata.is_file() || metadata.mode() & 0o077 != 0 || (uid != 0 && metadata.uid() != uid) {
-        bail!("traffic file must be a private regular file owned by the service user");
+    #[cfg(windows)]
+    {
+        crate::windows::files::open_private(path, create, false)
     }
-    Ok(file)
+    #[cfg(unix)]
+    {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(create)
+            .create(create)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let file = options.open(path).context("open private traffic file")?;
+        let metadata = file.metadata()?;
+        let uid = unsafe { libc::geteuid() };
+        if !metadata.is_file()
+            || metadata.mode() & 0o077 != 0
+            || (uid != 0 && metadata.uid() != uid)
+        {
+            bail!("traffic file must be a private regular file owned by the service user");
+        }
+        Ok(file)
+    }
 }
 
 struct Journal {
@@ -121,11 +135,48 @@ struct Journal {
     poisoned: bool,
 }
 
-fn lock_file(file: &File, operation: i32) -> Result<()> {
-    if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("lock traffic journal");
+enum Lock {
+    Exclusive,
+    Shared,
+    Unlock,
+}
+
+fn lock_file(file: &File, operation: Lock) -> Result<()> {
+    #[cfg(windows)]
+    {
+        match operation {
+            Lock::Exclusive => crate::windows::files::lock(file, true, false),
+            Lock::Shared => crate::windows::files::lock(file, false, false),
+            Lock::Unlock => crate::windows::files::unlock(file),
+        }
     }
-    Ok(())
+    #[cfg(unix)]
+    let operation = match operation {
+        Lock::Exclusive => libc::LOCK_EX,
+        Lock::Shared => libc::LOCK_SH,
+        Lock::Unlock => libc::LOCK_UN,
+    };
+    #[cfg(unix)]
+    {
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("lock traffic journal");
+        }
+        Ok(())
+    }
+}
+
+fn try_writer_lock(file: &File) -> Result<()> {
+    #[cfg(windows)]
+    {
+        crate::windows::files::lock(file, true, true)
+    }
+    #[cfg(unix)]
+    {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("lock traffic writer");
+        }
+        Ok(())
+    }
 }
 
 impl Journal {
@@ -133,13 +184,13 @@ impl Journal {
         let mut lock_path = path.as_os_str().to_os_string();
         lock_path.push(".lock");
         let lock = open_private(Path::new(&lock_path), true)?;
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        if try_writer_lock(&lock).is_err() {
             bail!(
                 "another process is recording to this traffic file; use --traffic-file for a separate instance"
             );
         }
         let mut file = open_private(path, true)?;
-        lock_file(&file, libc::LOCK_EX)?;
+        lock_file(&file, Lock::Exclusive)?;
         // Reject unrelated existing files before attempting any tail recovery.
         let mut first = Vec::new();
         BufReader::new((&mut file).take((MAX_LINE + 1) as u64)).read_until(b'\n', &mut first)?;
@@ -182,7 +233,7 @@ impl Journal {
             decode_sample(&tail[begin..], 0).context("invalid final traffic record")?;
         }
         file.seek(SeekFrom::End(0))?;
-        lock_file(&file, libc::LOCK_UN)?;
+        lock_file(&file, Lock::Unlock)?;
         Ok(Self {
             file,
             _lock: lock,
@@ -196,7 +247,7 @@ impl Journal {
         }
         let mut bytes = serde_json::to_vec(sample)?;
         bytes.push(b'\n');
-        lock_file(&self.file, libc::LOCK_EX)?;
+        lock_file(&self.file, Lock::Exclusive)?;
         let result = (|| {
             let offset = self.file.seek(SeekFrom::End(0))?;
             if let Err(error) = self
@@ -219,7 +270,7 @@ impl Journal {
             }
             Ok(())
         })();
-        result.and(lock_file(&self.file, libc::LOCK_UN))
+        result.and(lock_file(&self.file, Lock::Unlock))
     }
 }
 
@@ -334,7 +385,7 @@ pub fn query(path: &Path, from: Option<u64>, to: Option<u64>) -> Result<Report> 
         bail!("--from must precede --to");
     }
     let file = open_private(path, false)?;
-    lock_file(&file, libc::LOCK_SH)?;
+    lock_file(&file, Lock::Shared)?;
     // Read a fixed snapshot. A concurrent append's incomplete final line is ignored.
     let length = file.metadata()?.len();
     let mut reader = BufReader::new(file.take(length));
@@ -505,9 +556,12 @@ pub fn parse_time(value: &str) -> Result<u64> {
 }
 
 fn initialize_local_timezone() {
+    #[cfg(unix)]
     unsafe extern "C" {
         fn tzset();
     }
+    #[cfg(windows)]
+    use libc::tzset;
     static INITIALIZED: std::sync::Once = std::sync::Once::new();
     // POSIX does not require localtime_r to initialize timezone state itself.
     // TZ is fixed at process startup; never mutate the environment from worker threads.
@@ -518,7 +572,11 @@ fn local_parts(timestamp: libc::time_t) -> Result<libc::tm> {
     initialize_local_timezone();
     let mut parts = std::mem::MaybeUninit::<libc::tm>::uninit();
     // localtime_r writes the entire tm on success; TZ (or the system zone) is handled by libc.
-    if unsafe { libc::localtime_r(&timestamp, parts.as_mut_ptr()) }.is_null() {
+    #[cfg(unix)]
+    let failed = unsafe { libc::localtime_r(&timestamp, parts.as_mut_ptr()) }.is_null();
+    #[cfg(windows)]
+    let failed = unsafe { libc::localtime_s(parts.as_mut_ptr(), &timestamp) } != 0;
+    if failed {
         bail!("local timestamp is outside the platform range");
     }
     Ok(unsafe { parts.assume_init() })
@@ -545,7 +603,15 @@ fn local_timestamp(
         parts.tm_min = minute as i32;
         parts.tm_sec = second as i32;
         parts.tm_isdst = isdst;
+        #[cfg(unix)]
         let timestamp = unsafe { libc::mktime(&mut parts) };
+        #[cfg(windows)]
+        let timestamp = {
+            unsafe extern "C" {
+                fn _mktime64(parts: *mut libc::tm) -> i64;
+            }
+            unsafe { _mktime64(&mut parts) }
+        };
         if timestamp < 0 {
             continue;
         }
@@ -578,7 +644,24 @@ pub fn format_local_time(timestamp: u64) -> Result<String> {
         .try_into()
         .context("timestamp exceeds platform time range")?;
     let parts = local_parts(timestamp)?;
+    #[cfg(unix)]
     let offset = parts.tm_gmtoff;
+    #[cfg(windows)]
+    let offset = {
+        let mut west = 0;
+        let mut dst = 0;
+        if unsafe { libc::get_timezone(&mut west) } != 0
+            || unsafe { libc::get_dstbias(&mut dst) } != 0
+        {
+            bail!("read Windows local timezone offset");
+        }
+        -(i64::from(west)
+            + if parts.tm_isdst > 0 {
+                i64::from(dst)
+            } else {
+                0
+            })
+    };
     let magnitude = offset.unsigned_abs();
     let mut suffix = format!(
         "{}{:02}:{:02}",
@@ -603,6 +686,7 @@ pub fn format_local_time(timestamp: u64) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     fn sample(timestamp: u64, upload: u64, download: u64) -> Sample {
@@ -643,6 +727,7 @@ mod tests {
         assert_eq!(range.bytes, sample(120, 30, 40).bytes);
         assert_eq!(query(&path, Some(181), None).unwrap().total_bytes, 0);
         assert!(query(&path, Some(120), Some(120)).is_err());
+        #[cfg(unix)]
         assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
     }
 
@@ -739,6 +824,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn private_permissions_symlinks_and_nonregular_files_are_enforced() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("traffic.jsonl");

@@ -2,7 +2,9 @@ use std::future::Future;
 use std::io;
 use std::time::Duration;
 
-use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+use tokio::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 
 const RESOURCE_BACKOFF: Duration = Duration::from_secs(1);
 
@@ -21,6 +23,7 @@ pub async fn accept(listener: &TcpListener, label: &str) -> io::Result<TcpStream
 }
 
 /// [`accept`] for the local Unix control socket.
+#[cfg(unix)]
 pub async fn accept_unix(listener: &UnixListener, label: &str) -> io::Result<UnixStream> {
     retry(label, || listener.accept())
         .await
@@ -64,7 +67,12 @@ fn classify(error: &io::Error) -> AcceptError {
     ) {
         return AcceptError::Connection;
     }
-    match error.raw_os_error() {
+    classify_os(error.raw_os_error())
+}
+
+#[cfg(unix)]
+fn classify_os(code: Option<i32>) -> AcceptError {
+    match code {
         // Network errors already pending on the new connection are reported
         // by accept on Linux and should be treated like a failed handshake.
         Some(
@@ -76,6 +84,18 @@ fn classify(error: &io::Error) -> AcceptError {
             | libc::ENOPROTOOPT,
         ) => AcceptError::Connection,
         Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => AcceptError::Resource,
+        _ => AcceptError::Fatal,
+    }
+}
+
+#[cfg(windows)]
+fn classify_os(code: Option<i32>) -> AcceptError {
+    use windows_sys::Win32::Networking::WinSock::*;
+    match code {
+        Some(WSAENETDOWN | WSAENETUNREACH | WSAEHOSTUNREACH | WSAECONNABORTED | WSAECONNRESET) => {
+            AcceptError::Connection
+        }
+        Some(WSAEMFILE | WSAENOBUFS) => AcceptError::Resource,
         _ => AcceptError::Fatal,
     }
 }
@@ -94,6 +114,7 @@ mod tests {
         ] {
             assert_eq!(classify(&io::Error::from(kind)), AcceptError::Connection);
         }
+        #[cfg(unix)]
         for (code, expected) in [
             (libc::EPROTO, AcceptError::Connection),
             (libc::EHOSTUNREACH, AcceptError::Connection),

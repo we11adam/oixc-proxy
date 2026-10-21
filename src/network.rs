@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::ffi::CStr;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -72,24 +73,24 @@ pub struct NetworkSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct InterfaceAddress {
-    name: String,
-    index: u32,
-    address: IpAddr,
-    state: AddressState,
+pub(crate) struct InterfaceAddress {
+    pub(crate) name: String,
+    pub(crate) index: u32,
+    pub(crate) address: IpAddr,
+    pub(crate) state: AddressState,
 }
 
 /// IPv6 address state that matters for source selection. IPv4 addresses,
 /// and IPv6 addresses whose state cannot be read, use the default.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct AddressState {
+pub(crate) struct AddressState {
     /// A privacy address that the host replaces regularly.
-    temporary: bool,
+    pub(crate) temporary: bool,
     /// Past its preferred lifetime and kept only for existing connections.
-    deprecated: bool,
+    pub(crate) deprecated: bool,
     /// Still in, or failed, duplicate address detection, so it cannot be
     /// bound yet.
-    unassignable: bool,
+    pub(crate) unassignable: bool,
 }
 
 impl NetworkMonitor {
@@ -326,7 +327,42 @@ impl NetworkSnapshot {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    fn bind_interface<T: std::os::windows::io::AsSocket>(
+        &self,
+        socket: &T,
+        destination: SocketAddr,
+    ) -> io::Result<()> {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{
+            IP_UNICAST_IF, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, SOCKET_ERROR,
+            WSAGetLastError, setsockopt,
+        };
+        let Some(index) = self.selection.interface_index else {
+            return Ok(());
+        };
+        let (level, option, value) = if destination.is_ipv4() {
+            (IPPROTO_IP, IP_UNICAST_IF, index.to_be())
+        } else {
+            (IPPROTO_IPV6, IPV6_UNICAST_IF, index)
+        };
+        let socket = socket.as_socket();
+        if unsafe {
+            setsockopt(
+                socket.as_raw_socket() as usize,
+                level,
+                option,
+                (&value as *const u32).cast(),
+                4,
+            )
+        } == SOCKET_ERROR
+        {
+            return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
     fn bind_interface<T>(&self, _socket: &T, _destination: SocketAddr) -> io::Result<()> {
         Ok(())
     }
@@ -533,11 +569,22 @@ fn physical_default_from_netstat(routes: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn default_physical_interface() -> Option<String> {
+    crate::windows::network::default_interface()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn default_physical_interface() -> Option<String> {
     None
 }
 
+#[cfg(windows)]
+fn interface_addresses() -> io::Result<Vec<InterfaceAddress>> {
+    crate::windows::network::addresses()
+}
+
+#[cfg(unix)]
 fn interface_addresses() -> io::Result<Vec<InterfaceAddress>> {
     let mut head = std::ptr::null_mut();
     if unsafe { libc::getifaddrs(&mut head) } != 0 {
@@ -688,10 +735,10 @@ fn parse_if_inet6(content: &str) -> Vec<(String, Ipv6Addr, AddressState)> {
         .collect()
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 struct Ipv6States;
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 impl Ipv6States {
     fn load() -> Self {
         Self
@@ -702,7 +749,7 @@ impl Ipv6States {
     }
 }
 
-fn is_usable_address(address: &IpAddr) -> bool {
+pub(crate) fn is_usable_address(address: &IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => {
             !address.is_unspecified()

@@ -4,6 +4,14 @@
 
 Notable changes to `oixc-proxy` are recorded in this file. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Support Windows x64 with native SCM service installation/removal, delayed automatic start, failure restart, private logs and a final traffic flush on Stop/Shutdown.
+- Add `install.ps1` with release SHA256 verification, local-build installation, protected directories, previous-binary retention and optional service setup; preserve existing config/registrations.
+- Add ACL-protected local named pipes, native adapter discovery/interface binding, Windows file locks/timezones, Windows tests and a release ZIP.
+
 ## [0.6.1] - 2026-10-07
 
 ### Fixed

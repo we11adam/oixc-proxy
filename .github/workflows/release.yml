@@ -13,6 +13,10 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  windows-test:
+    name: Test Windows service
+    uses: ./.github/workflows/windows.yml
+
   test:
     name: Test release source
     runs-on: ubuntu-24.04
@@ -51,6 +55,9 @@ jobs:
             install_musl: false
           - runner: macos-26
             target: aarch64-apple-darwin
+            install_musl: false
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
             install_musl: false
 
     steps:
@@ -92,6 +99,7 @@ jobs:
         run: cargo +1.85.0 build --locked --release --target "${{ matrix.target }}"
 
       - name: Verify and package binary
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -103,11 +111,22 @@ jobs:
           chmod 0755 package/oixc-proxy
           tar -C package -czf "oixc-proxy-${{ matrix.target }}.tar.gz" oixc-proxy
 
+      - name: Verify and package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $binary = "target/${{ matrix.target }}/release/oixc-proxy.exe"
+          & $binary version
+          if ($LASTEXITCODE -ne 0) { throw 'Binary verification failed' }
+          Compress-Archive -LiteralPath $binary -DestinationPath "oixc-proxy-${{ matrix.target }}.zip"
+
       - name: Upload packaged binary
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: oixc-proxy-${{ matrix.target }}
-          path: oixc-proxy-${{ matrix.target }}.tar.gz
+          path: |
+            oixc-proxy-${{ matrix.target }}.tar.gz
+            oixc-proxy-${{ matrix.target }}.zip
           if-no-files-found: error
           compression-level: 0
 
@@ -115,6 +134,7 @@ jobs:
     name: Publish GitHub Release
     needs:
       - test
+      - windows-test
       - build
     runs-on: ubuntu-24.04
     permissions:
@@ -135,12 +155,14 @@ jobs:
         run: |
           set -euo pipefail
           cp install.sh dist/install.sh
+          cp install.ps1 dist/install.ps1
           chmod 0755 dist/install.sh
           cd dist
           for archive in oixc-proxy-*.tar.gz; do
             [[ "$(tar -tzf "$archive")" == "oixc-proxy" ]]
           done
-          sha256sum install.sh oixc-proxy-*.tar.gz > SHA256SUMS
+          [[ "$(unzip -Z1 oixc-proxy-x86_64-pc-windows-msvc.zip)" == "oixc-proxy.exe" ]]
+          sha256sum install.sh install.ps1 oixc-proxy-*.tar.gz oixc-proxy-*.zip > SHA256SUMS
 
       - name: Create or update release
         shell: bash

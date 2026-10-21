@@ -1,4 +1,5 @@
 //! Offline CLI/service checks. No installed service or real account is touched.
+#![cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
