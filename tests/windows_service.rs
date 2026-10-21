@@ -12,6 +12,9 @@ fn powershell() -> Command {
     let root = std::env::var_os("SystemRoot").unwrap();
     let mut command =
         Command::new(Path::new(&root).join("System32/WindowsPowerShell/v1.0/powershell.exe"));
+    // CI launches Cargo from PowerShell 7. Its module search path is incompatible
+    // with this Windows PowerShell 5.1 child; let the child rebuild its own path.
+    command.env_remove("PSModulePath");
     command.args([
         "-NoProfile",
         "-NonInteractive",
