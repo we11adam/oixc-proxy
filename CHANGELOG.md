@@ -4,7 +4,7 @@
 
 本文件记录 `oixc-proxy` 各版本中值得注意的变更。版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布]
+## [0.7.0] - 2026-10-21
 
 ### 变更
 
@@ -165,6 +165,7 @@
 - DNS 与 TCP 竞速：共享传输上下文、合并签名 DNS 查询、A/AAAA 并发查询、错开的连接尝试。
 - 拨号时间预算、采样的性能 tracing 和连接复用调优。
 
+[0.7.0]: https://github.com/we11adam/oixc-proxy/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/we11adam/oixc-proxy/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/we11adam/oixc-proxy/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/we11adam/oixc-proxy/compare/v0.4.0...v0.5.0

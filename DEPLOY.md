@@ -207,8 +207,8 @@ rules:
 ## Windows（原生服务）
 
 要求 Windows x64、管理员 PowerShell 5.1+ 和 NTFS 权限支持。不需要 NSSM/WinSW，
-不改变系统代理设置或防火墙。Windows 发布资产从包含此功能的下一版 Release 开始提供；
-已有 0.6.1 Release 没有 Windows 二进制。
+不改变系统代理设置或防火墙。Windows 发布资产从 v0.7.0 开始提供；
+0.6.1 及更早的 Release 没有 Windows 二进制。
 
 ### 首次安装
 
@@ -229,7 +229,7 @@ curl.exe --noproxy '*' -i http://127.0.0.1:16173/healthz
 脚本用 `gh` 的已有认证下载私有资产；未认证时仅尝试公开 HTTPS 下载。
 先校验 ZIP 的 SHA256 和唯一文件名，再运行版本检查。
 
-尚未发布或使用本地源码时，在 Windows 安装 Rust MSVC 工具链和 Visual Studio C++
+使用本地源码时，在 Windows 安装 Rust MSVC 工具链和 Visual Studio C++
 Build Tools（包括 Windows SDK），然后执行：
 
 ```powershell

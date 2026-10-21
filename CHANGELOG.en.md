@@ -4,7 +4,7 @@
 
 Notable changes to `oixc-proxy` are recorded in this file. Versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.7.0] - 2026-10-21
 
 ### Changed
 
@@ -165,6 +165,7 @@ First Rust release.
 - DNS and TCP racing: a shared transport context, coalesced signed DNS queries, concurrent A/AAAA lookups and staggered connection attempts.
 - Dial time budgets, sampled performance tracing and connection reuse tuning.
 
+[0.7.0]: https://github.com/we11adam/oixc-proxy/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/we11adam/oixc-proxy/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/we11adam/oixc-proxy/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/we11adam/oixc-proxy/compare/v0.4.0...v0.5.0

@@ -20,13 +20,13 @@ sh install.sh
 安装脚本会检测主机目标平台，用 Release 中的 `SHA256SUMS` 验证压缩包，检查二进制版本，并以原子方式安装到 `/usr/local/bin/oixc-proxy`。可通过以下命令安装指定版本或安装到用户可写目录：
 
 ```sh
-sh install.sh --version v0.6.1
+sh install.sh --version v0.7.0
 sh install.sh --install-dir "$HOME/.local/bin"
 ```
 
 安装脚本只安装二进制，不会创建配置、安装服务或重启现有进程。接下来可按照下方平台服务说明操作，也可查阅完整的[部署指南](DEPLOY.md)。
 
-Windows 使用 [`install.ps1`](install.ps1)，支持校验发布资产及安装原生 Windows 服务；见[Windows 部署说明](#在-windows-上安装服务)。这些资产会从包含此功能的下一版 Release 开始提供，旧版 Release 没有 Windows 产物。
+Windows 从 v0.7.0 起提供 [`install.ps1`](install.ps1) 和 x64 发布包，支持校验发布资产及安装原生 Windows 服务；见[Windows 部署说明](#在-windows-上安装服务)。旧版 Release 没有 Windows 产物。
 
 ## 让 Agent 使用部署 Skill
 
@@ -37,7 +37,7 @@ Windows 使用 [`install.ps1`](install.ps1)，支持校验发布资产及安装�
 ```text
 使用 $oixc-proxy-deploy 将最新 Release 安装到本机，并验证版本和健康状态。
 
-使用 $oixc-proxy-deploy 将 v0.6.1 更新到 root@router.lan，保留现有配置和服务方式，
+使用 $oixc-proxy-deploy 将 v0.7.0 更新到 root@router.lan，保留现有配置和服务方式，
 并验证新 PID、监听端口、/healthz 与 provider 端点；失败时回滚。
 
 使用 $oixc-proxy-deploy 发布 Cargo.toml 中的当前版本，
@@ -303,7 +303,7 @@ Restart-Service oixc-proxy
 
 SCM Stop/Shutdown 会触发最终不足一分钟的流量回写；`Restart-Service` 先 Stop 再 Start。强制结束进程、崩溃、断电或系统停止超时仍可能丢失未落盘数据。卸载仅停止并删除服务，保留程序、配置和历史。日志持续追加，需自行归档。
 
-尚未发布时可在 Windows 安装 Rust MSVC 工具链和 Visual Studio C++ Build Tools，执行 `cargo build --release`，再用 `install.ps1 -BinaryPath .\target\release\oixc-proxy.exe -InstallService -Config C:\secure\oixc-proxy.conf` 安装本地构建。完整升级、回滚与时区说明见 [DEPLOY.md](DEPLOY.md#windows原生服务)。
+从源码构建时可在 Windows 安装 Rust MSVC 工具链和 Visual Studio C++ Build Tools，执行 `cargo build --release`，再用 `install.ps1 -BinaryPath .\target\release\oixc-proxy.exe -InstallService -Config C:\secure\oixc-proxy.conf` 安装本地构建。完整升级、回滚与时区说明见 [DEPLOY.md](DEPLOY.md#windows原生服务)。
 
 ## 在 macOS 上安装服务
 

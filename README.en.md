@@ -35,7 +35,7 @@ release `SHA256SUMS`, checks the binary version and atomically installs
 with:
 
 ```sh
-sh install.sh --version v0.6.1
+sh install.sh --version v0.7.0
 sh install.sh --install-dir "$HOME/.local/bin"
 ```
 
@@ -45,7 +45,7 @@ below or the complete [deployment guide](DEPLOY.md).
 
 Windows uses [`install.ps1`](install.ps1), with optional native Windows service
 installation; see [Windows setup](#install-on-windows). Windows assets will be
-available starting with the next release containing this feature, not older tags.
+available starting with v0.7.0, not older tags.
 
 ## Use the deployment Skill with an agent
 
@@ -61,7 +61,7 @@ Example prompts:
 Use $oixc-proxy-deploy to install the latest Release locally, then verify the
 version and health status.
 
-Use $oixc-proxy-deploy to update root@router.lan to v0.6.1. Preserve its
+Use $oixc-proxy-deploy to update root@router.lan to v0.7.0. Preserve its
 existing config and service mechanism; verify the new PID, listeners, /healthz,
 and provider endpoint, and roll back on failure.
 
@@ -497,7 +497,7 @@ SCM Stop/Shutdown flushes the final partial-minute traffic sample;
 system stop timeouts may still lose unflushed traffic. Uninstall removes only the
 service and preserves all files. Logs append indefinitely; archive them as needed.
 
-Before a Windows release is published, install the Rust MSVC toolchain and Visual
+To build from source on Windows, install the Rust MSVC toolchain and Visual
 Studio C++ Build Tools, build with `cargo build --release`, then use
 `install.ps1 -BinaryPath .\target\release\oixc-proxy.exe -InstallService -Config C:\secure\oixc-proxy.conf`.
 See [DEPLOY.md](DEPLOY.md#windows原生服务) for upgrades, rollback and timezone notes.
