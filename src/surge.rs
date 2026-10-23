@@ -169,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_http_by_default_and_socks_on_request() {
+    fn renders_explicit_http_and_socks_protocols() {
         let proxies = [proxy("🇭🇰 Hong Kong 01", true)];
         let http = String::from_utf8(
             render_provider(

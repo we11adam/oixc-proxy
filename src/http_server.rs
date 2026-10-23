@@ -113,7 +113,7 @@ async fn serve_http(
                 .await;
             }
             let include_all = query_flag(query, "all");
-            let socks = query_flag(query, "socks");
+            let socks = !query_flag(query, "http");
             let raw = path == PROVIDER_PATH && query_flag(query, "raw");
             let (provider, content_type) = if path == CLASH_PROVIDER_PATH {
                 (
@@ -325,13 +325,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_combines_all_ignores_socks_and_head_omits_secrets() {
+    async fn raw_combines_all_ignores_proxy_protocol_flags_and_head_omits_secrets() {
         let manager = Arc::new(GatewayManager::provider_for_test());
         let filtered = request_for_test(manager.clone(), "GET", "/surge-proxies.conf?raw=1").await;
-        assert_eq!(
-            filtered,
-            request_for_test(manager.clone(), "GET", "/surge-proxies.conf?raw=1&socks=1").await
-        );
+        for flags in ["socks=1", "http=1", "http=1&socks=1"] {
+            assert_eq!(
+                filtered,
+                request_for_test(
+                    manager.clone(),
+                    "GET",
+                    &format!("/surge-proxies.conf?raw=1&{flags}")
+                )
+                .await
+            );
+        }
         let all = request_for_test(manager.clone(), "GET", "/surge-proxies.conf?raw=1&all=1").await;
         assert!(filtered.contains("Mock Fusion 01 = snell,"));
         assert!(!filtered.contains("Mock Extra 02"));
@@ -341,7 +348,7 @@ mod tests {
             request_for_test(
                 manager.clone(),
                 "GET",
-                "/surge-proxies.conf?all=1&raw=1&socks=1"
+                "/surge-proxies.conf?all=1&raw=1&http=1&socks=1"
             )
             .await
         );
@@ -363,7 +370,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn without_raw_provider_bytes_and_query_flag_semantics_are_unchanged() {
+    async fn non_raw_provider_bytes_and_query_flag_semantics_are_preserved() {
         let manager = Arc::new(GatewayManager::provider_for_test());
         let selector = crate::surge::node_selector("Mock Fusion 01").unwrap();
         assert_eq!(
@@ -376,7 +383,7 @@ mod tests {
         ] {
             for all in [false, true] {
                 for socks in [false, true] {
-                    let query = format!("all={}&socks={}", u8::from(all), u8::from(socks));
+                    let query = format!("all={}&http={}", u8::from(all), u8::from(!socks));
                     let target = format!("{path}?{query}");
                     let response =
                         request_from_peer(manager.clone(), "GET", &target, "192.0.2.1").await;
@@ -429,6 +436,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn providers_default_to_socks_and_require_http_equals_one_for_http() {
+        let manager = Arc::new(GatewayManager::provider_for_test());
+        for (path, clash) in [
+            ("/surge-proxies.conf", false),
+            ("/clash-proxies.yaml", true),
+        ] {
+            for all in [false, true] {
+                for (query, socks) in [
+                    ("", true),
+                    ("http=0", true),
+                    ("http=true", true),
+                    ("http=01", true),
+                    ("http", true),
+                    ("HTTP=1", true),
+                    ("socks=0", true),
+                    ("socks=1", true),
+                    ("http=1", false),
+                    ("socks=1&http=1", false),
+                    ("http=1&socks=1", false),
+                    ("http=0&http=1", false),
+                    ("http=1&http=0", true),
+                ] {
+                    let target = if all {
+                        format!("{path}?all=1&{query}")
+                    } else {
+                        format!("{path}?{query}")
+                    };
+                    let get = request_for_test(manager.clone(), "GET", &target).await;
+                    let (headers, body) = get.split_once("\r\n\r\n").unwrap();
+                    assert!(headers.starts_with("HTTP/1.1 200"));
+                    assert!(headers.contains("Cache-Control: no-store"));
+                    let expected = if clash {
+                        manager.clash_provider(all, socks).await.unwrap()
+                    } else {
+                        manager.provider(all, socks).await.unwrap()
+                    };
+                    assert_eq!(body.as_bytes(), expected.as_ref(), "{target}");
+                    if clash {
+                        let document: serde_yaml::Value = serde_yaml::from_str(body).unwrap();
+                        assert_eq!(
+                            document["proxies"][0]["type"].as_str(),
+                            Some(if socks { "socks5" } else { "http" })
+                        );
+                        assert_eq!(
+                            document["proxies"][0]["udp"].as_bool(),
+                            socks.then_some(true)
+                        );
+                        assert_eq!(
+                            document["proxies"].as_sequence().unwrap().len(),
+                            if all { 2 } else { 1 }
+                        );
+                    } else {
+                        assert!(body.contains(if socks { " = socks5, " } else { " = http, " }));
+                        assert_eq!(body.contains(", udp-relay=true"), socks);
+                        assert_eq!(body.lines().count(), if all { 2 } else { 1 });
+                    }
+                    let head = request_for_test(manager.clone(), "HEAD", &target).await;
+                    assert_eq!(head, format!("{headers}\r\n\r\n"));
+                }
+            }
+            // An unadorned subscription URL also defaults to SOCKS5.
+            assert_eq!(
+                request_for_test(manager.clone(), "GET", path).await,
+                request_for_test(manager.clone(), "GET", &format!("{path}?http=0")).await
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn clash_get_and_head_publish_only_fresh_valid_userinfo() {
         let manager = Arc::new(GatewayManager::provider_for_test());
         let info =
@@ -438,18 +514,21 @@ mod tests {
             .update_subscription(Some(info.clone()), Some(crate::diagnostics::unix_now()))
             .await;
         for method in ["GET", "HEAD"] {
-            let response =
-                request_for_test(manager.clone(), method, "/clash-proxies.yaml?all=1&socks=1")
-                    .await;
-            let (headers, body) = response.split_once("\r\n\r\n").unwrap();
-            assert!(headers.contains(
-                "Subscription-Userinfo: upload=1; download=2; total=100; expire=1700000000"
-            ));
-            assert!(headers.contains("200 OK"));
-            if method == "HEAD" {
-                assert!(body.is_empty());
-            } else {
-                assert!(!body.is_empty());
+            for path in [
+                "/clash-proxies.yaml?all=1",
+                "/clash-proxies.yaml?all=1&http=1",
+            ] {
+                let response = request_for_test(manager.clone(), method, path).await;
+                let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+                assert!(headers.contains(
+                    "Subscription-Userinfo: upload=1; download=2; total=100; expire=1700000000"
+                ));
+                assert!(headers.contains("200 OK"));
+                if method == "HEAD" {
+                    assert!(body.is_empty());
+                } else {
+                    assert!(!body.is_empty());
+                }
             }
         }
         assert!(
@@ -543,8 +622,8 @@ mod tests {
         assert!(!query_flag("ALL=1", "all"));
         assert!(!query_flag("ball=1", "all"));
         assert!(!query_flag("all=11", "all"));
-        assert!(query_flag("all=1&socks=1", "socks"));
-        assert!(!query_flag("all=1", "socks"));
-        assert!(!query_flag("socks=true", "socks"));
+        assert!(query_flag("all=1&http=1", "http"));
+        assert!(!query_flag("all=1", "http"));
+        assert!(!query_flag("http=true", "http"));
     }
 }

@@ -63,10 +63,10 @@ account does not include any Fusion/CIA nodes.
 
 GET /surge-proxies.conf?all=1 and /clash-proxies.yaml?all=1 publish the
 full catalog without changing the default filtered listing. Provider
-entries are HTTP proxies by default; append socks=1 to advertise SOCKS5
+entries are SOCKS5 proxies by default; append http=1 to advertise HTTP
 instead. The local listener accepts both HTTP and SOCKS5.
 GET /surge-proxies.conf?raw=1 exports sensitive Snell ECH-TLS node parameters,
-not local gateway entries. It combines with all=1, ignores socks, and allows
+not local gateway entries. It combines with all=1, ignores http/socks, and allows
 only loopback peers unless allow-remote-raw-provider=true is configured.
 
 preview-nodes prints the effective selection without modifying the service,

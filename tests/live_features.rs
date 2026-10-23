@@ -128,7 +128,7 @@ async fn isolated_service_publishes_metadata_status_and_filtered_preview() {
     assert_eq!(refreshed["ok"], true);
     assert_eq!(refreshed["payload"]["ready"], true);
     let provider = http
-        .get(format!("{base}/surge-proxies.conf"))
+        .get(format!("{base}/surge-proxies.conf?http=1"))
         .send()
         .await
         .unwrap()

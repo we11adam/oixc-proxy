@@ -150,8 +150,8 @@ target/release/oixc-proxy information --output ~/oixc-info.json
 | 端点 | 地址 | 用途 |
 | --- | --- | --- |
 | Mixed 代理 | `127.0.0.1:6172` | 同一端口同时接受 HTTP 与 SOCKS5 |
-| Surge provider | `http://127.0.0.1:6173/surge-proxies.conf` | 默认 HTTP 节点；`?all=1` 全部节点，`?socks=1` 改声明为 SOCKS5 |
-| Clash provider | `http://127.0.0.1:6173/clash-proxies.yaml` | 默认 HTTP 节点；`?all=1` 全部节点，`?socks=1` 改声明为 SOCKS5 |
+| Surge provider | `http://127.0.0.1:6173/surge-proxies.conf` | 默认 SOCKS5 节点；`?all=1` 全部节点，`?http=1` 改声明为 HTTP |
+| Clash provider | `http://127.0.0.1:6173/clash-proxies.yaml` | 默认 SOCKS5 节点；`?all=1` 全部节点，`?http=1` 改声明为 HTTP |
 | 健康检查 | `http://127.0.0.1:6173/healthz` | 就绪探针（204） |
 
 ### 客户端接入
@@ -191,7 +191,7 @@ rules:
 要点：
 
 - provider 中每个节点已包含 `server`、`port`、`username`、`password`；
-  默认声明为 HTTP 代理。需要 SOCKS5（含 UDP）时在 URL 后加 `?socks=1`；
+  默认声明为 SOCKS5 代理（按节点能力支持 UDP）。需要 HTTP 时在 URL 后加 `?http=1`；
   客户端**无需**额外配置认证信息；
 - 回环监听会直接声明节点的 UDP 能力；局域网、Docker 或 NAT 部署只有在
   `udp-port-range` 与 `udp-advertise-address` 同时有效时才声明 UDP。映射和

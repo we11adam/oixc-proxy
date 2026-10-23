@@ -120,9 +120,9 @@ The default endpoints are:
 | Endpoint | Address | Purpose |
 | --- | --- | --- |
 | Mixed proxy | `127.0.0.1:6172` | HTTP and SOCKS5 on one port; routes provider credentials to one named node |
-| Nodelist | `http://127.0.0.1:6173/surge-proxies.conf` | Surge list (`?all=1` every node, `?socks=1` advertise SOCKS5) |
-| Raw Snell list | `http://127.0.0.1:6173/surge-proxies.conf?raw=1` | Sensitive ECH-TLS node parameters; loopback peers only by default, combines with `all=1`, ignores `socks` |
-| Clash | `http://127.0.0.1:6173/clash-proxies.yaml` | Clash list (`?all=1` every node, `?socks=1` advertise SOCKS5) |
+| Nodelist | `http://127.0.0.1:6173/surge-proxies.conf` | SOCKS5 by default; `?all=1` every node, `?http=1` advertise HTTP |
+| Raw Snell list | `http://127.0.0.1:6173/surge-proxies.conf?raw=1` | Sensitive ECH-TLS node parameters; loopback peers only by default, combines with `all=1`, ignores `http` / `socks` |
+| Clash | `http://127.0.0.1:6173/clash-proxies.yaml` | SOCKS5 by default; `?all=1` every node, `?http=1` advertise HTTP |
 | Health | `http://127.0.0.1:6173/healthz` | Readiness probe |
 
 Example Surge group:
@@ -132,9 +132,13 @@ Example Surge group:
 OIXC = select, policy-path=http://127.0.0.1:6173/surge-proxies.conf, update-interval=3600
 ```
 
-Every default provider entry points to the shared mixed listener. Entries are HTTP
-proxies by default; `?socks=1` advertises SOCKS5 instead (UDP ASSOCIATE is
-only available on the SOCKS path). Loopback listeners advertise each node's
+Every default provider entry points to the shared mixed listener. Entries are
+SOCKS5 proxies by default (UDP ASSOCIATE is only available on the SOCKS path).
+HTTP requires `http=1`, for example `/surge-proxies.conf?all=1&http=1`.
+The legacy `socks` parameter no longer selects the protocol: only `http=1`
+selects HTTP, all other values return SOCKS5, and `http=1&socks=1` returns HTTP.
+Subscriptions that relied on the old HTTP default must explicitly add `http=1`.
+Loopback listeners advertise each node's
 UDP capability directly. A remote listener advertises UDP only when a fixed
 relay port range and a client-reachable address are both configured, avoiding
 providers that claim unusable UDP support. The username is a reversible URL-safe
@@ -150,7 +154,7 @@ avoids admitting ordinary names such as `Special`. An empty filtered catalog
 is rejected so a control-plane naming change cannot expose ordinary nodes.
 `GET` `/surge-proxies.conf?all=1` and `/clash-proxies.yaml?all=1` publish the
 full catalog; those extra nodes are still routed through the same mixed
-listener. Append `socks=1` when the client should use SOCKS5.
+listener. Append `http=1` when the client should use HTTP.
 
 ### Export raw Snell ECH-TLS nodes
 
@@ -167,7 +171,7 @@ Successful and forbidden responses carry `Cache-Control: no-store`.
 curl --noproxy '*' 'http://127.0.0.1:6173/surge-proxies.conf?raw=1&all=1'
 ```
 
-Without `all=1`, the current node filter still applies. Raw mode ignores `socks`;
+Without `all=1`, the current node filter still applies. Raw mode ignores both `http` and `socks`;
 the Clash route does not support raw exports. Lines include Snell v4, ECH-TLS,
 SNI (falling back to the original node host), standard Base64 ECH configuration,
 reuse and UDP flags. TFO / skip-certificate-verification flags appear only when
@@ -476,7 +480,7 @@ file with mode `0600`. It refuses to replace an existing file.
 generated provider select different managed nodes on one mixed HTTP/SOCKS5
 port. It also serves `GET`/`HEAD` for `/surge-proxies.conf`,
 `/clash-proxies.yaml` and `/healthz`. Append `?all=1` to list every node, or
-`?socks=1` to advertise SOCKS5 instead of HTTP.
+`?http=1` to advertise HTTP instead of the default SOCKS5.
 
 `serve-map` fetches the same Fusion/CIA catalog itself, then gives each
 node one loopback SOCKS5 port beginning at 7200 by default. Its default

@@ -82,9 +82,9 @@ target/release/oixc-proxy serve
 | 端点 | 地址 | 用途 |
 | --- | --- | --- |
 | 混合代理 | `127.0.0.1:6172` | 在同一端口提供 HTTP 和 SOCKS5；通过 provider 凭据路由到指定命名节点 |
-| 节点列表 | `http://127.0.0.1:6173/surge-proxies.conf` | Surge 列表（`?all=1` 发布全部节点，`?socks=1` 声明为 SOCKS5） |
-| 原始 Snell 列表 | `http://127.0.0.1:6173/surge-proxies.conf?raw=1` | 含敏感节点参数的 ECH-TLS 列表，默认仅允许回环对端；可叠加 `all=1`，忽略 `socks` |
-| Clash | `http://127.0.0.1:6173/clash-proxies.yaml` | Clash 列表（`?all=1` 发布全部节点，`?socks=1` 声明为 SOCKS5） |
+| 节点列表 | `http://127.0.0.1:6173/surge-proxies.conf` | 默认 SOCKS5；`?all=1` 发布全部节点，`?http=1` 声明为 HTTP |
+| 原始 Snell 列表 | `http://127.0.0.1:6173/surge-proxies.conf?raw=1` | 含敏感节点参数的 ECH-TLS 列表，默认仅允许回环对端；可叠加 `all=1`，忽略 `http` / `socks` |
+| Clash | `http://127.0.0.1:6173/clash-proxies.yaml` | 默认 SOCKS5；`?all=1` 发布全部节点，`?http=1` 声明为 HTTP |
 | 健康检查 | `http://127.0.0.1:6173/healthz` | HTTP 服务存活探针，不代表上游可达 |
 | 诊断状态 | `http://127.0.0.1:6173/status` | 目录刷新、缓存年龄、物理出口、证书库及 ECH 建连统计 |
 
@@ -95,9 +95,9 @@ Surge 代理组示例：
 OIXC = select, policy-path=http://127.0.0.1:6173/surge-proxies.conf, update-interval=3600
 ```
 
-默认 provider 的每个条目都指向共享的混合监听器。条目默认声明为 HTTP 代理；`?socks=1` 会改为声明 SOCKS5（UDP ASSOCIATE 仅在 SOCKS 路径可用）。回环监听会直接声明节点的 UDP 能力；远程监听只有同时配置固定 UDP 端口范围和客户端可达的宣告地址后才会声明 UDP，避免生成实际不可用的配置。用户名是节点准确名称的可逆 URL-safe 编码，密码是稳定的 HMAC 派生路由密钥。HTTP 客户端通过 `Proxy-Authorization: Basic` 发送这些凭据。访问 token 始终不由节点列表 HTTP 端点返回；节点地址、PSK 和 ECH 配置仅在显式请求下述 `raw=1` 时返回，普通 Surge/Clash 列表不返回这些参数。
+默认 provider 的每个条目都指向共享的混合监听器。条目默认声明为 SOCKS5（UDP ASSOCIATE 仅在 SOCKS 路径可用）；需要 HTTP 代理时必须加 `http=1`，例如 `/surge-proxies.conf?all=1&http=1`。旧的 `socks` 参数不再参与协议选择；仅 `http=1` 选择 HTTP，其他值仍返回 SOCKS5，因此 `http=1&socks=1` 也返回 HTTP。此前依赖默认 HTTP 声明的订阅应显式加上 `http=1`。回环监听会直接声明节点的 UDP 能力；远程监听只有同时配置固定 UDP 端口范围和客户端可达的宣告地址后才会声明 UDP，避免生成实际不可用的配置。用户名是节点准确名称的可逆 URL-safe 编码，密码是稳定的 HMAC 派生路由密钥。HTTP 客户端通过 `Proxy-Authorization: Basic` 发送这些凭据。访问 token 始终不由节点列表 HTTP 端点返回；节点地址、PSK 和 ECH 配置仅在显式请求下述 `raw=1` 时返回，普通 Surge/Clash 列表不返回这些参数。
 
-默认只发布名称中包含 `Fusion` 或独立 `CIA` token 的节点，匹配不区分大小写。将该缩写视为独立 token，可避免错误纳入 `Special` 等普通名称。过滤后目录为空时会拒绝加载，以免控制面命名变化意外暴露普通节点。`GET /surge-proxies.conf?all=1` 和 `/clash-proxies.yaml?all=1` 会发布完整目录；这些额外节点仍通过同一个混合监听器路由。需要客户端使用 SOCKS5 时，再附加 `socks=1`。
+默认只发布名称中包含 `Fusion` 或独立 `CIA` token 的节点，匹配不区分大小写。将该缩写视为独立 token，可避免错误纳入 `Special` 等普通名称。过滤后目录为空时会拒绝加载，以免控制面命名变化意外暴露普通节点。`GET /surge-proxies.conf?all=1` 和 `/clash-proxies.yaml?all=1` 会发布完整目录；这些额外节点仍通过同一个混合监听器路由。需要客户端使用 HTTP 时，再附加 `http=1`。
 
 ### 导出原始 Snell ECH-TLS 节点
 
@@ -107,7 +107,7 @@ OIXC = select, policy-path=http://127.0.0.1:6173/surge-proxies.conf, update-inte
 curl --noproxy '*' 'http://127.0.0.1:6173/surge-proxies.conf?raw=1&all=1'
 ```
 
-不带 `all=1` 时沿用当前节点筛选；`socks` 在 raw 模式下被忽略，Clash 路由不支持 raw。每行直接声明 Snell v4、ECH-TLS、SNI（为空时使用原始节点主机名）、标准 Base64 ECH 配置、复用和 UDP 能力；仅在启用时附加 TFO / 跳过证书验证标志，不输出 path、preconnect 或 identity 字段。策略名沿用普通 provider 的清洗及重名后缀；不支持的协议/身份版本及无法安全表示的参数会跳过，`/status` 的 `raw_skipped_nodes.filtered` / `.all` 提供计数。
+不带 `all=1` 时沿用当前节点筛选；`http` 和 `socks` 在 raw 模式下均被忽略，Clash 路由不支持 raw。每行直接声明 Snell v4、ECH-TLS、SNI（为空时使用原始节点主机名）、标准 Base64 ECH 配置、复用和 UDP 能力；仅在启用时附加 TFO / 跳过证书验证标志，不输出 path、preconnect 或 identity 字段。策略名沿用普通 provider 的清洗及重名后缀；不支持的协议/身份版本及无法安全表示的参数会跳过，`/status` 的 `raw_skipped_nodes.filtered` / `.all` 提供计数。
 
 节点地址复用现有解析路径：托管域名使用签名私有 DNS，其他域名使用系统解析；优先 IPv4，其次 IPv6（不加方括号）。跨请求最多并发 8 个解析，单次最多 2 秒；失败或超时依次回退到该主机最后一次成功地址、原始主机名，不使整份订阅失败或丢弃节点。成功地址缓存在进程内，跨请求及目录刷新保留、重启清空，不写入磁盘；解析器原有短 TTL 缓存不变。
 
@@ -285,7 +285,7 @@ oixc-proxy uninstall-windows-service
 
 `information` 发起只读账户/API 请求，并以 `0600` 权限创建新的 JSON 文件；它拒绝覆盖已有文件。
 
-`serve` 是常规命名节点网关。生成的 provider 中，不同用户名/密码组合会在同一个混合 HTTP/SOCKS5 端口选择不同托管节点。它还会为 `/surge-proxies.conf`、`/clash-proxies.yaml` 和 `/healthz` 提供 `GET`/`HEAD`。附加 `?all=1` 可列出所有节点，附加 `?socks=1` 可将代理声明为 SOCKS5 而非 HTTP。
+`serve` 是常规命名节点网关。生成的 provider 中，不同用户名/密码组合会在同一个混合 HTTP/SOCKS5 端口选择不同托管节点。它还会为 `/surge-proxies.conf`、`/clash-proxies.yaml` 和 `/healthz` 提供 `GET`/`HEAD`。默认声明 SOCKS5，附加 `?all=1` 可列出所有节点，附加 `?http=1` 可将代理声明为 HTTP。
 
 `serve-map` 自行获取相同的 Fusion/CIA 目录，然后为每个节点分配一个回环 SOCKS5 端口，默认从 7200 开始。其默认受保护 token 文件为 `token.txt`。该命令不提供 HTTP 节点列表端点。目录每小时刷新一次：地址、PSK 或 ECH 配置变化的节点会在原端口上原地更新；新增或移除的节点只记录日志，因为重新编号端口会把客户端导向其他节点，需要重启 `serve-map` 才能重新映射。
 
