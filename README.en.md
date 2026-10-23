@@ -79,7 +79,7 @@ platform details.
 
 ## Build
 
-Rust 1.99 or newer is required. `rust-toolchain.toml` pins 1.99.0 to match CI and release builds.
+Rust 1.99.1 or newer is required. `rust-toolchain.toml` pins 1.99.1 to match CI and release builds.
 
 ```sh
 cargo test

@@ -48,7 +48,7 @@ Windows 从 v0.7.0 起提供 [`install.ps1`](install.ps1) 和 x64 发布包，�
 
 ## 构建
 
-需要 Rust 1.99 或更高版本；仓库通过 `rust-toolchain.toml` 固定使用 1.99.0，与 CI/release 保持一致。
+需要 Rust 1.99.1 或更高版本；仓库通过 `rust-toolchain.toml` 固定使用 1.99.1，与 CI/release 保持一致。
 
 ```sh
 cargo test

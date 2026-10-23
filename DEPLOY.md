@@ -45,7 +45,7 @@ sh install.sh
 不会创建配置、安装服务或重启现有进程；首次安装继续按对应平台章节操作，
 更新已有服务则在安装后按对应章节重启并检查健康端点。
 
-从源码构建需要 Rust 工具链（1.99 或更新），`cargo --version` 可运行；仓库、CI 和 release 固定使用 1.99.0。使用已编译的 Release 不需要安装 Rust。
+从源码构建需要 Rust 工具链（1.99.1 或更新），`cargo --version` 可运行；仓库、CI 和 release 固定使用 1.99.1。使用已编译的 Release 不需要安装 Rust。
 未安装时用 [rustup](https://rustup.rs/)：
 
 ```sh
