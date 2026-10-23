@@ -4,6 +4,23 @@
 
 本文件记录 `oixc-proxy` 各版本中值得注意的变更。版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.0] - 2026-10-23
+
+### 变更与升级提示
+
+- Surge / Clash provider 默认改为 SOCKS5；需要 HTTP 声明的客户端必须在订阅 URL 中显式添加 `http=1`，可与 `all=1` 组合。旧 `socks` 参数不再参与协议选择；`raw=1` 不受两者影响，混合监听器仍同时接受 HTTP 和 SOCKS5。
+- 最低 Rust 版本、仓库工具链、CI 和 release 构建统一升级至 1.99.1；已编译的发布包不需要安装 Rust。
+
+### 新功能
+
+- `/surge-proxies.conf?raw=1` 可直接导出 Snell v4 ECH-TLS 节点，保留策略名清洗及重名后缀，支持 `all=1`；跳过不支持或无法安全表示的节点，并在状态/诊断中提供跳过计数。
+- raw 地址解析复用现有签名私有 DNS / 系统解析，优先 IPv4；跨请求最多并发 8 个解析、单次超时 2 秒。失败时依次回退到进程内的最后成功地址、原始域名；缓存跨请求及目录刷新共享，重启清空，不持久化。
+- raw 导出包含真实节点地址、PSK 和 ECH 配置，默认仅允许回环 TCP 对端；远程需显式开启 `allow-remote-raw-provider=true`，支持热重载。接口没有额外认证或加密，必须限制可信访问范围，响应保持 `Cache-Control: no-store`。
+
+### 修复
+
+- raw 导出允许现有私有 DNS 支持的下划线域名，避免有效节点因过严的主机名校验而缺失；仍拒绝参数注入字符。
+
 ## [0.7.0] - 2026-10-21
 
 ### 变更
@@ -165,6 +182,7 @@
 - DNS 与 TCP 竞速：共享传输上下文、合并签名 DNS 查询、A/AAAA 并发查询、错开的连接尝试。
 - 拨号时间预算、采样的性能 tracing 和连接复用调优。
 
+[0.8.0]: https://github.com/we11adam/oixc-proxy/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/we11adam/oixc-proxy/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/we11adam/oixc-proxy/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/we11adam/oixc-proxy/compare/v0.5.0...v0.6.0

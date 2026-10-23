@@ -4,6 +4,23 @@
 
 Notable changes to `oixc-proxy` are recorded in this file. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] - 2026-10-23
+
+### Changed and upgrade notes
+
+- Surge / Clash providers now default to SOCKS5. Clients requiring HTTP declarations must explicitly add `http=1` to their subscription URL, optionally with `all=1`. The legacy `socks` parameter no longer selects the protocol; neither flag affects `raw=1`. The mixed listener still accepts both HTTP and SOCKS5.
+- Raise the minimum Rust version and pin repository, CI and release toolchains to 1.99.1. Prebuilt binaries do not require Rust.
+
+### Added
+
+- Export Snell v4 ECH-TLS nodes directly with `/surge-proxies.conf?raw=1`, preserving policy sanitizing/duplicate suffixes and supporting `all=1`. Skip unsupported or unsafe nodes and report skipped counts in status/diagnostics.
+- Reuse signed private DNS / system resolution for raw server addresses, preferring IPv4. Share an eight-lookup concurrency limit across requests with a two-second per-lookup timeout. Fail open through an in-memory last-known-good address to the original hostname; retain the cache across requests/catalog refreshes and clear it on restart, without persistence.
+- Raw exports expose real node addresses, PSKs and ECH configurations. Allow only loopback TCP peers by default, with an explicit, reloadable `allow-remote-raw-provider=true` opt-in for remote peers. Restrict access to trusted clients: the HTTP endpoint has no additional authentication/encryption. Keep `Cache-Control: no-store`.
+
+### Fixed
+
+- Accept underscore-bearing DNS labels supported by the existing private resolver, avoiding missing raw nodes from overly strict hostname checks while retaining parameter-injection guards.
+
 ## [0.7.0] - 2026-10-21
 
 ### Changed
@@ -165,6 +182,7 @@ First Rust release.
 - DNS and TCP racing: a shared transport context, coalesced signed DNS queries, concurrent A/AAAA lookups and staggered connection attempts.
 - Dial time budgets, sampled performance tracing and connection reuse tuning.
 
+[0.8.0]: https://github.com/we11adam/oixc-proxy/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/we11adam/oixc-proxy/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/we11adam/oixc-proxy/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/we11adam/oixc-proxy/compare/v0.5.0...v0.6.0
