@@ -1,8 +1,9 @@
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
@@ -22,7 +23,16 @@ pub async fn serve(listener: TcpListener, manager: Arc<GatewayManager>) -> Resul
     }
 }
 
-async fn serve_connection(mut connection: TcpStream, manager: Arc<GatewayManager>) -> Result<()> {
+async fn serve_connection(connection: TcpStream, manager: Arc<GatewayManager>) -> Result<()> {
+    let peer = connection.peer_addr()?.ip();
+    serve_http(connection, manager, peer).await
+}
+
+async fn serve_http(
+    mut connection: impl AsyncRead + AsyncWrite + Unpin,
+    manager: Arc<GatewayManager>,
+    peer: IpAddr,
+) -> Result<()> {
     let request = timeout(Duration::from_secs(5), read_headers(&mut connection))
         .await
         .map_err(|_| anyhow::anyhow!("nodelist HTTP header timed out"))??;
@@ -104,11 +114,29 @@ async fn serve_connection(mut connection: TcpStream, manager: Arc<GatewayManager
             }
             let include_all = query_flag(query, "all");
             let socks = query_flag(query, "socks");
+            let raw = path == PROVIDER_PATH && query_flag(query, "raw");
             let (provider, content_type) = if path == CLASH_PROVIDER_PATH {
                 (
                     manager.clash_provider(include_all, socks).await,
                     "text/yaml; charset=utf-8",
                 )
+            } else if raw {
+                let provider = match manager.raw_provider(include_all, peer).await {
+                    Ok(Some(document)) => Ok(document),
+                    Ok(None) => {
+                        return write_response(
+                            &mut connection,
+                            403,
+                            "Forbidden",
+                            &[("Cache-Control", "no-store")],
+                            b"raw provider requires a loopback peer\n",
+                            method == "HEAD",
+                        )
+                        .await;
+                    }
+                    Err(error) => Err(error),
+                };
+                (provider, "text/plain; charset=utf-8")
             } else {
                 (
                     manager.provider(include_all, socks).await,
@@ -145,7 +173,11 @@ async fn serve_connection(mut connection: TcpStream, manager: Arc<GatewayManager
                         &mut connection,
                         503,
                         "Service Unavailable",
-                        &[],
+                        if raw {
+                            &[("Cache-Control", "no-store")]
+                        } else {
+                            &[]
+                        },
                         b"gateway unavailable\n",
                         method == "HEAD",
                     )
@@ -182,7 +214,7 @@ fn query_flag(query: &str, name: &str) -> bool {
         == Some("1")
 }
 
-async fn read_headers(connection: &mut TcpStream) -> Result<Vec<u8>> {
+async fn read_headers(connection: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>> {
     let mut request = Vec::with_capacity(1024);
     let mut buffer = [0u8; 1024];
     loop {
@@ -201,7 +233,7 @@ async fn read_headers(connection: &mut TcpStream) -> Result<Vec<u8>> {
 }
 
 async fn write_response(
-    connection: &mut TcpStream,
+    connection: &mut (impl AsyncWrite + Unpin),
     status: u16,
     reason: &str,
     headers: &[(&str, &str)],
@@ -232,12 +264,17 @@ mod tests {
     use super::*;
 
     async fn request_for_test(manager: Arc<GatewayManager>, method: &str, path: &str) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut client = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (server, _) = listener.accept().await.unwrap();
-        let task = tokio::spawn(serve_connection(server, manager));
+        request_from_peer(manager, method, path, "127.0.0.1").await
+    }
+
+    async fn request_from_peer(
+        manager: Arc<GatewayManager>,
+        method: &str,
+        path: &str,
+        peer: &str,
+    ) -> String {
+        let (mut client, server) = tokio::io::duplex(65536);
+        let task = tokio::spawn(serve_http(server, manager, peer.parse().unwrap()));
         client
             .write_all(format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
             .await
@@ -246,6 +283,149 @@ mod tests {
         client.read_to_end(&mut bytes).await.unwrap();
         task.await.unwrap().unwrap();
         String::from_utf8(bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn raw_export_guard_uses_peer_not_forwarded_headers_and_allows_explicit_opt_in() {
+        let manager = Arc::new(GatewayManager::provider_for_test());
+        for peer in ["127.0.0.1", "127.0.0.2", "::1", "::ffff:127.0.0.1"] {
+            let response =
+                request_from_peer(manager.clone(), "GET", "/surge-proxies.conf?raw=1", peer).await;
+            assert!(response.starts_with("HTTP/1.1 200"));
+            assert!(response.contains("Cache-Control: no-store"));
+            assert!(response.contains(" = snell, node.example.test, 443, psk=mock-secret,"));
+        }
+        for peer in ["192.0.2.1", "2001:db8::1", "::ffff:192.0.2.1"] {
+            for method in ["GET", "HEAD"] {
+                let response =
+                    request_from_peer(manager.clone(), method, "/surge-proxies.conf?raw=1", peer)
+                        .await;
+                assert!(response.starts_with("HTTP/1.1 403"));
+                assert!(response.contains("Cache-Control: no-store"));
+                assert!(!response.contains("mock-secret"));
+                assert!(!response.contains("node.example.test"));
+                if method == "HEAD" {
+                    assert!(response.ends_with("\r\n\r\n"));
+                }
+            }
+            let permitted = Arc::new(GatewayManager::raw_provider_for_test(true));
+            assert!(
+                request_from_peer(permitted, "GET", "/surge-proxies.conf?raw=1", peer)
+                    .await
+                    .starts_with("HTTP/1.1 200")
+            );
+        }
+        let (mut client, server) = tokio::io::duplex(65536);
+        let task = tokio::spawn(serve_http(server, manager, "192.0.2.1".parse().unwrap()));
+        client.write_all(b"GET /surge-proxies.conf?raw=1 HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 127.0.0.1\r\nForwarded: for=127.0.0.1\r\n\r\n").await.unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        task.await.unwrap().unwrap();
+        assert!(response.starts_with("HTTP/1.1 403"));
+    }
+
+    #[tokio::test]
+    async fn raw_combines_all_ignores_socks_and_head_omits_secrets() {
+        let manager = Arc::new(GatewayManager::provider_for_test());
+        let filtered = request_for_test(manager.clone(), "GET", "/surge-proxies.conf?raw=1").await;
+        assert_eq!(
+            filtered,
+            request_for_test(manager.clone(), "GET", "/surge-proxies.conf?raw=1&socks=1").await
+        );
+        let all = request_for_test(manager.clone(), "GET", "/surge-proxies.conf?raw=1&all=1").await;
+        assert!(filtered.contains("Mock Fusion 01 = snell,"));
+        assert!(!filtered.contains("Mock Extra 02"));
+        assert!(all.contains("Mock Extra 02 = snell,"));
+        assert_eq!(
+            all,
+            request_for_test(
+                manager.clone(),
+                "GET",
+                "/surge-proxies.conf?all=1&raw=1&socks=1"
+            )
+            .await
+        );
+        let head =
+            request_for_test(manager.clone(), "HEAD", "/surge-proxies.conf?raw=1&all=1").await;
+        assert_eq!(
+            head,
+            format!("{}\r\n\r\n", all.split_once("\r\n\r\n").unwrap().0)
+        );
+        assert!(
+            request_for_test(manager.clone(), "POST", "/surge-proxies.conf?raw=1")
+                .await
+                .starts_with("HTTP/1.1 405")
+        );
+        manager.close().await;
+        let unavailable = request_for_test(manager, "GET", "/surge-proxies.conf?raw=1").await;
+        assert!(unavailable.starts_with("HTTP/1.1 503"));
+        assert!(unavailable.contains("Cache-Control: no-store"));
+    }
+
+    #[tokio::test]
+    async fn without_raw_provider_bytes_and_query_flag_semantics_are_unchanged() {
+        let manager = Arc::new(GatewayManager::provider_for_test());
+        let selector = crate::surge::node_selector("Mock Fusion 01").unwrap();
+        assert_eq!(
+            manager.provider(false, false).await.unwrap().as_ref(),
+            format!("Mock Fusion 01 = http, 127.0.0.1, 6172, {selector}, mock-secret\n").as_bytes()
+        );
+        for (path, clash) in [
+            ("/surge-proxies.conf", false),
+            ("/clash-proxies.yaml", true),
+        ] {
+            for all in [false, true] {
+                for socks in [false, true] {
+                    let query = format!("all={}&socks={}", u8::from(all), u8::from(socks));
+                    let target = format!("{path}?{query}");
+                    let response =
+                        request_from_peer(manager.clone(), "GET", &target, "192.0.2.1").await;
+                    let expected = if clash {
+                        manager.clash_provider(all, socks).await.unwrap()
+                    } else {
+                        manager.provider(all, socks).await.unwrap()
+                    };
+                    assert_eq!(
+                        response.split_once("\r\n\r\n").unwrap().1.as_bytes(),
+                        expected.as_ref()
+                    );
+                    for flag in ["raw=0", "raw=true", "raw=1&raw=0"] {
+                        assert_eq!(
+                            response,
+                            request_from_peer(
+                                manager.clone(),
+                                "GET",
+                                &format!("{target}&{flag}"),
+                                "192.0.2.1"
+                            )
+                            .await
+                        );
+                    }
+                    if clash {
+                        assert_eq!(
+                            response,
+                            request_from_peer(
+                                manager.clone(),
+                                "GET",
+                                &format!("{target}&raw=1"),
+                                "192.0.2.1"
+                            )
+                            .await
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            request_from_peer(
+                manager,
+                "GET",
+                "/surge-proxies.conf?raw=0&raw=1",
+                "192.0.2.1"
+            )
+            .await
+            .starts_with("HTTP/1.1 403")
+        );
     }
 
     #[tokio::test]
@@ -310,22 +490,7 @@ mod tests {
         });
         manager.refresh_finished(Some(&error));
         for method in ["GET", "HEAD", "POST"] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let mut client = TcpStream::connect(listener.local_addr().unwrap())
-                .await
-                .unwrap();
-            let (server, _) = listener.accept().await.unwrap();
-            let task = tokio::spawn(serve_connection(server, manager.clone()));
-            client
-                .write_all(
-                    format!("{method} /status HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes(),
-                )
-                .await
-                .unwrap();
-            let mut bytes = Vec::new();
-            client.read_to_end(&mut bytes).await.unwrap();
-            task.await.unwrap().unwrap();
-            let response = String::from_utf8(bytes).unwrap();
+            let response = request_for_test(manager.clone(), method, "/status").await;
             let (headers, body) = response.split_once("\r\n\r\n").unwrap();
             if method == "POST" {
                 assert!(headers.contains("405"));

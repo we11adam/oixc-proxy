@@ -12,6 +12,7 @@ use tokio::sync::{RwLock, Semaphore};
 
 use crate::config::RuntimeConfig;
 use crate::nodes::Proxy;
+use crate::raw_provider::{RawNodes, RawProvider};
 use crate::snell::{SnellClient, SnellClientOptions};
 use crate::surge::{ProviderProtocol, node_selector, render_provider};
 use crate::transport::{EchDialer, TransportContext};
@@ -49,6 +50,9 @@ pub struct Router {
     all: ProviderDocs,
     routing_secret: String,
     published_count: usize,
+    raw_filtered: RawNodes,
+    raw_all: RawNodes,
+    allow_remote_raw_provider: bool,
 }
 
 pub struct GatewayManager {
@@ -56,6 +60,7 @@ pub struct GatewayManager {
     catalog_status: Mutex<crate::diagnostics::CatalogStatus>,
     transport: Option<Arc<TransportContext>>,
     subscription: RwLock<Option<(crate::subscription::UserInfo, Option<u64>)>>,
+    raw: RawProvider,
 }
 
 #[derive(Clone)]
@@ -188,6 +193,9 @@ impl Router {
             all,
             routing_secret: context.routing_secret.clone(),
             published_count: published.len(),
+            raw_filtered: RawNodes::new(published),
+            raw_all: RawNodes::new(proxies),
+            allow_remote_raw_provider: runtime.allow_remote_raw_provider,
         })
     }
 
@@ -237,25 +245,32 @@ impl GatewayManager {
             catalog_status: Mutex::new(crate::diagnostics::CatalogStatus::default()),
             transport: None,
             subscription: RwLock::new(None),
+            raw: RawProvider::default(),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn provider_for_test() -> Self {
-        let doc: Arc<[u8]> = b"proxies: []\n".as_slice().into();
-        let docs = ProviderDocs {
-            surge_http: doc.clone(),
-            surge_socks: doc.clone(),
-            clash_http: doc.clone(),
-            clash_socks: doc,
-        };
+        Self::raw_provider_for_test(false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw_provider_for_test(allow_remote: bool) -> Self {
+        let proxies = [
+            crate::raw_provider::test_proxy("Mock Fusion 01"),
+            crate::raw_provider::test_proxy("Mock Extra 02"),
+        ];
         Self::new(Router {
             routes: HashMap::new(),
             runtimes: HashMap::new(),
-            filtered: docs.clone(),
-            all: docs,
+            filtered: render_provider_docs(&proxies[..1], "127.0.0.1", 6172, "mock-secret", true)
+                .unwrap(),
+            all: render_provider_docs(&proxies, "127.0.0.1", 6172, "mock-secret", true).unwrap(),
             routing_secret: "test".to_owned(),
             published_count: 0,
+            raw_filtered: RawNodes::new(&proxies[..1]),
+            raw_all: RawNodes::new(&proxies),
+            allow_remote_raw_provider: allow_remote,
         })
     }
 
@@ -302,18 +317,19 @@ impl GatewayManager {
         catalog.cache_age_seconds = catalog
             .last_success_at
             .map(|time| crate::diagnostics::unix_now().saturating_sub(time));
-        let (ready, total, published, nodes) = {
+        let (ready, total, published, nodes, raw_skipped) = {
             let router = self.router.read().await;
             router
                 .as_ref()
-                .map(|r| (true, r.runtimes.len(), r.published_count, r.node_statuses()))
-                .unwrap_or((false, 0, 0, Vec::new()))
+                .map(|r| (true, r.runtimes.len(), r.published_count, r.node_statuses(),
+                    serde_json::json!({"filtered": r.raw_filtered.skipped, "all": r.raw_all.skipped})))
+                .unwrap_or((false, 0, 0, Vec::new(), serde_json::Value::Null))
         };
         let transport = match &self.transport {
             Some(transport) => transport.status().await,
             None => serde_json::Value::Null,
         };
-        serde_json::json!({"version": crate::VERSION, "ready": ready, "total_nodes": total, "published_nodes": published, "catalog": catalog, "transport": transport, "nodes":nodes})
+        serde_json::json!({"version": crate::VERSION, "ready": ready, "total_nodes": total, "published_nodes": published, "catalog": catalog, "transport": transport, "nodes":nodes, "raw_skipped_nodes": raw_skipped})
     }
 
     pub fn new(router: Router) -> Self {
@@ -322,6 +338,7 @@ impl GatewayManager {
             catalog_status: Mutex::new(crate::diagnostics::CatalogStatus::default()),
             transport: None,
             subscription: RwLock::new(None),
+            raw: RawProvider::default(),
         }
     }
 
@@ -340,6 +357,44 @@ impl GatewayManager {
             .as_ref()
             .map(|router| router.provider(include_all, socks))
             .ok_or_else(|| anyhow::anyhow!("gateway unavailable"))
+    }
+
+    /// None means this peer is forbidden. Check the same catalog snapshot that
+    /// will be exported, including after a transactional config reload.
+    pub(crate) async fn raw_provider(
+        &self,
+        include_all: bool,
+        peer: IpAddr,
+    ) -> Result<Option<Arc<[u8]>>> {
+        let router = self.current().await?;
+        let loopback = match peer {
+            IpAddr::V4(ip) => ip.is_loopback(),
+            IpAddr::V6(ip) => {
+                ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
+            }
+        };
+        if !loopback && !router.allow_remote_raw_provider {
+            return Ok(None);
+        }
+        let transport = self.transport.clone();
+        let nodes = if include_all {
+            &router.raw_all
+        } else {
+            &router.raw_filtered
+        };
+        let document = self
+            .raw
+            .render(nodes, move |host| {
+                let transport = transport.clone();
+                async move {
+                    match transport {
+                        Some(transport) => transport.resolve_host(&host).await,
+                        None => bail!("raw resolver unavailable"),
+                    }
+                }
+            })
+            .await;
+        Ok(Some(document.into()))
     }
 
     pub async fn clash_provider(&self, include_all: bool, socks: bool) -> Result<Arc<[u8]>> {
@@ -485,6 +540,38 @@ fn constant_time_equal(first: &[u8], second: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn raw_export_permissions_follow_the_replaced_catalog() {
+        let manager = GatewayManager::provider_for_test();
+        let remote = "192.0.2.1".parse().unwrap();
+        assert!(manager.raw_provider(false, remote).await.unwrap().is_none());
+        for allow_remote in [true, false] {
+            let replacement = GatewayManager::raw_provider_for_test(allow_remote)
+                .router
+                .into_inner()
+                .unwrap();
+            let mut replacement = Arc::try_unwrap(replacement).ok().unwrap();
+            replacement.raw_filtered.skipped = 1;
+            replacement.raw_all.skipped = 2;
+            manager.replace(replacement).await.unwrap();
+            assert_eq!(
+                manager.raw_provider(false, remote).await.unwrap().is_some(),
+                allow_remote
+            );
+        }
+        assert_eq!(
+            manager.status().await["raw_skipped_nodes"],
+            serde_json::json!({"filtered":1,"all":2})
+        );
+        let status = manager.status().await;
+        assert!(!status.to_string().contains("mock-secret"));
+        assert!(!status.to_string().contains("node.example.test"));
+        assert_eq!(
+            crate::diagnostics::bundle_status(&status)["raw_skipped_nodes"],
+            status["raw_skipped_nodes"]
+        );
+    }
 
     #[test]
     fn routing_secret_is_stable_and_url_safe() {

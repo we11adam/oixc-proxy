@@ -121,6 +121,7 @@ The default endpoints are:
 | --- | --- | --- |
 | Mixed proxy | `127.0.0.1:6172` | HTTP and SOCKS5 on one port; routes provider credentials to one named node |
 | Nodelist | `http://127.0.0.1:6173/surge-proxies.conf` | Surge list (`?all=1` every node, `?socks=1` advertise SOCKS5) |
+| Raw Snell list | `http://127.0.0.1:6173/surge-proxies.conf?raw=1` | Sensitive ECH-TLS node parameters; loopback peers only by default, combines with `all=1`, ignores `socks` |
 | Clash | `http://127.0.0.1:6173/clash-proxies.yaml` | Clash list (`?all=1` every node, `?socks=1` advertise SOCKS5) |
 | Health | `http://127.0.0.1:6173/healthz` | Readiness probe |
 
@@ -131,7 +132,7 @@ Example Surge group:
 OIXC = select, policy-path=http://127.0.0.1:6173/surge-proxies.conf, update-interval=3600
 ```
 
-Every provider entry points to the shared mixed listener. Entries are HTTP
+Every default provider entry points to the shared mixed listener. Entries are HTTP
 proxies by default; `?socks=1` advertises SOCKS5 instead (UDP ASSOCIATE is
 only available on the SOCKS path). Loopback listeners advertise each node's
 UDP capability directly. A remote listener advertises UDP only when a fixed
@@ -139,8 +140,9 @@ relay port range and a client-reachable address are both configured, avoiding
 providers that claim unusable UDP support. The username is a reversible URL-safe
 encoding of the exact managed node name; the password is a stable HMAC-derived
 routing secret. HTTP clients send those as `Proxy-Authorization: Basic`. The
-access token, node address, PSK and ECH configuration are never returned by
-the nodelist HTTP endpoint.
+access token is never returned by the nodelist HTTP endpoint. Node addresses,
+PSKs and ECH configurations are returned only when explicitly requesting
+`raw=1` below, not in ordinary Surge/Clash provider lists.
 
 Only names containing `Fusion` or a standalone `CIA` token,
 case-insensitively, are published by default. Treating the acronym as a token
@@ -149,6 +151,38 @@ is rejected so a control-plane naming change cannot expose ordinary nodes.
 `GET` `/surge-proxies.conf?all=1` and `/clash-proxies.yaml?all=1` publish the
 full catalog; those extra nodes are still routed through the same mixed
 listener. Append `socks=1` when the client should use SOCKS5.
+
+### Export raw Snell ECH-TLS nodes
+
+**`raw=1` exposes real node addresses, PSKs and ECH configurations: treat it as
+an export of upstream credentials.** By default only loopback TCP peers are
+allowed; other peers receive HTTP 403. `Forwarded` / `X-Forwarded-For` are not
+trusted. Do not forward this local endpoint to untrusted clients through a
+reverse proxy. To allow remote peers, explicitly set
+`allow-remote-raw-provider=true` and restrict access with a firewall/trusted
+network; this HTTP endpoint provides no additional authentication or encryption.
+Successful and forbidden responses carry `Cache-Control: no-store`.
+
+```sh
+curl --noproxy '*' 'http://127.0.0.1:6173/surge-proxies.conf?raw=1&all=1'
+```
+
+Without `all=1`, the current node filter still applies. Raw mode ignores `socks`;
+the Clash route does not support raw exports. Lines include Snell v4, ECH-TLS,
+SNI (falling back to the original node host), standard Base64 ECH configuration,
+reuse and UDP flags. TFO / skip-certificate-verification flags appear only when
+enabled; path, preconnect and identity fields are omitted. Policy sanitizing and
+duplicate suffixes match the ordinary provider. Unsupported profiles and unsafe
+parameter values are skipped; `/status` reports counts in
+`raw_skipped_nodes.filtered` / `.all`.
+
+Addresses use the existing resolver: signed private DNS for managed names,
+system DNS otherwise, preferring IPv4 and then bracket-free IPv6. At most eight
+lookups run concurrently across requests, with a two-second per-lookup deadline.
+Failure/timeout falls back to the host's last successful address, then its
+original hostname, without failing the subscription or dropping the node.
+Last-known-good addresses are memory-only, survive requests/catalog refreshes
+and reset on process restart. The resolver's existing short TTL cache is unchanged.
 
 ## Service configuration
 
@@ -196,6 +230,7 @@ The file must be a regular file with Unix mode `0600` or stricter.
 | `api-fallback-urls` | No | Unset | Comma-separated trusted HTTPS API URLs, at most three |
 | `listen` | No | `127.0.0.1:6172` | Mixed HTTP/SOCKS5 numeric IP and port |
 | `nodelist-listen` | No | `127.0.0.1:6173` | HTTP numeric IP and port |
+| `allow-remote-raw-provider` | No | `false` | Allow non-loopback peers to retrieve upstream credentials via `raw=1`; accepts only `true` / `false`, supports hot reload |
 | `outbound-ip` | Conditional | SOCKS5 bind IP | Provider/UDP address; a non-loopback value also pins control-plane and node connections to that physical source IP |
 | `udp-port-range` | Conditional | Unset (OS-assigned port) | Fixed SOCKS5 UDP relay range as `START-END`, limited to 4096 ports |
 | `udp-advertise-address` | Conditional | Unset (bound IP) | Client-reachable address returned by SOCKS5 UDP ASSOCIATE |
@@ -332,7 +367,8 @@ Run `oixc-proxy refresh-nodes [--config PATH]` to refresh the running `serve`
 instance manually. Configuration changes can be applied with
 `oixc-proxy reload-config [--config PATH]`. Reload supports the token, API URLs,
 filters, timeouts, connection/dial limits, reuse settings, refresh interval and
-trace sampling. A token or API URL change must fetch and verify a fresh catalog;
+trace sampling, plus `allow-remote-raw-provider`. A token or API URL change must
+fetch and verify a fresh catalog;
 validation or preparation failure retains the complete active configuration.
 Filter-only changes retain unchanged clients and metrics. Token or dial/reuse
 changes rebuild clients and retire old idle connections; established tunnels

@@ -29,6 +29,7 @@ pub struct RuntimeConfig {
     pub tcp_idle_timeout: Duration,
     pub udp_idle_timeout: Duration,
     pub allow_remote_access: bool,
+    pub allow_remote_raw_provider: bool,
     pub socks_username: String,
     pub socks_password: String,
     pub max_client_connections: usize,
@@ -96,6 +97,7 @@ struct FileConfig {
     tcp_idle_timeout: String,
     udp_idle_timeout: String,
     allow_remote_access: bool,
+    allow_remote_raw_provider: bool,
     socks_username: String,
     socks_password_file: String,
     max_client_connections: usize,
@@ -181,6 +183,12 @@ pub(crate) fn proxy_config_from_bytes(content: &[u8]) -> Result<ProxyConfig> {
         Path::new(""),
         FileConfig {
             access_token: token,
+            allow_remote_raw_provider: match values.get("allow-remote-raw-provider") {
+                None => false,
+                Some(value) if value == "true" => true,
+                Some(value) if value == "false" => false,
+                Some(_) => bail!("allow-remote-raw-provider must be true or false"),
+            },
             api_base_url: config_string(&values, "api-base-url"),
             node_filter_lines: config_string(&values, "node-filter-lines"),
             node_filter_regions: config_string(&values, "node-filter-regions"),
@@ -360,6 +368,7 @@ fn runtime_from_raw(config_dir: &Path, raw: FileConfig) -> Result<RuntimeConfig>
         tcp_idle_timeout,
         udp_idle_timeout,
         allow_remote_access: raw.allow_remote_access,
+        allow_remote_raw_provider: raw.allow_remote_raw_provider,
         socks_username,
         socks_password,
         max_client_connections: bounded_or_default(
@@ -402,6 +411,7 @@ fn parse_proxy_config(content: &[u8]) -> Result<HashMap<String, String>> {
         "listen",
         "socks5-listen",
         "nodelist-listen",
+        "allow-remote-raw-provider",
         "outbound-ip",
         "udp-port-range",
         "udp-advertise-address",
@@ -721,6 +731,42 @@ pub(crate) fn require_private_file(path: &Path, allow_insecure: bool) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_raw_provider_defaults_off_and_requires_an_explicit_boolean() {
+        assert!(
+            !proxy_config_from_bytes(b"token=mock-secret\n")
+                .unwrap()
+                .runtime
+                .allow_remote_raw_provider
+        );
+        for (value, expected) in [("true", true), ("false", false)] {
+            let config = format!("token=mock-secret\nallow-remote-raw-provider={value}\n");
+            assert_eq!(
+                proxy_config_from_bytes(config.as_bytes())
+                    .unwrap()
+                    .runtime
+                    .allow_remote_raw_provider,
+                expected
+            );
+        }
+        for value in ["1", "yes", "TRUE"] {
+            let config = format!("token=mock-secret\nallow-remote-raw-provider={value}\n");
+            assert!(proxy_config_from_bytes(config.as_bytes()).is_err());
+        }
+        assert!(
+            runtime_from_raw(
+                Path::new(""),
+                FileConfig {
+                    access_token: "mock-secret".into(),
+                    allow_remote_raw_provider: true,
+                    ..FileConfig::default()
+                }
+            )
+            .unwrap()
+            .allow_remote_raw_provider
+        );
+    }
 
     #[test]
     fn api_fallbacks_require_distinct_trusted_https_urls() {

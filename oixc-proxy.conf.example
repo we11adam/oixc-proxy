@@ -2,6 +2,9 @@
 token=REPLACE_WITH_OIXC_ACCESS_TOKEN
 listen=127.0.0.1:6172
 nodelist-listen=127.0.0.1:6173
+# raw=1 exports upstream PSKs/ECH configs. Remote peers are denied by default.
+# Only enable on a trusted network with restricted access; no HTTP authentication.
+# allow-remote-raw-provider=false
 node-refresh-interval=1h
 
 # Custom selection replaces the default Fusion/CIA filter. Alternatives use |.

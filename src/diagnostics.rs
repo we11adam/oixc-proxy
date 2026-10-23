@@ -328,6 +328,7 @@ fn select_fields(value: &serde_json::Value, keys: &[&str]) -> serde_json::Value 
 
 pub fn bundle_status(status: &serde_json::Value) -> serde_json::Value {
     let mut safe = select_fields(status, &["ready", "total_nodes", "published_nodes"]);
+    safe["raw_skipped_nodes"] = select_fields(&status["raw_skipped_nodes"], &["filtered", "all"]);
     safe["catalog"] = select_fields(
         &status["catalog"],
         &[
@@ -399,6 +400,7 @@ pub fn config_summary(
     let runtime = &config.runtime;
     serde_json::json!({
         "remote_listener":!config.listen.ip().is_loopback(),
+        "allow_remote_raw_provider":runtime.allow_remote_raw_provider,
         "pinned_egress":!config.outbound_ip.is_loopback(),
         "fixed_udp_port_count":config.udp_port_range.map(|range| range.port_count()),
         "api_fallback_count":runtime.api_fallback_urls.len(),

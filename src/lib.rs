@@ -13,6 +13,7 @@ pub mod http_server;
 pub mod network;
 pub mod nodes;
 pub mod perftrace;
+mod raw_provider;
 pub mod rlimit;
 pub mod snell;
 pub mod socks5;

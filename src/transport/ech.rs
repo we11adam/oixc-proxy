@@ -1,6 +1,6 @@
 use std::collections::{HashSet, VecDeque};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -72,6 +72,16 @@ pub struct EchDialer {
 }
 
 impl TransportContext {
+    /// Shares the dialer's signed private DNS cache and system DNS fallback.
+    pub(crate) async fn resolve_host(&self, host: &str) -> Result<Vec<IpAddr>> {
+        let network = self.network.snapshot().await;
+        Ok(resolve_addresses(&self.resolver, &network, host, 0)
+            .await?
+            .into_iter()
+            .map(|address| address.ip())
+            .collect())
+    }
+
     pub async fn status(&self) -> serde_json::Value {
         let network = self.network.snapshot().await;
         let fields = network
@@ -298,17 +308,7 @@ impl EchDialer {
         }
         let dns_started = Instant::now();
         timings.start(DialStage::Dns);
-        let addresses = match self.resolver.lookup(&self.server, &network).await {
-            Ok(Some(addresses)) => Ok(addresses
-                .into_iter()
-                .map(|ip| SocketAddr::new(ip, self.port))
-                .collect::<Vec<_>>()),
-            Ok(None) => lookup_host((self.server.as_str(), self.port))
-                .await
-                .map(|addresses| addresses.collect())
-                .map_err(|error| anyhow::Error::new(error).context("resolve ECH-TLS node")),
-            Err(error) => Err(error),
-        };
+        let addresses = resolve_addresses(&self.resolver, &network, &self.server, self.port).await;
         timings.finish();
         crate::perftrace::stage("ech.dns", dns_started, addresses.is_ok(), &[]);
         let addresses = addresses?
@@ -538,6 +538,24 @@ async fn connect_from(address: SocketAddr, network: NetworkSnapshot) -> io::Resu
     };
     network.bind_tcp(&socket, address)?;
     socket.connect(address).await
+}
+
+async fn resolve_addresses(
+    resolver: &PrivateDnsResolver,
+    network: &NetworkSnapshot,
+    host: &str,
+    port: u16,
+) -> Result<Vec<SocketAddr>> {
+    match resolver.lookup(host, network).await? {
+        Some(addresses) => Ok(addresses
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect()),
+        None => lookup_host((host, port))
+            .await
+            .map(|addresses| addresses.collect())
+            .map_err(|error| anyhow::Error::new(error).context("resolve ECH-TLS node")),
+    }
 }
 
 pub(crate) fn parse_ech_config(encoded: &str) -> Result<EchConfig> {
