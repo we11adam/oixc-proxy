@@ -91,7 +91,10 @@ fn safe_host(host: &str) -> bool {
                         && !label.ends_with('-')
                         && label
                             .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                            // Private DNS also uses underscore-bearing labels.
+                            // They are safe in Surge fields even though stricter
+                            // hostname grammars disallow them.
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
                 }))
 }
 
@@ -265,6 +268,35 @@ mod tests {
             })
             .await;
         assert_eq!(String::from_utf8(output).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn renders_underscore_dns_labels_without_skipping_private_dns_nodes() {
+        let mut proxy = test_proxy("Mock Fusion 01");
+        proxy.server = "node_fusion.example.test".into();
+        let nodes = RawNodes::new(&[proxy]);
+        assert_eq!(nodes.skipped, 0);
+        let resolver = RawProvider::default();
+        let resolved = resolver
+            .render(&nodes, |host| async move {
+                assert_eq!(host, "node_fusion.example.test");
+                Ok(vec!["192.0.2.1".parse().unwrap()])
+            })
+            .await;
+        let resolved = String::from_utf8(resolved).unwrap();
+        assert!(resolved.starts_with("Mock Fusion 01 = snell, 192.0.2.1, 443,"));
+        let failed = resolver
+            .render(&nodes, |_| async { anyhow::bail!("mock failure") })
+            .await;
+        assert_eq!(String::from_utf8(failed).unwrap(), resolved);
+        let uncached = RawProvider::default()
+            .render(&nodes, |_| async { anyhow::bail!("mock failure") })
+            .await;
+        assert!(
+            String::from_utf8(uncached)
+                .unwrap()
+                .starts_with("Mock Fusion 01 = snell, node_fusion.example.test, 443,")
+        );
     }
 
     #[tokio::test]
