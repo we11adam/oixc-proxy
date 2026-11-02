@@ -156,6 +156,20 @@ is rejected so a control-plane naming change cannot expose ordinary nodes.
 full catalog; those extra nodes are still routed through the same mixed
 listener. Append `http=1` when the client should use HTTP.
 
+### Force a provider refresh
+
+Add `refresh=1` to either Surge or Clash provider URL (GET and HEAD are supported) to fetch the complete remote catalog visible to the current token instead of using the startup cache. The request waits for validation and persistence to `nodes-cache.yaml` beside the config, then returns the updated in-memory catalog. Successful fetches update timestamps and subscription metadata even when nodes have not changed.
+
+```text
+http://127.0.0.1:6173/surge-proxies.conf?all=1&refresh=1
+http://127.0.0.1:6173/surge-proxies.conf?all=1&raw=1&refresh=1
+http://127.0.0.1:6173/clash-proxies.yaml?all=1&refresh=1
+```
+
+`refresh=1` controls fetching; `all=1` bypasses local response filters. Without `all=1`, the response remains filtered, but the cache stores the full valid catalog. This does not bypass panel permissions or protocol validation. Requests without `refresh=1` continue to use the current catalog without fetching remotely.
+
+Remote fetch, validation or cache-write failures **fail closed with HTTP 503, never stale nodes**. Preserve the previous in-memory catalog and disk cache for ordinary requests. Busy refreshes, unavailable queues and waits exceeding 180 seconds also return a non-cacheable 503. Only one HTTP forced refresh is accepted at a time; avoid frequent polling across clients. Raw access checks run before refreshing, and raw DNS last-known-good/hostname fallback remains unchanged.
+
 ### Export raw Snell ECH-TLS nodes
 
 **`raw=1` exposes real node addresses, PSKs and ECH configurations: treat it as

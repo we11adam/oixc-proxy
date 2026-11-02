@@ -65,6 +65,9 @@ GET /surge-proxies.conf?all=1 and /clash-proxies.yaml?all=1 publish the
 full catalog without changing the default filtered listing. Provider
 entries are SOCKS5 proxies by default; append http=1 to advertise HTTP
 instead. The local listener accepts both HTTP and SOCKS5.
+Append refresh=1 to force a remote catalog fetch and cache update before
+responding. Failures return HTTP 503 without stale nodes, retaining the old
+catalog and cache. Combine with all=1 to bypass local response filters.
 GET /surge-proxies.conf?raw=1 exports sensitive Snell ECH-TLS node parameters,
 not local gateway entries. It combines with all=1, ignores http/socks, and allows
 only loopback peers unless allow-remote-raw-provider=true is configured.
@@ -556,14 +559,34 @@ impl CatalogService {
     }
 
     async fn refresh(&mut self) -> Result<()> {
+        self.refresh_with_policy(false).await
+    }
+
+    async fn refresh_with_policy(&mut self, require_cache_write: bool) -> Result<()> {
         self.manager.refresh_started();
-        let result = self.refresh_inner().await;
+        let fetched = load_managed_catalog(&self.service.runtime, true, &self.network).await;
+        self.finish_refresh(fetched, require_cache_write).await
+    }
+
+    async fn finish_refresh(
+        &mut self,
+        fetched: Result<CatalogSnapshot>,
+        require_cache_write: bool,
+    ) -> Result<()> {
+        let result = match fetched {
+            Ok(refreshed) => {
+                self.apply_refreshed_catalog(refreshed, require_cache_write)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
         self.manager.refresh_finished(result.as_ref().err());
         self.events.record(
             crate::diagnostics::EventKind::CatalogRefresh,
             result.as_ref().err(),
         );
-        if let Err(error) = &result
+        if !require_cache_write
+            && let Err(error) = &result
             && matches!(
                 crate::diagnostics::classify(error),
                 crate::diagnostics::ErrorKind::Authentication
@@ -581,9 +604,12 @@ impl CatalogService {
         result
     }
 
-    async fn refresh_inner(&mut self) -> Result<()> {
-        let refreshed = load_managed_catalog(&self.service.runtime, true, &self.network).await?;
-        if refreshed.managed.proxies != self.managed.proxies {
+    async fn apply_refreshed_catalog(
+        &mut self,
+        refreshed: CatalogSnapshot,
+        require_cache_write: bool,
+    ) -> Result<()> {
+        let replacement = if refreshed.managed.proxies != self.managed.proxies {
             let published = published_proxies(
                 &refreshed.managed,
                 self.disable_filter,
@@ -597,17 +623,33 @@ impl CatalogService {
                 &self.context,
                 Some(previous.as_ref()),
             )?;
+            Some((replacement, published.len()))
+        } else {
+            None
+        };
+        // A forced HTTP refresh must not claim success if persistence failed.
+        // Validate/build first so invalid catalogs never replace the old cache.
+        if require_cache_write {
+            self.cache.store_snapshot(
+                &refreshed.managed,
+                refreshed.userinfo.as_ref(),
+                refreshed.fetched_at,
+            )?;
+        }
+        if let Some((replacement, published_count)) = replacement {
             self.manager.replace(replacement).await?;
             println!(
                 "Refreshed node catalog ({})",
-                format_node_count(published.len(), refreshed.managed.proxies.len())
+                format_node_count(published_count, refreshed.managed.proxies.len())
             );
         }
         self.manager
             .update_subscription(refreshed.userinfo.clone(), refreshed.fetched_at)
             .await;
         self.fetched_at = refreshed.fetched_at;
-        self.cache.store_snapshot_or_log(&refreshed);
+        if !require_cache_write {
+            self.cache.store_snapshot_or_log(&refreshed);
+        }
         self.managed = refreshed.managed;
         Ok(())
     }
@@ -653,7 +695,12 @@ async fn run_serve(args: &[String]) -> Result<()> {
         &gateway_context,
         None,
     )?;
-    let manager = Arc::new(GatewayManager::new(router).with_transport(transport));
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<crate::control::Request>(8);
+    let manager = Arc::new(
+        GatewayManager::new(router)
+            .with_transport(transport)
+            .with_provider_refresh(control_tx.clone()),
+    );
     manager.initialize_status(
         from_cache,
         if from_cache {
@@ -705,7 +752,6 @@ async fn run_serve(args: &[String]) -> Result<()> {
     });
     let mut socks_task = tokio::spawn(serve_dynamic_listener(socks_listener, settings_rx));
     let mut http_task = tokio::spawn(http_server::serve(nodelist_listener, manager.clone()));
-    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<crate::control::Request>(8);
     // Owned here so a graceful stop, which drops this future, removes the socket.
     let mut control = crate::control::start(&config_path, control_tx).await?;
     #[cfg(windows)]
@@ -760,8 +806,13 @@ async fn run_serve(args: &[String]) -> Result<()> {
         let reloading = request
             .as_ref()
             .is_some_and(|r| matches!(r.command, crate::control::Command::ReloadConfig));
+        let provider_refresh = request
+            .as_ref()
+            .is_some_and(|r| matches!(r.command, crate::control::Command::RefreshProvider));
         let result = if reloading {
             catalog.reload(&config_path).await
+        } else if provider_refresh {
+            catalog.refresh_with_policy(true).await
         } else {
             catalog.refresh().await
         };
@@ -787,7 +838,11 @@ async fn run_serve(args: &[String]) -> Result<()> {
                     } else {
                         "node catalog refreshed"
                     },
-                    manager.status().await,
+                    if provider_refresh {
+                        serde_json::Value::Null
+                    } else {
+                        manager.status().await
+                    },
                 ),
                 Err(error) => crate::control::Response::failure(
                     if reloading {
@@ -1776,6 +1831,170 @@ mod tests {
             "Japan IXP 01"
         );
         assert_eq!(published_proxies(&managed, true, &filter).unwrap().len(), 2);
+    }
+
+    async fn cached_catalog_for_test(path: &Path) -> CatalogService {
+        write_exclusive(
+            path,
+            b"token=test\napi-base-url=https://127.0.0.1:9\nrequest-timeout=100ms\n",
+        )
+        .unwrap();
+        let service = load_proxy_config(path).unwrap();
+        let managed = ManagedConfig {
+            proxies: vec![node("Old Fusion 01")],
+        };
+        let network = NetworkMonitor::new(None);
+        let transport = Arc::new(TransportContext::built_in_with_network(network.clone()).unwrap());
+        let context = GatewayContext::new(
+            service.outbound_ip,
+            false,
+            derive_routing_secret("test").unwrap(),
+            Arc::new(Semaphore::new(1)),
+            transport,
+        );
+        let router = Router::build(
+            &managed.proxies,
+            &managed.proxies,
+            &service.runtime,
+            &context,
+            None,
+        )
+        .unwrap();
+        let manager = Arc::new(GatewayManager::new(router));
+        let info = crate::subscription::UserInfo::parse("upload=1;download=2;total=100").unwrap();
+        manager
+            .update_subscription(Some(info.clone()), Some(1))
+            .await;
+        let cache = CatalogCache::beside_config(path, "test");
+        cache
+            .store_snapshot(&managed, Some(&info), Some(1))
+            .unwrap();
+        CatalogService {
+            service,
+            managed,
+            fetched_at: Some(1),
+            network,
+            cache,
+            context,
+            manager,
+            disable_filter: false,
+            events: crate::diagnostics::EventLog::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_refresh_preserves_entire_cache_and_router_on_remote_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test.conf");
+        let mut catalog = cached_catalog_for_test(&path).await;
+        let cache_path = directory.path().join("nodes-cache.yaml");
+        let original = fs::read(&cache_path).unwrap();
+        let previous = catalog.manager.current().await.unwrap();
+        assert!(catalog.refresh_with_policy(true).await.is_err());
+        for kind in [
+            crate::diagnostics::ErrorKind::Authentication,
+            crate::diagnostics::ErrorKind::Forbidden,
+            crate::diagnostics::ErrorKind::InvalidResponse,
+            crate::diagnostics::ErrorKind::Signature,
+            crate::diagnostics::ErrorKind::Timeout,
+        ] {
+            let error = crate::diagnostics::ApiFailure {
+                kind,
+                status: None,
+                retry_after_seconds: None,
+            };
+            assert!(
+                catalog
+                    .finish_refresh(Err(error.into()), true)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(fs::read(&cache_path).unwrap(), original);
+            assert!(Arc::ptr_eq(
+                &previous,
+                &catalog.manager.current().await.unwrap()
+            ));
+            assert_eq!(catalog.fetched_at, Some(1));
+            assert_eq!(
+                catalog
+                    .cache
+                    .load_snapshot()
+                    .unwrap()
+                    .userinfo
+                    .unwrap()
+                    .download,
+                2
+            );
+        }
+        assert!(
+            catalog
+                .manager
+                .provider(true, true)
+                .await
+                .unwrap()
+                .starts_with(b"Old Fusion 01 = socks5,")
+        );
+        assert_eq!(
+            catalog.manager.status().await["catalog"]["refresh_failures"],
+            6
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_refresh_commits_full_catalog_and_refuses_cache_write_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test.conf");
+        let mut catalog = cached_catalog_for_test(&path).await;
+        let cache_path = directory.path().join("nodes-cache.yaml");
+        let original = fs::read(&cache_path).unwrap();
+        let previous = catalog.manager.current().await.unwrap();
+        let fresh = || CatalogSnapshot {
+            managed: ManagedConfig {
+                proxies: vec![node("New Fusion 01"), node("Other IXP 02")],
+            },
+            userinfo: crate::subscription::UserInfo::parse("upload=3;download=4;total=100"),
+            fetched_at: Some(2),
+        };
+        let mut invalid = fresh();
+        invalid.managed.proxies[0].version = 6;
+        assert!(catalog.finish_refresh(Ok(invalid), true).await.is_err());
+        assert_eq!(fs::read(&cache_path).unwrap(), original);
+        assert!(Arc::ptr_eq(
+            &previous,
+            &catalog.manager.current().await.unwrap()
+        ));
+        // Block the exact temporary destination, without relying on Unix-only
+        // permissions (or root behavior), so this regression also runs on Windows.
+        let blocked = directory
+            .path()
+            .join(format!(".nodes-cache.yaml.tmp-{}", std::process::id()));
+        fs::create_dir(&blocked).unwrap();
+        assert!(catalog.finish_refresh(Ok(fresh()), true).await.is_err());
+        assert_eq!(fs::read(&cache_path).unwrap(), original);
+        assert!(Arc::ptr_eq(
+            &previous,
+            &catalog.manager.current().await.unwrap()
+        ));
+        fs::remove_dir(&blocked).unwrap();
+
+        catalog.finish_refresh(Ok(fresh()), true).await.unwrap();
+        let cached = catalog.cache.load_snapshot().unwrap();
+        assert_eq!(cached.managed.proxies.len(), 2);
+        assert_eq!(cached.fetched_at, Some(2));
+        assert_eq!(cached.userinfo.unwrap().download, 4);
+        assert_eq!(catalog.managed, fresh().managed);
+        assert_eq!(catalog.manager.status().await["published_nodes"], 1);
+        let all = catalog.manager.provider(true, true).await.unwrap();
+        assert!(String::from_utf8_lossy(&all).contains("Other IXP 02 = socks5,"));
+        assert!(!String::from_utf8_lossy(&all).contains("Old Fusion"));
+        let filtered = catalog.manager.provider(false, true).await.unwrap();
+        assert!(!String::from_utf8_lossy(&filtered).contains("Other IXP"));
+
+        // Even an unchanged catalog must rewrite its successful fetch metadata.
+        let mut unchanged = fresh();
+        unchanged.fetched_at = Some(3);
+        catalog.finish_refresh(Ok(unchanged), true).await.unwrap();
+        assert_eq!(catalog.cache.load_snapshot().unwrap().fetched_at, Some(3));
     }
 
     #[tokio::test]

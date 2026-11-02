@@ -240,6 +240,42 @@ proxies:
         })
         .await
         .unwrap();
+        // A forced provider refresh must go through the running service and
+        // fail closed against the offline API, without destroying its cache.
+        let cache_path = directory.path().join("nodes-cache.yaml");
+        let old_cache = std::fs::read(&cache_path).unwrap();
+        for path in [
+            "/surge-proxies.conf?all=1&refresh=1",
+            "/surge-proxies.conf?all=1&raw=1&refresh=1",
+            "/clash-proxies.yaml?all=1&refresh=1",
+        ] {
+            let response = http
+                .get(format!("http://127.0.0.1:{http_port}{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            let body = response.text().await.unwrap();
+            assert!(!body.contains("Hong Kong Fusion"));
+            assert!(!body.contains("local-test-only"));
+            assert_eq!(std::fs::read(&cache_path).unwrap(), old_cache);
+        }
+        let cached_provider = http
+            .get(format!(
+                "http://127.0.0.1:{http_port}/surge-proxies.conf?all=1"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(cached_provider.status().is_success());
+        assert!(
+            cached_provider
+                .text()
+                .await
+                .unwrap()
+                .contains("Hong Kong Fusion 01 = socks5,")
+        );
         // Read-only queries work while the writer is running; concurrent writers cannot.
         assert!(query(&journal, &["--all", "--json"]).status.success());
         let duplicate = Command::new(env!("CARGO_BIN_EXE_oixc-proxy"))

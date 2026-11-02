@@ -1,4 +1,5 @@
-//! Local service control. No administrative endpoint is exposed over HTTP.
+//! Private service control. HTTP provider refreshes enqueue only the internal
+//! refresh variant; reload and diagnostics remain private to the local channel.
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
@@ -22,6 +23,9 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(180);
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
     RefreshNodes,
+    /// In-process only: not accepted by the private control wire protocol.
+    #[serde(skip)]
+    RefreshProvider,
     ReloadConfig,
     Diagnostics,
 }
@@ -56,6 +60,13 @@ impl Response {
 pub struct Request {
     pub command: Command,
     pub reply: oneshot::Sender<Response>,
+}
+
+#[cfg(test)]
+#[test]
+fn provider_refresh_is_not_a_wire_control_command() {
+    assert!(serde_json::from_str::<Command>(r#"{"command":"refresh_provider"}"#).is_err());
+    assert!(serde_json::to_string(&Command::RefreshProvider).is_err());
 }
 
 pub fn socket_path(config: &Path) -> Result<PathBuf> {

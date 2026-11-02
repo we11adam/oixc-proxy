@@ -115,6 +115,31 @@ async fn serve_http(
             let include_all = query_flag(query, "all");
             let socks = !query_flag(query, "http");
             let raw = path == PROVIDER_PATH && query_flag(query, "raw");
+            if query_flag(query, "refresh") {
+                // Refuse forbidden raw requests before any remote API work.
+                if raw && matches!(manager.raw_provider_allowed(peer).await, Ok(false)) {
+                    return write_response(
+                        &mut connection,
+                        403,
+                        "Forbidden",
+                        &[("Cache-Control", "no-store")],
+                        b"raw provider requires a loopback peer\n",
+                        method == "HEAD",
+                    )
+                    .await;
+                }
+                if manager.refresh_provider().await.is_err() {
+                    return write_response(
+                        &mut connection,
+                        503,
+                        "Service Unavailable",
+                        &[("Cache-Control", "no-store")],
+                        b"remote refresh failed or unavailable; previous catalog retained\n",
+                        method == "HEAD",
+                    )
+                    .await;
+                }
+            }
             let (provider, content_type) = if path == CLASH_PROVIDER_PATH {
                 (
                     manager.clash_provider(include_all, socks).await,
@@ -283,6 +308,153 @@ mod tests {
         client.read_to_end(&mut bytes).await.unwrap();
         task.await.unwrap().unwrap();
         String::from_utf8(bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn refresh_waits_for_service_and_preserves_provider_flags() {
+        for (path, expected) in [
+            ("/surge-proxies.conf?refresh=1", "Mock Fusion 01 = socks5,"),
+            (
+                "/surge-proxies.conf?refresh=1&all=1&http=1",
+                "Mock Extra 02 = http,",
+            ),
+            (
+                "/surge-proxies.conf?refresh=1&all=1&raw=1",
+                "Mock Extra 02 = snell,",
+            ),
+            ("/clash-proxies.yaml?refresh=1&all=1", "type: socks5"),
+            ("/clash-proxies.yaml?refresh=1&http=1", "type: http"),
+        ] {
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+            let manager =
+                Arc::new(GatewayManager::provider_for_test().with_provider_refresh(sender));
+            let request = tokio::spawn(request_for_test(manager, "GET", path));
+            let pending = receiver.recv().await.unwrap();
+            assert!(matches!(
+                pending.command,
+                crate::control::Command::RefreshProvider
+            ));
+            assert!(
+                !request.is_finished(),
+                "must not return the cached provider yet"
+            );
+            pending
+                .reply
+                .send(crate::control::Response::success(
+                    "cache persisted",
+                    serde_json::Value::Null,
+                ))
+                .unwrap();
+            let response = request.await.unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"));
+            assert!(response.contains(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_never_returns_stale_nodes_but_ordinary_requests_still_work() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let manager = Arc::new(GatewayManager::provider_for_test().with_provider_refresh(sender));
+        for method in ["GET", "HEAD"] {
+            for path in [
+                "/surge-proxies.conf?refresh=1&all=1",
+                "/surge-proxies.conf?refresh=1&all=1&raw=1",
+                "/clash-proxies.yaml?refresh=1&all=1",
+            ] {
+                let task = tokio::spawn(request_for_test(manager.clone(), method, path));
+                receiver
+                    .recv()
+                    .await
+                    .unwrap()
+                    .reply
+                    .send(crate::control::Response::failure(
+                        "private API error",
+                        crate::diagnostics::ErrorKind::Forbidden,
+                    ))
+                    .unwrap();
+                let response = task.await.unwrap();
+                assert!(response.starts_with("HTTP/1.1 503"));
+                assert!(response.contains("Cache-Control: no-store"));
+                for private in [
+                    "Mock Fusion",
+                    "Mock Extra",
+                    "mock-secret",
+                    "private API error",
+                ] {
+                    assert!(!response.contains(private));
+                }
+                if method == "HEAD" {
+                    assert!(response.ends_with("\r\n\r\n"));
+                }
+            }
+        }
+        let cached = request_for_test(manager, "GET", "/surge-proxies.conf?all=1").await;
+        assert!(cached.starts_with("HTTP/1.1 200"));
+        assert!(cached.contains("Mock Extra 02 = socks5,"));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn refresh_is_bounded_and_checks_raw_access_before_remote_work() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let manager = Arc::new(GatewayManager::provider_for_test().with_provider_refresh(sender));
+        let forbidden = request_from_peer(
+            manager.clone(),
+            "GET",
+            "/surge-proxies.conf?refresh=1&raw=1",
+            "192.0.2.1",
+        )
+        .await;
+        assert!(forbidden.starts_with("HTTP/1.1 403"));
+        assert!(receiver.try_recv().is_err());
+        for (method, path) in [
+            ("POST", "/surge-proxies.conf?refresh=1"),
+            ("GET", "/healthz?refresh=1"),
+            ("GET", "/surge-proxies.conf?refresh=true"),
+            ("GET", "/surge-proxies.conf?refresh=1&refresh=0"),
+        ] {
+            request_for_test(manager.clone(), method, path).await;
+            assert!(receiver.try_recv().is_err());
+        }
+        let first = tokio::spawn(request_for_test(
+            manager.clone(),
+            "HEAD",
+            "/surge-proxies.conf?refresh=1",
+        ));
+        let pending = receiver.recv().await.unwrap();
+        let busy = request_for_test(manager.clone(), "GET", "/surge-proxies.conf?refresh=1").await;
+        assert!(busy.starts_with("HTTP/1.1 503"));
+        assert!(receiver.try_recv().is_err());
+        assert!(
+            request_for_test(manager.clone(), "GET", "/surge-proxies.conf")
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        pending
+            .reply
+            .send(crate::control::Response::success(
+                "ok",
+                serde_json::Value::Null,
+            ))
+            .unwrap();
+        let head = first.await.unwrap();
+        assert!(head.starts_with("HTTP/1.1 200"));
+        assert!(head.ends_with("\r\n\r\n"));
+        drop(receiver);
+        assert!(
+            request_for_test(manager, "GET", "/surge-proxies.conf?refresh=1")
+                .await
+                .starts_with("HTTP/1.1 503")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_refresh_times_out_without_returning_cached_nodes() {
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let manager = Arc::new(GatewayManager::provider_for_test().with_provider_refresh(sender));
+        let response = request_for_test(manager, "GET", "/surge-proxies.conf?refresh=1").await;
+        assert!(response.starts_with("HTTP/1.1 503"));
+        assert!(!response.contains("Mock Fusion"));
     }
 
     #[tokio::test]

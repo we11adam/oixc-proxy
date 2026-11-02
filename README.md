@@ -99,6 +99,20 @@ OIXC = select, policy-path=http://127.0.0.1:6173/surge-proxies.conf, update-inte
 
 默认只发布名称中包含 `Fusion` 或独立 `CIA` token 的节点，匹配不区分大小写。将该缩写视为独立 token，可避免错误纳入 `Special` 等普通名称。过滤后目录为空时会拒绝加载，以免控制面命名变化意外暴露普通节点。`GET /surge-proxies.conf?all=1` 和 `/clash-proxies.yaml?all=1` 会发布完整目录；这些额外节点仍通过同一个混合监听器路由。需要客户端使用 HTTP 时，再附加 `http=1`。
 
+### 强制刷新节点列表
+
+在 Surge 或 Clash provider URL 上添加 `refresh=1`（GET / HEAD 均支持），会绕过启动缓存，重新从远程取得当前 token 可见的完整目录。校验并写入配置旁的 `nodes-cache.yaml` 后才返回结果，同时更新运行中的目录；即使节点未变化，也会更新缓存的获取时间和订阅信息。
+
+```text
+http://127.0.0.1:6173/surge-proxies.conf?all=1&refresh=1
+http://127.0.0.1:6173/surge-proxies.conf?all=1&raw=1&refresh=1
+http://127.0.0.1:6173/clash-proxies.yaml?all=1&refresh=1
+```
+
+`refresh=1` 控制重新拉取，`all=1` 控制响应跳过本地筛选；不带 `all=1` 仍返回筛选后的列表，但缓存保存完整有效目录。“全量”不绕过面板权限或协议校验，也不会把不支持的节点强行导出。未带 `refresh=1` 的请求仍直接读取当前目录，不触发远程拉取。
+
+远程请求、校验或缓存写入失败时，本次请求 **fail-closed，返回 HTTP 503，不返回旧节点**；此前的内存目录和磁盘缓存保留，普通请求仍可使用。并发刷新繁忙、队列不可用或等待超过 180 秒也返回 503，响应均不缓存。每次只接受一个 HTTP 强制刷新，请勿让所有客户端频繁轮询此参数；`raw=1` 的访问限制仍先于刷新执行。raw 地址解析失败后的最后成功地址/域名回退不受此参数影响。
+
 ### 导出原始 Snell ECH-TLS 节点
 
 **`raw=1` 会返回真实节点地址、PSK 和 ECH 配置，相当于导出上游访问凭据。** 默认只接受 TCP 对端为回环地址的请求，其他对端返回 HTTP 403；不信任 `Forwarded` / `X-Forwarded-For`。不要通过反向代理将本地 raw 端点转发给不受信任的客户端。确需远程读取时，显式设置 `allow-remote-raw-provider=true`，并自行限制防火墙/可信访问范围；该 HTTP 接口没有额外认证或加密。成功和拒绝响应均带 `Cache-Control: no-store`。

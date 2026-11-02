@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{RwLock, Semaphore, mpsc, oneshot};
 
 use crate::config::RuntimeConfig;
 use crate::nodes::Proxy;
@@ -61,6 +61,8 @@ pub struct GatewayManager {
     transport: Option<Arc<TransportContext>>,
     subscription: RwLock<Option<(crate::subscription::UserInfo, Option<u64>)>>,
     raw: RawProvider,
+    provider_refresh: Option<mpsc::Sender<crate::control::Request>>,
+    provider_refresh_gate: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -246,6 +248,8 @@ impl GatewayManager {
             transport: None,
             subscription: RwLock::new(None),
             raw: RawProvider::default(),
+            provider_refresh: None,
+            provider_refresh_gate: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -277,6 +281,47 @@ impl GatewayManager {
     pub fn with_transport(mut self, transport: Arc<TransportContext>) -> Self {
         self.transport = Some(transport);
         self
+    }
+
+    pub(crate) fn with_provider_refresh(
+        mut self,
+        sender: mpsc::Sender<crate::control::Request>,
+    ) -> Self {
+        self.provider_refresh = Some(sender);
+        self
+    }
+
+    /// Wait for a real remote refresh and persisted cache, never serve stale
+    /// data as a successful refresh. At most one HTTP refresh can be pending.
+    pub(crate) async fn refresh_provider(&self) -> Result<()> {
+        let _guard = self
+            .provider_refresh_gate
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("provider refresh is busy"))?;
+        let sender = self
+            .provider_refresh
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("provider refresh unavailable"))?;
+        let (reply, receive) = oneshot::channel();
+        sender
+            .try_send(crate::control::Request {
+                command: crate::control::Command::RefreshProvider,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("provider refresh unavailable"))?;
+        let response = tokio::time::timeout(Duration::from_secs(180), receive)
+            .await
+            .map_err(|_| anyhow::anyhow!("provider refresh timed out"))?
+            .map_err(|_| anyhow::anyhow!("provider refresh unavailable"))?;
+        if !response.ok {
+            bail!("provider refresh failed");
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn raw_provider_allowed(&self, peer: IpAddr) -> Result<bool> {
+        let router = self.current().await?;
+        Ok(raw_peer_allowed(peer, router.allow_remote_raw_provider))
     }
 
     pub fn initialize_status(&self, from_cache: bool, last_success_at: Option<u64>) {
@@ -339,6 +384,8 @@ impl GatewayManager {
             transport: None,
             subscription: RwLock::new(None),
             raw: RawProvider::default(),
+            provider_refresh: None,
+            provider_refresh_gate: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -367,13 +414,7 @@ impl GatewayManager {
         peer: IpAddr,
     ) -> Result<Option<Arc<[u8]>>> {
         let router = self.current().await?;
-        let loopback = match peer {
-            IpAddr::V4(ip) => ip.is_loopback(),
-            IpAddr::V6(ip) => {
-                ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
-            }
-        };
-        if !loopback && !router.allow_remote_raw_provider {
+        if !raw_peer_allowed(peer, router.allow_remote_raw_provider) {
             return Ok(None);
         }
         let transport = self.transport.clone();
@@ -451,6 +492,16 @@ impl GatewayManager {
             previous.retire_exclusive_runtimes(None).await;
         }
     }
+}
+
+fn raw_peer_allowed(peer: IpAddr, allow_remote: bool) -> bool {
+    allow_remote
+        || match peer {
+            IpAddr::V4(ip) => ip.is_loopback(),
+            IpAddr::V6(ip) => {
+                ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
+            }
+        }
 }
 
 pub fn derive_routing_secret(key_material: &str) -> Result<String> {
