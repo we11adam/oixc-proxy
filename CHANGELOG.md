@@ -4,6 +4,16 @@
 
 本文件记录 `oixc-proxy` 各版本中值得注意的变更。版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.0] - 2026-11-02
+
+### 修复
+
+- 兼容新版订阅省略 `identity-version`：缺失时默认使用 Identity v2，修复全部远程节点因缺少迁移字段而被跳过、强制刷新返回 503 的问题；本地缓存同样兼容。显式旧身份版本、Legacy 回退、非 ECH-TLS、错误 ALPN 和跳过证书验证仍被拒绝。
+
+### 新功能
+
+- Surge / Clash provider 支持 `refresh=1`：等待远程完整有效目录拉取、校验、缓存持久化及内存更新后返回，可组合 `all=1`、`raw=1`、`http=1`；失败返回 HTTP 503，不回退输出旧节点，并保留旧目录和磁盘缓存。raw 权限先检查，HTTP 强制刷新限制为单个待处理请求。
+
 ## [0.8.0] - 2026-10-23
 
 ### 变更与升级提示
@@ -182,6 +192,7 @@
 - DNS 与 TCP 竞速：共享传输上下文、合并签名 DNS 查询、A/AAAA 并发查询、错开的连接尝试。
 - 拨号时间预算、采样的性能 tracing 和连接复用调优。
 
+[0.9.0]: https://github.com/we11adam/oixc-proxy/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/we11adam/oixc-proxy/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/we11adam/oixc-proxy/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/we11adam/oixc-proxy/compare/v0.6.0...v0.6.1

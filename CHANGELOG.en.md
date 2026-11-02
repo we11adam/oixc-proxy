@@ -4,6 +4,16 @@
 
 Notable changes to `oixc-proxy` are recorded in this file. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.9.0] - 2026-11-02
+
+### Fixed
+
+- Default omitted `identity-version` to Identity v2 in subscriptions and local caches, preventing all remote nodes from being skipped and forced refreshes from returning 503 when the retired migration field is absent. Continue rejecting explicit incompatible identity versions, legacy fallback, non-ECH-TLS transport, incorrect ALPN and disabled certificate verification.
+
+### Added
+
+- Add `refresh=1` to Surge / Clash providers: wait for a full valid remote catalog, validation, cache persistence and in-memory update before responding. Combine with `all=1`, `raw=1` or `http=1`. Fail closed with HTTP 503 instead of stale nodes, retaining the previous catalog and disk cache. Check raw permissions first and allow only one pending HTTP forced refresh.
+
 ## [0.8.0] - 2026-10-23
 
 ### Changed and upgrade notes
@@ -182,6 +192,7 @@ First Rust release.
 - DNS and TCP racing: a shared transport context, coalesced signed DNS queries, concurrent A/AAAA lookups and staggered connection attempts.
 - Dial time budgets, sampled performance tracing and connection reuse tuning.
 
+[0.9.0]: https://github.com/we11adam/oixc-proxy/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/we11adam/oixc-proxy/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/we11adam/oixc-proxy/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/we11adam/oixc-proxy/compare/v0.6.0...v0.6.1
