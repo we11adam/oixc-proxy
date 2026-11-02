@@ -243,6 +243,32 @@ proxies:
     }
 
     #[test]
+    fn cache_without_migration_fields_loads_as_identity_v2() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = CatalogCache::beside_config(&directory.path().join("test.conf"), "token-a");
+        let managed = ManagedConfig::parse(YAML.as_bytes()).unwrap();
+        cache.store(&managed).unwrap();
+        let mut envelope: serde_yaml::Value =
+            serde_yaml::from_slice(&fs::read(&cache.path).unwrap()).unwrap();
+        let obfs = envelope["managed"]["proxies"][0]["obfs-opts"]
+            .as_mapping_mut()
+            .unwrap();
+        obfs.remove(serde_yaml::Value::String("identity-version".into()));
+        obfs.remove(serde_yaml::Value::String("legacy-fallback".into()));
+        write_private_atomic(
+            &cache.path,
+            serde_yaml::to_string(&envelope).unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(cache.load().unwrap(), managed);
+        assert!(
+            CatalogCache::beside_config(&directory.path().join("test.conf"), "other-token")
+                .load()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn metadata_is_account_scoped_and_legacy_or_invalid_metadata_is_omitted() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("oixc-proxy.conf");

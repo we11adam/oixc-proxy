@@ -78,11 +78,15 @@ obfs-opts:
   path: string
   alpn: snell-ech/1
   ech-config: standard-base64
-  identity-version: 2
-  legacy-fallback: false
+  identity-version: 2 # Optional; omission defaults to Identity v2.
+  legacy-fallback: false # Optional; omission defaults to false.
   skip-cert-verify: false
   preconnect: integer
 ```
+
+Newer subscriptions omit the retired identity migration fields above. Omission
+does not enable a legacy authentication path: connections always use Identity
+v2, and explicit incompatible versions or legacy fallback remain rejected.
 
 Only proxy names containing `fusion`, using case-insensitive matching, belong
 to the premium/love catalog. Filtering is fail-closed: zero matches is an

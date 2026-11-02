@@ -143,7 +143,9 @@ pub struct ObfsOptions {
     pub alpn: String,
     #[serde(rename = "ech-config")]
     pub ech_config: String,
-    #[serde(rename = "identity-version")]
+    // New subscriptions omit this retired migration field. The wire protocol
+    // remains Identity v2; an explicitly incompatible value is still rejected.
+    #[serde(rename = "identity-version", default = "default_identity_version")]
     pub identity_version: u8,
     #[serde(rename = "legacy-fallback", default)]
     pub legacy_fallback: bool,
@@ -151,6 +153,10 @@ pub struct ObfsOptions {
     pub skip_cert_verify: bool,
     #[serde(default)]
     pub preconnect: u8,
+}
+
+fn default_identity_version() -> u8 {
+    2
 }
 
 /// The API document is parsed per node so that one node the client cannot
@@ -323,6 +329,41 @@ proxies:
       skip-cert-verify: false
       preconnect: 0
 "#;
+
+    #[test]
+    fn omitted_migration_fields_default_to_secure_identity_v2() {
+        let modern = YAML
+            .replace("      identity-version: 2\n", "")
+            .replace("      legacy-fallback: false\n", "");
+        let current = ManagedConfig::parse(modern.as_bytes()).unwrap();
+        assert_eq!(current, ManagedConfig::parse(YAML.as_bytes()).unwrap());
+        assert_eq!(current.proxies[0].obfs.identity_version, 2);
+        assert!(!current.proxies[0].obfs.legacy_fallback);
+        for (from, to) in [
+            ("      alpn: snell-ech/1", "      alpn: h2"),
+            ("      mode: ech-tls", "      mode: tls"),
+            (
+                "      skip-cert-verify: false",
+                "      skip-cert-verify: true",
+            ),
+            ("    identity: true", "    identity: false"),
+            ("    version: 4", "    version: 6"),
+        ] {
+            assert!(ManagedConfig::parse(modern.replace(from, to).as_bytes()).is_err());
+        }
+        for explicit in ["0", "1", "3", "null", "\"2\""] {
+            let invalid = modern.replace(
+                "      preconnect: 0",
+                &format!("      preconnect: 0\n      identity-version: {explicit}"),
+            );
+            assert!(ManagedConfig::parse(invalid.as_bytes()).is_err());
+        }
+        let legacy = modern.replace(
+            "      preconnect: 0",
+            "      preconnect: 0\n      legacy-fallback: true",
+        );
+        assert!(ManagedConfig::parse(legacy.as_bytes()).is_err());
+    }
 
     #[test]
     fn custom_filters_combine_groups_and_preview_empty_results() {
