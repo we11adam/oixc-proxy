@@ -6,7 +6,7 @@
 
 本仓库是 Go 版 `oixc` 的 Rust 重写。二进制名称、命令、配置、HTTP 端点、Surge provider 格式、SOCKS5 路由凭据、控制面认证以及 Snell/ECH 线路行为均有意保持兼容。
 
-开发版新增 AnyTLS（TCP / UoT v2 UDP）及 CDN 双层 TLS：外层 TLS → WebSocket → 内层 TLS → AnyTLS。复用现有 HTTP/SOCKS5 网关、私有 DNS、出口选择和流量统计；节点结构、证书要求、会话复用及验证边界见 [AnyTLS 说明](docs/anytls.md)。`raw=1` 按节点实际协议混合导出 Snell 与 AnyTLS；CDN 扩展格式见 [Spike 字段约定](docs/anytls-raw-provider-contract.md)。
+自 0.10.0 起支持 AnyTLS（TCP / UoT v2 UDP）及 CDN 双层 TLS：外层 TLS → WebSocket → 内层 TLS → AnyTLS。复用现有 HTTP/SOCKS5 网关、私有 DNS、出口选择和流量统计；节点结构、证书要求、会话复用及验证边界见 [AnyTLS 说明](docs/anytls.md)。`raw=1` 按节点实际协议混合导出 Snell 与 AnyTLS；CDN 扩展格式见 [Spike 字段约定](docs/anytls-raw-provider-contract.md)。
 
 ## 安装发布版
 
@@ -22,7 +22,7 @@ sh install.sh
 安装脚本会检测主机目标平台，用 Release 中的 `SHA256SUMS` 验证压缩包，检查二进制版本，并以原子方式安装到 `/usr/local/bin/oixc-proxy`。可通过以下命令安装指定版本或安装到用户可写目录：
 
 ```sh
-sh install.sh --version v0.9.0
+sh install.sh --version v0.10.0
 sh install.sh --install-dir "$HOME/.local/bin"
 ```
 
@@ -39,7 +39,7 @@ Windows 从 v0.7.0 起提供 [`install.ps1`](install.ps1) 和 x64 发布包，�
 ```text
 使用 $oixc-proxy-deploy 将最新 Release 安装到本机，并验证版本和健康状态。
 
-使用 $oixc-proxy-deploy 将 v0.9.0 更新到 root@router.lan，保留现有配置和服务方式，
+使用 $oixc-proxy-deploy 将 v0.10.0 更新到 root@router.lan，保留现有配置和服务方式，
 并验证新 PID、监听端口、/healthz 与 provider 端点；失败时回滚。
 
 使用 $oixc-proxy-deploy 发布 Cargo.toml 中的当前版本，

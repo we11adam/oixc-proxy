@@ -13,7 +13,7 @@ binary name, commands, configuration, HTTP endpoints, Surge provider format,
 SOCKS5 routing credentials, control-plane authentication and Snell/ECH wire
 behavior are intentionally compatible.
 
-The development version adds AnyTLS TCP / UoT v2 UDP and the CDN carrier:
+Version 0.10.0 adds AnyTLS TCP / UoT v2 UDP and the CDN carrier:
 outer TLS → WebSocket → inner TLS → AnyTLS. It uses the existing HTTP/SOCKS5
 gateway, private DNS, egress selection and payload accounting. See the
 [AnyTLS notes](docs/anytls.md) for node fields, certificate requirements,
@@ -42,7 +42,7 @@ release `SHA256SUMS`, checks the binary version and atomically installs
 with:
 
 ```sh
-sh install.sh --version v0.9.0
+sh install.sh --version v0.10.0
 sh install.sh --install-dir "$HOME/.local/bin"
 ```
 
@@ -68,7 +68,7 @@ Example prompts:
 Use $oixc-proxy-deploy to install the latest Release locally, then verify the
 version and health status.
 
-Use $oixc-proxy-deploy to update root@router.lan to v0.9.0. Preserve its
+Use $oixc-proxy-deploy to update root@router.lan to v0.10.0. Preserve its
 existing config and service mechanism; verify the new PID, listeners, /healthz,
 and provider endpoint, and roll back on failure.
 
