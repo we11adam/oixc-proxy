@@ -6,6 +6,8 @@
 
 本仓库是 Go 版 `oixc` 的 Rust 重写。二进制名称、命令、配置、HTTP 端点、Surge provider 格式、SOCKS5 路由凭据、控制面认证以及 Snell/ECH 线路行为均有意保持兼容。
 
+开发版新增 AnyTLS（TCP / UoT v2 UDP）及 CDN 双层 TLS：外层 TLS → WebSocket → 内层 TLS → AnyTLS。复用现有 HTTP/SOCKS5 网关、私有 DNS、出口选择和流量统计；节点结构、证书要求、会话复用及验证边界见 [AnyTLS 说明](docs/anytls.md)。`raw=1` 按节点实际协议混合导出 Snell 与 AnyTLS；CDN 扩展格式见 [Spike 字段约定](docs/anytls-raw-provider-contract.md)。
+
 ## 安装发布版
 
 GitHub Releases 提供 x86-64 和 aarch64 的原生 macOS 二进制、静态 musl Linux 二进制，以及 Windows x64 的 `.exe` 压缩包。macOS/Linux 使用已登录的 GitHub CLI 下载并检查安装脚本，然后运行：
@@ -83,7 +85,7 @@ target/release/oixc-proxy serve
 | --- | --- | --- |
 | 混合代理 | `127.0.0.1:6172` | 在同一端口提供 HTTP 和 SOCKS5；通过 provider 凭据路由到指定命名节点 |
 | 节点列表 | `http://127.0.0.1:6173/surge-proxies.conf` | 默认 SOCKS5；`?all=1` 发布全部节点，`?http=1` 声明为 HTTP |
-| 原始 Snell 列表 | `http://127.0.0.1:6173/surge-proxies.conf?raw=1` | 含敏感节点参数的 ECH-TLS 列表，默认仅允许回环对端；可叠加 `all=1`，忽略 `http` / `socks` |
+| 原始节点列表 | `http://127.0.0.1:6173/surge-proxies.conf?raw=1` | 含敏感节点参数的 Snell / AnyTLS 列表，默认仅允许回环对端；可叠加 `all=1`，忽略 `http` / `socks` |
 | Clash | `http://127.0.0.1:6173/clash-proxies.yaml` | 默认 SOCKS5；`?all=1` 发布全部节点，`?http=1` 声明为 HTTP |
 | 健康检查 | `http://127.0.0.1:6173/healthz` | HTTP 服务存活探针，不代表上游可达 |
 | 诊断状态 | `http://127.0.0.1:6173/status` | 目录刷新、缓存年龄、物理出口、证书库及 ECH 建连统计 |
@@ -113,15 +115,23 @@ http://127.0.0.1:6173/clash-proxies.yaml?all=1&refresh=1
 
 远程请求、校验或缓存写入失败时，本次请求 **fail-closed，返回 HTTP 503，不返回旧节点**；此前的内存目录和磁盘缓存保留，普通请求仍可使用。并发刷新繁忙、队列不可用或等待超过 180 秒也返回 503，响应均不缓存。每次只接受一个 HTTP 强制刷新，请勿让所有客户端频繁轮询此参数；`raw=1` 的访问限制仍先于刷新执行。raw 地址解析失败后的最后成功地址/域名回退不受此参数影响。
 
-### 导出原始 Snell ECH-TLS 节点
+### 节点字段兼容
 
-**`raw=1` 会返回真实节点地址、PSK 和 ECH 配置，相当于导出上游访问凭据。** 默认只接受 TCP 对端为回环地址的请求，其他对端返回 HTTP 403；不信任 `Forwarded` / `X-Forwarded-For`。不要通过反向代理将本地 raw 端点转发给不受信任的客户端。确需远程读取时，显式设置 `allow-remote-raw-provider=true`，并自行限制防火墙/可信访问范围；该 HTTP 接口没有额外认证或加密。成功和拒绝响应均带 `Cache-Control: no-store`。
+节点订阅及缓存中的未知字段会被忽略，不会仅因新增字段跳过节点；这适用于文档、节点、`obfs-opts` 和缓存封装，不放宽本地配置或管理命令的拼写检查。已知连接参数仍严格校验，缺少必填参数、不支持的协议版本、错误 ALPN、旧身份或关闭证书验证仍会被拒绝。
+
+可选 `oixcloud` 元数据中的 `traffic-rate`（非负有限数字，可为小数）和 `warp`（布尔值）会保存在账户绑定缓存中；缺失时不猜测默认值，未知扩展字段不参与连接。元数据变化不重建连接池，也不改写 provider 名称或 Snell 参数、不启动 WARP、不改变本地真实字节流量统计。
+
+### 导出原始 Snell / AnyTLS 节点
+
+**`raw=1` 会返回真实节点地址、PSK / password、ECH 配置或 CDN path，相当于导出上游访问凭据。** 默认只接受 TCP 对端为回环地址的请求，其他对端返回 HTTP 403；不信任 `Forwarded` / `X-Forwarded-For`。不要通过反向代理将本地 raw 端点转发给不受信任的客户端。确需远程读取时，显式设置 `allow-remote-raw-provider=true`，并自行限制防火墙/可信访问范围；该 HTTP 接口没有额外认证或加密。成功和拒绝响应均带 `Cache-Control: no-store`。
 
 ```sh
 curl --noproxy '*' 'http://127.0.0.1:6173/surge-proxies.conf?raw=1&all=1'
 ```
 
-不带 `all=1` 时沿用当前节点筛选；`http` 和 `socks` 在 raw 模式下均被忽略，Clash 路由不支持 raw。每行直接声明 Snell v4、ECH-TLS、SNI（为空时使用原始节点主机名）、标准 Base64 ECH 配置、复用和 UDP 能力；仅在启用时附加 TFO / 跳过证书验证标志，不输出 path、preconnect 或 identity 字段。策略名沿用普通 provider 的清洗及重名后缀；不支持的协议/身份版本及无法安全表示的参数会跳过，`/status` 的 `raw_skipped_nodes.filtered` / `.all` 提供计数。
+不带 `all=1` 时沿用当前节点筛选；`http` 和 `socks` 在 raw 模式下均被忽略，Clash 路由不支持 raw。按源节点实际协议输出，不转换协议：Snell 行保持原有 v4 / ECH-TLS 参数；AnyTLS 行输出 password、sni、reuse=true 和 UDP 能力，CDN 节点追加 `obfs=wss-tls`、`obfs-host`、`obfs-uri`。AnyTLS 的 sni 和 CDN 外层域名均保留原始名称，不随解析后的拨号 IP 改写。完整语义及示例见 [Spike 扩展约定](docs/anytls-raw-provider-contract.md)；接收端需要实现该扩展，不能认为任意 Surge 格式客户端均已支持。
+
+策略名沿用普通 provider 的清洗及重名后缀；不支持的协议/身份版本、残缺 CDN 参数及无法安全表示的参数会跳过，`/status` 的 `raw_skipped_nodes.filtered` / `.all` 提供计数。当前不对含逗号、空白、引号、反斜线或注释符号的敏感参数尝试转义；跳过整行，避免注入。
 
 节点地址复用现有解析路径：托管域名使用签名私有 DNS，其他域名使用系统解析；优先 IPv4，其次 IPv6（不加方括号）。跨请求最多并发 8 个解析，单次最多 2 秒；失败或超时依次回退到该主机最后一次成功地址、原始主机名，不使整份订阅失败或丢弃节点。成功地址缓存在进程内，跨请求及目录刷新保留、重启清空，不写入磁盘；解析器原有短 TTL 缓存不变。
 
@@ -393,7 +403,7 @@ journalctl --user -u oixc-proxy.service
 2. 发送 bearer token、Unix 时间戳、age recipient 和请求 HMAC。
 3. 对准确的加密响应字符串验证 HMAC。
 4. 严格解码 Base64、ASCII armor 和 age，并实施 8 MiB 限制。
-5. 严格解析单个 YAML 文档并验证 Snell ECH profile。
+5. 严格解析单个 YAML 文档并验证 Snell ECH 或 AnyTLS profile。
 6. 对 Fusion/CIA 名称 allowlist 采取 fail-closed 策略。
 
 数据面流程：

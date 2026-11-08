@@ -4,6 +4,19 @@
 
 本文件记录 `oixc-proxy` 各版本中值得注意的变更。版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 新功能
+
+- `raw=1` 按源协议混合导出 Snell 与 AnyTLS；CDN AnyTLS 使用 Spike 扩展 `obfs=wss-tls`、`obfs-host` 和 `obfs-uri`，分别保留拨号 IP、外层域名、内层 SNI 和 path。沿用筛选、原顺序、名称去重、访问控制及 DNS 最后成功缓存，跳过残缺或不安全参数；Snell 行保持原格式。
+- 增加 AnyTLS TCP / UoT v2 UDP、鉴权、Settings / SYN-ACK、padding 更新、空闲心跳及带网络代次隔离的会话复用，接入现有 HTTP/SOCKS5 网关与业务字节统计。
+- 增加 CDN 双层 TLS carrier（TLS → WebSocket → TLS → AnyTLS），使用现有私有 DNS、物理出口和证书库恢复；WebSocket 校验 HTTP 握手，限制缓冲，提供有序 flush 及取消清理。两层均要求证书验证。真实官方节点互通尚未验证。
+
+### 修复
+
+- 兼容节点订阅中的 `oixcloud`，保存可选 `traffic-rate`（支持非负小数）和 `warp` 元数据到缓存，修复新增字段导致整份节点目录不可用的问题。元数据不改变连接协议、provider 或真实字节统计，单独变化不重建连接池。
+- 订阅文档、节点、ECH 选项和缓存封装统一忽略未知扩展字段；已知字段类型、协议/身份/证书校验、缓存账户绑定及格式版本仍严格检查，本地配置和管理命令保持严格解析。
+
 ## [0.9.0] - 2026-11-02
 
 ### 修复

@@ -1,5 +1,11 @@
 # Protocol and reverse-engineering findings
 
+AnyTLS TCP / UoT v2 and the double-TLS WebSocket CDN carrier are described in
+[AnyTLS implementation notes](anytls.md), with configuration, lifecycle and
+offline validation limits. The Snell-specific sections below retain their
+existing wire semantics. Raw providers can mix Snell ECH-TLS and AnyTLS;
+the CDN fields follow the [Spike extension contract](anytls-raw-provider-contract.md).
+
 This document is the compatibility reference for `oixc-proxy`. It preserves
 the technical findings previously used by removed `dump-*`, `probe-*`,
 `inspect-binary`, bundle and legacy service commands. The primary reference
@@ -56,10 +62,17 @@ token, encrypted payload or decrypted secrets.
 
 ## Managed YAML and catalog selection
 
-The decrypted document contains one `proxies` sequence. Unknown YAML fields,
-multiple documents, duplicate names and documents above 8 MiB are rejected.
+The decrypted document contains one `proxies` sequence. Unknown fields at the
+document, node and `obfs-opts` levels are ignored for forward compatibility;
+known field types and connection profiles remain validated. Multiple YAML
+documents and documents above 8 MiB are rejected. Invalid nodes and duplicate
+names are skipped individually; a catalog with no usable nodes is rejected.
+Cache envelopes also ignore extensions while retaining account binding,
+format-version, private-file and profile validation. Local configuration and
+control command schemas remain strict.
 
-Each supported proxy has:
+Each supported Snell proxy has the following fields. AnyTLS uses its separate
+[node schema](anytls.md#订阅节点); it does not inherit Snell authentication fields.
 
 ```yaml
 name: string
@@ -82,11 +95,19 @@ obfs-opts:
   legacy-fallback: false # Optional; omission defaults to false.
   skip-cert-verify: false
   preconnect: integer
+oixcloud: # Optional advisory metadata, not connection parameters.
+  traffic-rate: 1 # Optional finite nonnegative number; decimals supported.
+  warp: false # Optional boolean.
 ```
 
 Newer subscriptions omit the retired identity migration fields above. Omission
 does not enable a legacy authentication path: connections always use Identity
 v2, and explicit incompatible versions or legacy fallback remain rejected.
+
+Known `oixcloud` values are retained in the account-bound cache; missing values
+remain unknown and extra metadata keys are ignored. Metadata does not affect
+Snell authentication, provider parameters, local byte accounting or connection
+pool identity. Known malformed values are rejected without echoing them.
 
 Only proxy names containing `fusion`, using case-insensitive matching, belong
 to the premium/love catalog. Filtering is fail-closed: zero matches is an

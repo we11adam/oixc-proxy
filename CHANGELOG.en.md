@@ -4,6 +4,19 @@
 
 Notable changes to `oixc-proxy` are recorded in this file. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `raw=1` exports mixed Snell and AnyTLS nodes using their upstream protocols. CDN AnyTLS uses Spike's obfs=wss-tls, obfs-host and obfs-uri extension, preserving the dial IP, outer hostname, inner SNI and path independently. Existing ordering, filters, naming, access checks and DNS last-known-good behavior remain; incomplete or unsafe profiles are skipped and Snell lines retain their format.
+- AnyTLS TCP / UoT v2 UDP, authentication, Settings / SYN-ACK, padding updates, idle heartbeats and network-scoped session reuse through the existing HTTP/SOCKS5 gateway and payload traffic accounting.
+- CDN carrier using TLS → WebSocket → TLS → AnyTLS, sharing private DNS, physical egress and trust-store recovery. WebSocket includes upgrade validation, bounded buffers, ordered flush and cancellation cleanup; both TLS layers verify certificates. Real official-node interoperability remains unverified.
+
+### Fixed
+
+- Accept subscription `oixcloud` metadata and cache optional `traffic-rate` (including nonnegative decimals) and `warp`, avoiding complete catalog rejection when metadata is added. Metadata does not change connection protocols, providers or actual-byte counters, and metadata-only updates retain connection pools.
+- Ignore unknown extensions in subscription documents, nodes, ECH options and cache envelopes. Continue validating known field types, protocol/identity/certificate settings, cache account binding and format versions; keep local configuration and control commands strict.
+
 ## [0.9.0] - 2026-11-02
 
 ### Fixed

@@ -13,6 +13,13 @@ binary name, commands, configuration, HTTP endpoints, Surge provider format,
 SOCKS5 routing credentials, control-plane authentication and Snell/ECH wire
 behavior are intentionally compatible.
 
+The development version adds AnyTLS TCP / UoT v2 UDP and the CDN carrier:
+outer TLS → WebSocket → inner TLS → AnyTLS. It uses the existing HTTP/SOCKS5
+gateway, private DNS, egress selection and payload accounting. See the
+[AnyTLS notes](docs/anytls.md) for node fields, certificate requirements,
+session reuse and validation limits. `raw=1` exports each node's actual Snell or
+AnyTLS protocol; CDN parameters use the [Spike extension contract](docs/anytls-raw-provider-contract.md).
+
 ## Install a release
 
 GitHub Releases provide native macOS binaries and static musl Linux binaries
@@ -121,7 +128,7 @@ The default endpoints are:
 | --- | --- | --- |
 | Mixed proxy | `127.0.0.1:6172` | HTTP and SOCKS5 on one port; routes provider credentials to one named node |
 | Nodelist | `http://127.0.0.1:6173/surge-proxies.conf` | SOCKS5 by default; `?all=1` every node, `?http=1` advertise HTTP |
-| Raw Snell list | `http://127.0.0.1:6173/surge-proxies.conf?raw=1` | Sensitive ECH-TLS node parameters; loopback peers only by default, combines with `all=1`, ignores `http` / `socks` |
+| Raw node list | `http://127.0.0.1:6173/surge-proxies.conf?raw=1` | Sensitive Snell / AnyTLS node parameters; loopback peers only by default, combines with `all=1`, ignores `http` / `socks` |
 | Clash | `http://127.0.0.1:6173/clash-proxies.yaml` | SOCKS5 by default; `?all=1` every node, `?http=1` advertise HTTP |
 | Health | `http://127.0.0.1:6173/healthz` | Readiness probe |
 
@@ -170,9 +177,15 @@ http://127.0.0.1:6173/clash-proxies.yaml?all=1&refresh=1
 
 Remote fetch, validation or cache-write failures **fail closed with HTTP 503, never stale nodes**. Preserve the previous in-memory catalog and disk cache for ordinary requests. Busy refreshes, unavailable queues and waits exceeding 180 seconds also return a non-cacheable 503. Only one HTTP forced refresh is accepted at a time; avoid frequent polling across clients. Raw access checks run before refreshing, and raw DNS last-known-good/hostname fallback remains unchanged.
 
-### Export raw Snell ECH-TLS nodes
+### Node field compatibility
 
-**`raw=1` exposes real node addresses, PSKs and ECH configurations: treat it as
+Unknown subscription/cache fields are ignored rather than causing nodes to be skipped. This applies to document, node, `obfs-opts` and cache-envelope extensions; local configuration and control commands retain strict spelling checks. Known connection settings remain validated: missing required parameters, unsupported protocol versions, incorrect ALPN, legacy identity and disabled certificate verification are still rejected.
+
+Optional `oixcloud` metadata preserves `traffic-rate` (a finite nonnegative number, including decimals) and `warp` (a boolean) in the account-bound cache. Missing values remain unknown. Metadata changes do not rebuild connection pools, rename providers, alter Snell parameters, start WARP or scale local actual-byte traffic counters.
+
+### Export raw Snell / AnyTLS nodes
+
+**`raw=1` exposes real node addresses, PSKs/passwords, ECH configurations and CDN paths: treat it as
 an export of upstream credentials.** By default only loopback TCP peers are
 allowed; other peers receive HTTP 403. `Forwarded` / `X-Forwarded-For` are not
 trusted. Do not forward this local endpoint to untrusted clients through a
@@ -186,13 +199,18 @@ curl --noproxy '*' 'http://127.0.0.1:6173/surge-proxies.conf?raw=1&all=1'
 ```
 
 Without `all=1`, the current node filter still applies. Raw mode ignores both `http` and `socks`;
-the Clash route does not support raw exports. Lines include Snell v4, ECH-TLS,
-SNI (falling back to the original node host), standard Base64 ECH configuration,
-reuse and UDP flags. TFO / skip-certificate-verification flags appear only when
-enabled; path, preconnect and identity fields are omitted. Policy sanitizing and
-duplicate suffixes match the ordinary provider. Unsupported profiles and unsafe
+the Clash route does not support raw exports. Each line preserves its upstream
+protocol. Existing Snell v4 ECH-TLS lines remain unchanged. AnyTLS lines include
+password, sni, reuse=true and UDP capability; CDN nodes add obfs=wss-tls,
+obfs-host and obfs-uri. Inner sni and the original CDN hostname are preserved
+independently of the resolved dial IP. See the [Spike extension contract](docs/anytls-raw-provider-contract.md);
+receivers must implement this extension explicitly.
+
+Policy sanitizing and duplicate suffixes match the ordinary provider. Unsupported profiles, incomplete CDN settings and unsafe
 parameter values are skipped; `/status` reports counts in
-`raw_skipped_nodes.filtered` / `.all`.
+`raw_skipped_nodes.filtered` / `.all`. Parameters containing commas, whitespace,
+quotes, backslashes or comment characters are not escaped: the entire line is
+skipped to prevent configuration injection.
 
 Addresses use the existing resolver: signed private DNS for managed names,
 system DNS otherwise, preferring IPv4 and then bracket-free IPv6. At most eight
@@ -635,7 +653,7 @@ The control plane:
 2. Sends the bearer token, Unix timestamp, age recipient and request HMAC.
 3. Verifies the HMAC over the exact encrypted response string.
 4. Strictly decodes Base64, ASCII armor and age, with 8 MiB limits.
-5. Strictly parses one YAML document and validates the Snell ECH profile.
+5. Strictly parses one YAML document and validates the Snell ECH or AnyTLS profile.
 6. Fails closed to the Fusion/CIA name allowlist.
 
 The data plane:
