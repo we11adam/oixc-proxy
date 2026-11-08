@@ -418,10 +418,15 @@ async fn bad_inner_certificate_and_synack_timeout_do_not_create_idle_sessions() 
         });
         assert!(client.dial_tcp("example.org", 443).await.is_err());
         assert!(client.inner.idle.lock().await.is_empty());
-        peer.await.unwrap();
+        timeout(Duration::from_secs(10), peer)
+            .await
+            .expect("certificate-rejection peer must observe connection closure")
+            .unwrap();
     }
     let (mut client, listener, inner, outer) = fixture(false).await;
-    Arc::get_mut(&mut client.inner).unwrap().timeout = Duration::from_millis(100);
+    // The deadline includes DNS, socket setup and TLS as well as SYN-ACK.
+    // Leave enough time for those stages on Windows CI before withholding ACK.
+    Arc::get_mut(&mut client.inner).unwrap().timeout = Duration::from_secs(2);
     let peer = tokio::spawn(async move {
         let (mut r, mut w) = authenticate(carrier(&listener, inner, outer, false).await).await;
         non_padding(&mut r).await;
@@ -438,5 +443,8 @@ async fn bad_inner_certificate_and_synack_timeout_do_not_create_idle_sessions() 
     });
     assert!(client.dial_tcp("example.org", 443).await.is_err());
     assert!(client.inner.idle.lock().await.is_empty());
-    peer.await.unwrap();
+    timeout(Duration::from_secs(10), peer)
+        .await
+        .expect("SYN-ACK timeout peer must observe connection closure")
+        .unwrap();
 }

@@ -1,0 +1,2 @@
+# Wire-contract fixtures must retain identical bytes on every platform.
+testdata/*.conf text eol=lf
