@@ -107,20 +107,20 @@ impl NodeFilter {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct ManagedConfig {
     pub proxies: Vec<Proxy>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct Proxy {
     pub name: String,
     #[serde(rename = "type")]
     pub proxy_type: String,
     pub server: String,
     pub port: u16,
+    #[serde(default, alias = "password")]
     pub psk: String,
+    #[serde(default)]
     pub version: u8,
     #[serde(default)]
     pub udp: bool,
@@ -130,18 +130,29 @@ pub struct Proxy {
     pub reuse: bool,
     #[serde(default)]
     pub identity: bool,
-    #[serde(rename = "obfs-opts")]
+    #[serde(rename = "obfs-opts", default)]
     pub obfs: ObfsOptions,
+    #[serde(
+        default,
+        alias = "anytls-opts",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub anytls: Option<AnyTlsOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oixcloud: Option<OixcloudMetadata>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 pub struct ObfsOptions {
+    #[serde(default)]
     pub mode: String,
+    #[serde(default)]
     pub sni: String,
+    #[serde(default)]
     pub path: String,
+    #[serde(default)]
     pub alpn: String,
-    #[serde(rename = "ech-config")]
+    #[serde(rename = "ech-config", default)]
     pub ech_config: String,
     // New subscriptions omit this retired migration field. The wire protocol
     // remains Identity v2; an explicitly incompatible value is still rejected.
@@ -155,13 +166,34 @@ pub struct ObfsOptions {
     pub preconnect: u8,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+pub struct AnyTlsOptions {
+    #[serde(default, rename = "webSocketPath", alias = "websocket-path")]
+    pub websocket_path: Option<String>,
+    #[serde(default, rename = "usesCDN", alias = "uses-cdn")]
+    pub uses_cdn: bool,
+    #[serde(default)]
+    pub udp: bool,
+}
+
+/// Advisory subscription metadata, never used for authentication or billing.
+/// Unknown fields are intentionally ignored, as with the rest of the catalog.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct OixcloudMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_rate: Option<serde_json::Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warp: Option<bool>,
+}
+
 fn default_identity_version() -> u8 {
     2
 }
 
 /// The API document is parsed per node so that one node the client cannot
-/// use, for example after the server adds a field, does not take every other
-/// node offline. Each node is still validated strictly.
+/// use does not take every other node offline. Unknown extension fields are
+/// ignored; known connection settings are still validated strictly.
 #[derive(Deserialize)]
 struct RemoteManagedConfig {
     proxies: Vec<serde_yaml::Value>,
@@ -260,10 +292,90 @@ fn proxy_label(index: usize, value: &serde_yaml::Value) -> String {
 }
 
 impl Proxy {
-    fn from_value(value: serde_yaml::Value) -> Result<Self> {
+    /// Metadata-only updates must not discard live clients or idle connections.
+    pub(crate) fn same_connection_settings(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.proxy_type == other.proxy_type
+            && self.server == other.server
+            && self.port == other.port
+            && self.psk == other.psk
+            && self.version == other.version
+            && self.udp == other.udp
+            && self.tfo == other.tfo
+            && self.reuse == other.reuse
+            && self.identity == other.identity
+            && self.obfs == other.obfs
+            && self.anytls == other.anytls
+    }
+
+    fn from_value(mut value: serde_yaml::Value) -> Result<Self> {
+        // Normalize the standard AnyTLS subscription fields into our cache model.
+        if value.get("type").and_then(serde_yaml::Value::as_str) == Some("anytls") {
+            if let Some(transport) = value.get("transport")
+                && !matches!(transport.as_str(), Some("tcp" | "auto"))
+            {
+                bail!("unsupported AnyTLS transport");
+            }
+            if value.get("tls").is_some_and(|v| v.as_bool() != Some(true)) {
+                bail!("AnyTLS requires TLS");
+            }
+            if let Some(network) = value.get("network") {
+                match network.as_str() {
+                    Some("tcp") => {}
+                    Some("ws") => {
+                        let path = value
+                            .get("ws-opts")
+                            .and_then(|v| v.get("path"))
+                            .and_then(serde_yaml::Value::as_str)
+                            .ok_or_else(|| anyhow::anyhow!("AnyTLS WebSocket path is required"))?
+                            .to_owned();
+                        if let Some(headers) = value.get("ws-opts").and_then(|v| v.get("headers"))
+                            && !headers.as_mapping().is_some_and(|map| {
+                                map.iter().all(|(k, v)| {
+                                    k.as_str().is_some_and(|k| k.eq_ignore_ascii_case("host"))
+                                        && v == value
+                                            .get("server")
+                                            .unwrap_or(&serde_yaml::Value::Null)
+                                })
+                            })
+                        {
+                            bail!("unsupported AnyTLS WebSocket headers");
+                        }
+                        let options = AnyTlsOptions {
+                            websocket_path: Some(path),
+                            uses_cdn: true,
+                            udp: false,
+                        };
+                        value
+                            .as_mapping_mut()
+                            .unwrap()
+                            .insert("anytls".into(), serde_yaml::to_value(options)?);
+                    }
+                    _ => bail!("unsupported AnyTLS transport"),
+                }
+            }
+            let sni = value.get("sni").cloned();
+            let skip = value.get("skip-cert-verify").cloned();
+            if let Some(map) = value.as_mapping_mut() {
+                let obfs = map
+                    .entry(serde_yaml::Value::from("obfs-opts"))
+                    .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
+                if let Some(obfs) = obfs.as_mapping_mut() {
+                    if let Some(v) = sni {
+                        obfs.insert("sni".into(), v);
+                    }
+                    if let Some(v) = skip {
+                        obfs.insert("skip-cert-verify".into(), v);
+                    }
+                }
+            }
+        }
         // serde errors can quote field values such as the PSK.
-        let proxy: Self = serde_yaml::from_value(value)
+        let mut proxy: Self = serde_yaml::from_value(value)
             .map_err(|_| anyhow::anyhow!("does not match the expected schema"))?;
+        if proxy.proxy_type == "anytls" {
+            proxy.udp |= proxy.anytls.as_ref().is_some_and(|o| o.udp);
+        }
         proxy.validate()?;
         Ok(proxy)
     }
@@ -272,7 +384,43 @@ impl Proxy {
         if self.name.trim().is_empty() {
             bail!("name is required");
         }
-        if self.proxy_type != "snell" || self.version != 4 {
+        if let Some(rate) = self
+            .oixcloud
+            .as_ref()
+            .and_then(|meta| meta.traffic_rate.as_ref())
+            && !rate
+                .as_f64()
+                .is_some_and(|value| value.is_finite() && value >= 0.0)
+        {
+            bail!("invalid oixcloud traffic rate");
+        }
+        if self.proxy_type == "anytls" {
+            if self.server.trim().is_empty() || self.port == 0 || self.psk.is_empty() {
+                bail!("AnyTLS server, port and password are required");
+            }
+            if self.obfs.skip_cert_verify {
+                bail!("AnyTLS requires certificate verification");
+            }
+            if !matches!(self.version, 0 | 2)
+                || !matches!(self.obfs.mode.as_str(), "" | "tls")
+                || !self.obfs.ech_config.is_empty()
+                || !self.obfs.alpn.is_empty()
+                || self.obfs.legacy_fallback
+            {
+                bail!("unsupported AnyTLS TLS settings");
+            }
+            if let Some(options) = &self.anytls {
+                if let Some(path) = &options.websocket_path {
+                    crate::transport::websocket::validate_path(path)?;
+                }
+                if options.uses_cdn && options.websocket_path.is_none() {
+                    bail!("AnyTLS CDN requires a WebSocket path");
+                }
+            }
+            crate::surge::node_selector(&self.name)?;
+            return Ok(());
+        }
+        if self.proxy_type != "snell" || self.version != 4 || self.anytls.is_some() {
             bail!("only Snell v4 nodes are supported");
         }
         if self.server.trim().is_empty() || self.port == 0 || self.psk.is_empty() {
@@ -295,6 +443,16 @@ impl Proxy {
         }
         crate::transport::parse_ech_config(&self.obfs.ech_config)?;
         crate::surge::node_selector(&self.name)?;
+        if let Some(rate) = self
+            .oixcloud
+            .as_ref()
+            .and_then(|meta| meta.traffic_rate.as_ref())
+            && !rate
+                .as_f64()
+                .is_some_and(|value| value.is_finite() && value >= 0.0)
+        {
+            bail!("invalid oixcloud traffic rate");
+        }
         Ok(())
     }
 }
@@ -305,6 +463,54 @@ pub(crate) const TEST_ECH_CONFIG: &str = "AEX+DQBBBwAgACABAgMEBQYHCAkKCwwNDg8QER
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anytls_nodes_normalize_standard_fields_and_cache_without_losing_cdn_options() {
+        let direct=b"proxies:\n- name: AnyTLS Fusion\n  type: anytls\n  server: example.com\n  port: 443\n  password: test-password\n  sni: origin.example.com\n  anytls:\n    webSocketPath: /carrier\n    usesCDN: true\n    udp: true\n  future-extension: true\n";
+        let managed = ManagedConfig::parse(direct).unwrap();
+        let node = &managed.proxies[0];
+        assert_eq!(node.psk, "test-password");
+        assert_eq!(node.obfs.sni, "origin.example.com");
+        assert!(node.udp);
+        assert_eq!(
+            node.anytls.as_ref().unwrap().websocket_path.as_deref(),
+            Some("/carrier")
+        );
+        let cached: ManagedConfig =
+            serde_yaml::from_slice(&serde_yaml::to_string(&managed).unwrap().into_bytes()).unwrap();
+        cached.validate().unwrap();
+        assert_eq!(managed, cached);
+        let ws=b"proxies:\n- name: WS\n  type: anytls\n  server: example.com\n  port: 443\n  password: secret\n  tls: true\n  network: ws\n  ws-opts:\n    path: /carrier\n    headers:\n      Host: example.com\n";
+        assert_eq!(
+            ManagedConfig::parse(ws).unwrap().proxies[0]
+                .anytls
+                .as_ref()
+                .unwrap()
+                .websocket_path
+                .as_deref(),
+            Some("/carrier")
+        );
+        for (old, new) in [
+            ("tls: true", "tls: false"),
+            ("network: ws", "network: grpc"),
+            ("path: /carrier", "path: invalid"),
+            ("Host: example.com", "Host: other.example.com"),
+        ] {
+            assert!(
+                ManagedConfig::parse(
+                    String::from_utf8(ws.to_vec())
+                        .unwrap()
+                        .replace(old, new)
+                        .as_bytes()
+                )
+                .is_err()
+            );
+        }
+        let invalid = String::from_utf8(direct.to_vec())
+            .unwrap()
+            .replace("  sni:", "  skip-cert-verify: true\n  sni:");
+        assert!(ManagedConfig::parse(invalid.as_bytes()).is_err());
+    }
 
     const YAML: &str = r#"
 proxies:
@@ -470,7 +676,6 @@ proxies:
             .trim_start_matches("\nproxies:\n")
             .replace("Hong Kong Fusion 01", "Japan Fusion 02");
         for second in [
-            valid_second.replace("    udp: true", "    unexpected: true"),
             valid_second.replace("port: 443", "port: not-a-port"),
             valid_second.replace("mode: ech-tls", "mode: tls"),
             valid_second.replace("Japan Fusion 02", "Hong Kong Fusion 01"),
@@ -500,9 +705,107 @@ proxies:
 
     #[test]
     fn rejects_catalog_without_usable_proxies() {
-        let content = YAML.replace("    udp: true", "    unexpected: true");
+        let content = YAML.replace("port: 443", "port: 0");
         assert!(ManagedConfig::parse(content.as_bytes()).is_err());
         assert!(ManagedConfig::parse(b"proxies: []\n").is_err());
         assert!(ManagedConfig::parse(b"other: true\n").is_err());
+    }
+
+    #[test]
+    fn ignores_extensions_at_document_node_and_obfs_levels() {
+        let expected = ManagedConfig::parse(YAML.as_bytes()).unwrap();
+        let mut document: serde_yaml::Value = serde_yaml::from_str(YAML).unwrap();
+        document["future-document"] = serde_yaml::from_str("{nested: [true, 42]}").unwrap();
+        document["proxies"][0]["future-node"] = "future-private-value".into();
+        document["proxies"][0]["obfs-opts"]["future-obfs"] =
+            serde_yaml::from_str("[1, {new: true}]").unwrap();
+        let yaml = serde_yaml::to_string(&document).unwrap();
+        assert_eq!(ManagedConfig::parse(yaml.as_bytes()).unwrap(), expected);
+        assert_eq!(
+            serde_yaml::from_str::<ManagedConfig>(&yaml).unwrap(),
+            expected
+        );
+        // An unknown key is not an unusable node, even in a mixed catalog.
+        let second = YAML
+            .trim_start_matches("\nproxies:\n")
+            .replace("Hong Kong Fusion 01", "Japan Fusion 02")
+            .replace("    udp: true", "    udp: true\n    future-node: true");
+        assert_eq!(
+            ManagedConfig::parse(with_second_proxy(&second).as_bytes())
+                .unwrap()
+                .proxies
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn oixcloud_metadata_is_optional_extensible_and_round_trips_decimal_rates() {
+        let original = ManagedConfig::parse(YAML.as_bytes()).unwrap();
+        assert!(original.proxies[0].oixcloud.is_none());
+        for rate in ["0", "0.5", "1", "1.0", "2", "2.75"] {
+            let yaml = format!(
+                "{YAML}    oixcloud:\n      traffic-rate: {rate}\n      warp: true\n      future-metadata: {{nested: [true, 42]}}\n"
+            );
+            let parsed = ManagedConfig::parse(yaml.as_bytes()).unwrap();
+            let meta = parsed.proxies[0].oixcloud.as_ref().unwrap();
+            assert_eq!(
+                meta.traffic_rate.as_ref().unwrap().as_f64().unwrap(),
+                rate.parse::<f64>().unwrap()
+            );
+            assert_eq!(meta.warp, Some(true));
+            assert_eq!(
+                ManagedConfig::parse(serde_yaml::to_string(&parsed).unwrap().as_bytes()).unwrap(),
+                parsed
+            );
+            assert!(original.proxies[0].same_connection_settings(&parsed.proxies[0]));
+        }
+        let partial =
+            ManagedConfig::parse(format!("{YAML}    oixcloud:\n      warp: false\n").as_bytes())
+                .unwrap();
+        assert_eq!(
+            partial.proxies[0].oixcloud.as_ref().unwrap().warp,
+            Some(false)
+        );
+        assert!(
+            partial.proxies[0]
+                .oixcloud
+                .as_ref()
+                .unwrap()
+                .traffic_rate
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unknown_fields_do_not_bypass_validation_of_known_fields() {
+        let extensible = format!(
+            "{YAML}    future-node: true\n    oixcloud:\n      traffic-rate: 1\n      warp: false\n      future-metadata: true\n"
+        );
+        for (from, to) in [
+            ("port: 443", "port: 0"),
+            ("port: 443", "port: not-a-port"),
+            ("psk: secret", "psk: ''"),
+            ("sni: example.com", "sni: ''"),
+            ("version: 4", "version: 6"),
+            ("identity: true", "identity: false"),
+            ("identity-version: 2", "identity-version: 1"),
+            ("legacy-fallback: false", "legacy-fallback: true"),
+            ("skip-cert-verify: false", "skip-cert-verify: true"),
+            ("mode: ech-tls", "mode: tls"),
+            ("alpn: snell-ech/1", "alpn: h2"),
+            (TEST_ECH_CONFIG, "AAAA"),
+            ("traffic-rate: 1", "traffic-rate: -1"),
+            ("traffic-rate: 1", "traffic-rate: .nan"),
+            ("traffic-rate: 1", "traffic-rate: .inf"),
+            ("traffic-rate: 1", "traffic-rate: '2'"),
+            ("warp: false", "warp: 'false'"),
+        ] {
+            let error = ManagedConfig::parse(extensible.replace(from, to).as_bytes()).unwrap_err();
+            assert!(!format!("{error:#}").contains("psk: secret"));
+        }
+        assert!(
+            ManagedConfig::parse(extensible.replace("    psk: secret\n", "").as_bytes()).is_err()
+        );
     }
 }

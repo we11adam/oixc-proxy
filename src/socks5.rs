@@ -13,8 +13,10 @@ use tokio::time::timeout;
 
 use crate::config::UdpPortRange;
 use crate::gateway::{GatewayManager, Route};
-use crate::snell::{
-    DatagramError, SnellPacketSession, SnellSession, SnellSessionReader, SnellSessionWriter,
+use crate::snell::DatagramError;
+use crate::upstream::{
+    PacketSession as SnellPacketSession, Session as SnellSession,
+    SessionReader as SnellSessionReader, SessionWriter as SnellSessionWriter,
 };
 
 const VERSION: u8 = 5;

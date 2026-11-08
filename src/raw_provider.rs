@@ -231,6 +231,8 @@ pub(crate) fn test_proxy(name: &str) -> Proxy {
         tfo: false,
         reuse: true,
         identity: true,
+        oixcloud: None,
+        anytls: None,
         obfs: crate::nodes::ObfsOptions {
             mode: "ech-tls".into(),
             sni: "sni.example.test".into(),

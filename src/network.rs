@@ -94,6 +94,18 @@ pub(crate) struct AddressState {
 }
 
 impl NetworkMonitor {
+    #[cfg(test)]
+    pub(crate) fn test_unbound() -> Self {
+        Self {
+            pinned_ip: None,
+            state: Arc::new(Mutex::new(MonitorState {
+                selection: EgressSelection::empty(),
+                generation: 1,
+                checked_at: Instant::now() + Duration::from_secs(3600),
+                default_route: DefaultRouteCache::default(),
+            })),
+        }
+    }
     pub fn new(pinned_ip: Option<IpAddr>) -> Self {
         let mut default_route = DefaultRouteCache::default();
         let detected = detect_egress(pinned_ip, &mut default_route);

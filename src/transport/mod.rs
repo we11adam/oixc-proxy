@@ -1,6 +1,7 @@
 mod ech;
 mod private_dns;
 mod trust;
+pub mod websocket;
 
 pub(crate) use ech::parse_ech_config;
 pub use ech::{EchConnection, EchDialer, TransportContext};

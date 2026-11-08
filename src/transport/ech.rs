@@ -72,6 +72,110 @@ pub struct EchDialer {
 }
 
 impl TransportContext {
+    #[cfg(test)]
+    pub(crate) async fn test_roots(&self, roots: rustls::RootCertStore) {
+        self.roots.replace_for_test(roots).await;
+    }
+    pub(crate) async fn network_generation(&self) -> u64 {
+        self.network.snapshot().await.generation()
+    }
+
+    /// AnyTLS uses ordinary verified TLS, and a second TLS layer for CDN nodes.
+    /// A trust refresh retries only the carrier, before AnyTLS authentication.
+    pub(crate) async fn dial_anytls(
+        &self,
+        proxy: &Proxy,
+    ) -> Result<(super::websocket::BoxStream, SocketAddr, u64)> {
+        let before = self.roots.snapshot().await;
+        match self.dial_anytls_with_roots(proxy, &before).await {
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(unknown_issuer)
+                }) =>
+            {
+                let after = self.roots.refresh(before.generation).await;
+                self.dial_anytls_with_roots(proxy, &after).await
+            }
+            result => result,
+        }
+    }
+
+    async fn dial_anytls_with_roots(
+        &self,
+        proxy: &Proxy,
+        trust: &TrustSnapshot,
+    ) -> Result<(super::websocket::BoxStream, SocketAddr, u64)> {
+        let network = self.network.snapshot().await;
+        let addresses =
+            resolve_addresses(&self.resolver, &network, &proxy.server, proxy.port).await?;
+        let addresses = interleave_addresses(
+            addresses
+                .into_iter()
+                .filter(|a| network.supports(*a))
+                .collect(),
+            None,
+        );
+        let (raw, _) = connect_happy_eyeballs(addresses, network.clone()).await?;
+        raw.set_nodelay(true)?;
+        let local = raw.local_addr()?;
+        let sni = if proxy.obfs.sni.is_empty() {
+            &proxy.server
+        } else {
+            &proxy.obfs.sni
+        };
+        let config = |alpn: Vec<Vec<u8>>| -> Result<TlsConnector> {
+            let mut config = ClientConfig::builder_with_provider(self.provider.clone())
+                .with_safe_default_protocol_versions()?
+                .with_root_certificates(trust.roots.as_ref().clone())
+                .with_no_client_auth();
+            config.alpn_protocols = alpn;
+            Ok(TlsConnector::from(Arc::new(config)))
+        };
+        let stream: super::websocket::BoxStream = if let Some(path) = proxy
+            .anytls
+            .as_ref()
+            .and_then(|o| o.websocket_path.as_ref())
+        {
+            let outer = config(vec![b"http/1.1".to_vec()])?
+                .connect(
+                    ServerName::try_from(proxy.server.clone())
+                        .map_err(|_| anyhow::anyhow!("invalid AnyTLS CDN name"))?,
+                    raw,
+                )
+                .await?;
+            if outer
+                .get_ref()
+                .1
+                .alpn_protocol()
+                .is_some_and(|p| p != b"http/1.1")
+            {
+                bail!("AnyTLS CDN negotiated an unexpected ALPN");
+            }
+            let ws = super::websocket::upgrade(outer, &proxy.server, path).await?;
+            Box::new(
+                config(Vec::new())?
+                    .connect(
+                        ServerName::try_from(sni.clone())
+                            .map_err(|_| anyhow::anyhow!("invalid AnyTLS SNI"))?,
+                        ws,
+                    )
+                    .await?,
+            )
+        } else {
+            Box::new(
+                config(Vec::new())?
+                    .connect(
+                        ServerName::try_from(sni.clone())
+                            .map_err(|_| anyhow::anyhow!("invalid AnyTLS SNI"))?,
+                        raw,
+                    )
+                    .await?,
+            )
+        };
+        Ok((stream, local, network.generation()))
+    }
     /// Shares the dialer's signed private DNS cache and system DNS fallback.
     pub(crate) async fn resolve_host(&self, host: &str) -> Result<Vec<IpAddr>> {
         let network = self.network.snapshot().await;

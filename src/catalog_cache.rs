@@ -19,7 +19,6 @@ const MAX_CACHE_BYTES: usize = (8 << 20) + (64 << 10);
 const ACCOUNT_FINGERPRINT_CONTEXT: &[u8] = b"oixc-proxy/catalog-cache-account/v1";
 
 #[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 struct CacheEnvelope {
     version: u8,
     account_fingerprint: String,
@@ -266,6 +265,49 @@ proxies:
                 .load()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn cache_extensions_preserve_metadata_and_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("test.conf");
+        let cache = CatalogCache::beside_config(&config, "token-a");
+        let yaml = format!("{YAML}    oixcloud:\n      traffic-rate: 0.5\n      warp: true\n");
+        let managed = ManagedConfig::parse(yaml.as_bytes()).unwrap();
+        cache.store(&managed).unwrap();
+        let mut envelope: serde_yaml::Value =
+            serde_yaml::from_slice(&fs::read(&cache.path).unwrap()).unwrap();
+        envelope["future-envelope"] = "ignored".into();
+        envelope["managed"]["future-document"] = true.into();
+        envelope["managed"]["proxies"][0]["future-node"] = true.into();
+        envelope["managed"]["proxies"][0]["obfs-opts"]["future-obfs"] = true.into();
+        envelope["managed"]["proxies"][0]["oixcloud"]["future-metadata"] = true.into();
+        write_private_atomic(
+            &cache.path,
+            serde_yaml::to_string(&envelope).unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(cache.load().unwrap(), managed);
+        assert!(
+            CatalogCache::beside_config(&config, "other-token")
+                .load()
+                .is_none()
+        );
+        envelope["managed"]["proxies"][0]["port"] = 0.into();
+        write_private_atomic(
+            &cache.path,
+            serde_yaml::to_string(&envelope).unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert!(cache.load().is_none());
+        envelope["managed"]["proxies"][0]["port"] = 443.into();
+        envelope["version"] = 255.into();
+        write_private_atomic(
+            &cache.path,
+            serde_yaml::to_string(&envelope).unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert!(cache.load().is_none());
     }
 
     #[test]

@@ -232,7 +232,10 @@ async fn start_gateway(client: SnellClient, sample_every: usize) -> Result<Socke
         udp_idle_timeout: Duration::from_secs(30),
         udp_relay: oixc_proxy::socks5::UdpRelay::ephemeral("127.0.0.1".parse().unwrap()),
         mode: Mode::Fixed {
-            route: FixedRoute::new(Route { client, udp: false }),
+            route: FixedRoute::new(Route {
+                client: client.into(),
+                udp: false,
+            }),
             credentials: None,
         },
     };

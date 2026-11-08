@@ -8,8 +8,11 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use url::{Host, Url};
 
-use crate::snell::{SnellSession, SnellSessionReader, SnellSessionWriter};
 use crate::socks5::{self, Activity, Mode, Options};
+use crate::upstream::{
+    Session as SnellSession, SessionReader as SnellSessionReader,
+    SessionWriter as SnellSessionWriter,
+};
 
 const BODY_BATCH_SIZE: usize = 32 << 10;
 const CHUNK_LINE_LIMIT: usize = 4 << 10;

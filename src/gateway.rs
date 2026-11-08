@@ -13,9 +13,9 @@ use tokio::sync::{RwLock, Semaphore, mpsc, oneshot};
 use crate::config::RuntimeConfig;
 use crate::nodes::Proxy;
 use crate::raw_provider::{RawNodes, RawProvider};
-use crate::snell::{SnellClient, SnellClientOptions};
 use crate::surge::{ProviderProtocol, node_selector, render_provider};
-use crate::transport::{EchDialer, TransportContext};
+use crate::transport::TransportContext;
+use crate::upstream::Client;
 
 pub const PROVIDER_PATH: &str = "/surge-proxies.conf";
 pub const CLASH_PROVIDER_PATH: &str = "/clash-proxies.yaml";
@@ -25,7 +25,7 @@ const ROUTING_SECRET_CONTEXT: &[u8] = b"oixc-proxy/provider-routing/v1";
 
 #[derive(Clone)]
 pub struct Route {
-    pub client: SnellClient,
+    pub client: Client,
     pub udp: bool,
 }
 
@@ -144,38 +144,22 @@ impl Router {
         for proxy in proxies {
             let node_runtime = if let Some(existing) = previous
                 .and_then(|catalog| catalog.runtimes.get(&proxy.name))
-                .filter(|existing| existing.proxy == *proxy)
+                .filter(|existing| existing.proxy.same_connection_settings(proxy))
             {
                 existing.clone()
             } else {
-                let dialer = EchDialer::new_with_context(
+                let (client, diagnostics) = Client::build(
                     proxy,
-                    runtime.request_timeout,
+                    runtime,
                     context.transport.clone(),
-                )?;
-                let diagnostics = dialer.diagnostics.clone();
-                let client = SnellClient::new_with_node_dial_limit(
-                    SnellClientOptions {
-                        node_name: proxy.name.clone(),
-                        psk: proxy.psk.clone(),
-                        reuse: proxy.reuse,
-                        max_idle: runtime.reuse_max_idle,
-                        max_uses: runtime.reuse_max_uses,
-                        idle_timeout: runtime.reuse_idle_timeout,
-                        handshake_timeout: runtime.request_timeout,
-                        close_timeout: Duration::from_secs(2),
-                        dialer: dialer.into(),
-                        dial_limit: Some(context.dial_limit.clone()),
-                        dial_limit_timeout: runtime.request_timeout.max(Duration::from_secs(45)),
-                    },
-                    Some(Arc::new(Semaphore::new(runtime.per_node_dial_concurrency))),
+                    context.dial_limit.clone(),
                 )?;
                 Arc::new(NodeRuntime {
                     proxy: proxy.clone(),
                     diagnostics,
                     route: Route {
                         client,
-                        udp: proxy.udp,
+                        udp: proxy.udp || proxy.anytls.as_ref().is_some_and(|o| o.udp),
                     },
                 })
             };
@@ -264,16 +248,31 @@ impl GatewayManager {
             crate::raw_provider::test_proxy("Mock Fusion 01"),
             crate::raw_provider::test_proxy("Mock Extra 02"),
         ];
+        Self::raw_proxies_for_test(&proxies, 1, allow_remote)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw_proxies_for_test(
+        proxies: &[Proxy],
+        published: usize,
+        allow_remote: bool,
+    ) -> Self {
         Self::new(Router {
             routes: HashMap::new(),
             runtimes: HashMap::new(),
-            filtered: render_provider_docs(&proxies[..1], "127.0.0.1", 6172, "mock-secret", true)
-                .unwrap(),
-            all: render_provider_docs(&proxies, "127.0.0.1", 6172, "mock-secret", true).unwrap(),
+            filtered: render_provider_docs(
+                &proxies[..published],
+                "127.0.0.1",
+                6172,
+                "mock-secret",
+                true,
+            )
+            .unwrap(),
+            all: render_provider_docs(proxies, "127.0.0.1", 6172, "mock-secret", true).unwrap(),
             routing_secret: "test".to_owned(),
             published_count: 0,
-            raw_filtered: RawNodes::new(&proxies[..1]),
-            raw_all: RawNodes::new(&proxies),
+            raw_filtered: RawNodes::new(&proxies[..published]),
+            raw_all: RawNodes::new(proxies),
             allow_remote_raw_provider: allow_remote,
         })
     }
@@ -591,6 +590,46 @@ fn constant_time_equal(first: &[u8], second: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn metadata_only_refresh_reuses_node_runtime_but_connection_changes_do_not() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test.conf");
+        std::fs::write(&path, "token=test\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let runtime = crate::config::load_proxy_config(&path).unwrap().runtime;
+        let context = GatewayContext::new(
+            "127.0.0.1".parse().unwrap(),
+            true,
+            "mock-secret".into(),
+            Arc::new(Semaphore::new(1)),
+            Arc::new(TransportContext::built_in().unwrap()),
+        );
+        let mut proxies = vec![crate::raw_provider::test_proxy("Mock Fusion 01")];
+        let original = Router::build(&proxies, &proxies, &runtime, &context, None).unwrap();
+        proxies[0].oixcloud = Some(crate::nodes::OixcloudMetadata {
+            traffic_rate: Some(2.into()),
+            warp: Some(true),
+        });
+        let updated =
+            Router::build(&proxies, &proxies, &runtime, &context, Some(&original)).unwrap();
+        assert!(Arc::ptr_eq(
+            &original.runtimes["Mock Fusion 01"],
+            &updated.runtimes["Mock Fusion 01"]
+        ));
+        assert_eq!(original.provider(true, true), updated.provider(true, true));
+        proxies[0].psk = "rotated-mock-secret".into();
+        let rotated =
+            Router::build(&proxies, &proxies, &runtime, &context, Some(&updated)).unwrap();
+        assert!(!Arc::ptr_eq(
+            &updated.runtimes["Mock Fusion 01"],
+            &rotated.runtimes["Mock Fusion 01"]
+        ));
+    }
 
     #[tokio::test]
     async fn raw_export_permissions_follow_the_replaced_catalog() {

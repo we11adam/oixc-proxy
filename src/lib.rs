@@ -1,4 +1,5 @@
 pub mod accept;
+pub mod anytls;
 pub mod api;
 pub mod catalog_cache;
 pub mod catalog_refresh;
@@ -21,6 +22,7 @@ pub mod subscription;
 pub mod surge;
 pub mod traffic;
 pub mod transport;
+pub mod upstream;
 #[cfg(windows)]
 pub mod windows;
 

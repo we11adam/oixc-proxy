@@ -21,9 +21,9 @@ use crate::http_server;
 use crate::network::NetworkMonitor;
 use crate::nodes::{ManagedConfig, Proxy};
 use crate::rlimit;
-use crate::snell::{SnellClient, SnellClientOptions};
 use crate::socks5::{self, Credentials, FixedRoute, Mode, UdpRelay};
-use crate::transport::{EchDialer, TransportContext};
+use crate::transport::TransportContext;
+use crate::upstream::Client;
 
 const SERVE_MAP_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
 
@@ -1053,7 +1053,9 @@ fn plan_map_refresh(mapped: &[Proxy], refreshed: &[Proxy]) -> MapRefresh {
     let mut removed = 0;
     for (index, current) in mapped.iter().enumerate() {
         match refreshed.iter().find(|proxy| proxy.name == current.name) {
-            Some(proxy) if proxy != current => updates.push((index, proxy.clone())),
+            Some(proxy) if !proxy.same_connection_settings(current) => {
+                updates.push((index, proxy.clone()));
+            }
             Some(_) => {}
             None => removed += 1,
         }
@@ -1154,25 +1156,10 @@ fn build_fixed_route(
     transport: Arc<TransportContext>,
     dial_limit: Arc<Semaphore>,
 ) -> Result<Route> {
-    let dialer = EchDialer::new_with_context(proxy, runtime.request_timeout, transport)?;
+    let (client, _) = Client::build(proxy, runtime, transport, dial_limit)?;
     Ok(Route {
-        client: SnellClient::new_with_node_dial_limit(
-            SnellClientOptions {
-                node_name: proxy.name.clone(),
-                psk: proxy.psk.clone(),
-                reuse: proxy.reuse,
-                max_idle: runtime.reuse_max_idle,
-                max_uses: runtime.reuse_max_uses,
-                idle_timeout: runtime.reuse_idle_timeout,
-                handshake_timeout: runtime.request_timeout,
-                close_timeout: Duration::from_secs(2),
-                dialer: dialer.into(),
-                dial_limit: Some(dial_limit),
-                dial_limit_timeout: runtime.request_timeout,
-            },
-            Some(Arc::new(Semaphore::new(runtime.per_node_dial_concurrency))),
-        )?,
-        udp: proxy.udp,
+        client,
+        udp: proxy.udp || proxy.anytls.as_ref().is_some_and(|o| o.udp),
     })
 }
 
@@ -1783,6 +1770,12 @@ mod tests {
                 removed: 0,
             }
         );
+        let mut metadata_only = mapped.clone();
+        metadata_only[0].oixcloud = Some(crate::nodes::OixcloudMetadata {
+            traffic_rate: Some(2.into()),
+            warp: Some(true),
+        });
+        assert!(plan_map_refresh(&mapped, &metadata_only).updates.is_empty());
     }
 
     #[test]

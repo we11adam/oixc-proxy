@@ -154,6 +154,8 @@ mod tests {
             tfo: false,
             reuse: true,
             identity: true,
+            oixcloud: None,
+            anytls: None,
             obfs: ObfsOptions {
                 mode: "ech-tls".to_owned(),
                 sni: "sni.example.com".to_owned(),
