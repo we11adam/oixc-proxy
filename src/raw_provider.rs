@@ -99,6 +99,28 @@ fn safe_host(host: &str) -> bool {
 }
 
 fn supported(proxy: &Proxy) -> bool {
+    if proxy.port == 0
+        || !safe_host(&proxy.server)
+        || (!proxy.obfs.sni.is_empty() && !safe_host(&proxy.obfs.sni))
+        || !safe_parameter(&proxy.psk)
+    {
+        return false;
+    }
+    if proxy.proxy_type == "anytls" {
+        return matches!(proxy.version, 0 | 2)
+            && matches!(proxy.obfs.mode.as_str(), "" | "tls")
+            && proxy.obfs.alpn.is_empty()
+            && proxy.obfs.ech_config.is_empty()
+            && !proxy.obfs.skip_cert_verify
+            && !proxy.obfs.legacy_fallback
+            && proxy.anytls.as_ref().is_none_or(|options| {
+                (!options.uses_cdn || options.websocket_path.is_some())
+                    && options.websocket_path.as_ref().is_none_or(|path| {
+                        crate::transport::websocket::validate_path(path).is_ok()
+                            && safe_parameter(path)
+                    })
+            });
+    }
     proxy.proxy_type == "snell"
         && proxy.version == 4
         && proxy.obfs.mode == "ech-tls"
@@ -195,6 +217,32 @@ impl RawProvider {
             } else {
                 &proxy.obfs.sni
             };
+            if proxy.proxy_type == "anytls" {
+                write!(
+                    output,
+                    "{} = anytls, {server}, {}, password={}, sni={sni}",
+                    node.policy, proxy.port, proxy.psk
+                )
+                .unwrap();
+                if let Some(path) = proxy
+                    .anytls
+                    .as_ref()
+                    .and_then(|options| options.websocket_path.as_ref())
+                {
+                    // The socket address may be an IP. Keep the source hostname
+                    // for outer TLS verification and HTTP Host independently.
+                    write!(
+                        output,
+                        ", obfs=wss-tls, obfs-host={}, obfs-uri={path}",
+                        proxy.server
+                    )
+                    .unwrap();
+                }
+                let udp = proxy.udp || proxy.anytls.as_ref().is_some_and(|options| options.udp);
+                // AnyTLS defaults to session reuse, unlike the Snell flag.
+                writeln!(output, ", reuse=true, udp-relay={udp}").unwrap();
+                continue;
+            }
             writeln!(output,
                 "{} = snell, {server}, {}, psk={}, version=4, obfs=ech-tls, obfs-host={sni}, ech-config={}, reuse={}, udp-relay={}{}{}",
                 node.policy, proxy.port, proxy.psk, proxy.obfs.ech_config, proxy.reuse, proxy.udp,
@@ -252,9 +300,169 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn anytls(name: &str, path: Option<&str>) -> Proxy {
+        Proxy {
+            name: name.into(),
+            proxy_type: "anytls".into(),
+            server: "cdn.example.test".into(),
+            port: 443,
+            psk: "mock-secret".into(),
+            version: 0,
+            udp: false,
+            tfo: false,
+            reuse: false,
+            identity: false,
+            oixcloud: None,
+            anytls: Some(crate::nodes::AnyTlsOptions {
+                websocket_path: path.map(str::to_owned),
+                uses_cdn: path.is_some(),
+                udp: true,
+            }),
+            obfs: crate::nodes::ObfsOptions {
+                sni: "origin.example.test".into(),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_protocol_export_preserves_order_and_both_tls_names() {
+        let proxies = [
+            test_proxy("Snell Fusion"),
+            anytls("Plain AnyTLS", None),
+            anytls("CDN AnyTLS", Some("/carrier?route=1&mode=tls")),
+        ];
+        let nodes = RawNodes::new(&proxies);
+        assert_eq!(nodes.skipped, 0);
+        let output = RawProvider::default()
+            .render(&nodes, |_| async {
+                Ok(vec!["203.0.113.10".parse().unwrap()])
+            })
+            .await;
+        let output = String::from_utf8(output).unwrap();
+        let lines: Vec<_> = output.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            format!("{}\n", lines[1..].join("\n")),
+            include_str!("../testdata/anytls-raw-provider.conf")
+        );
+        assert!(lines[0].starts_with(
+            "Snell Fusion = snell, 203.0.113.10, 443, psk=mock-secret, version=4, obfs=ech-tls,"
+        ));
+        assert_eq!(
+            lines[1],
+            "Plain AnyTLS = anytls, 203.0.113.10, 443, password=mock-secret, sni=origin.example.test, reuse=true, udp-relay=true"
+        );
+        assert_eq!(
+            lines[2],
+            "CDN AnyTLS = anytls, 203.0.113.10, 443, password=mock-secret, sni=origin.example.test, obfs=wss-tls, obfs-host=cdn.example.test, obfs-uri=/carrier?route=1&mode=tls, reuse=true, udp-relay=true"
+        );
+        assert!(!lines[1].contains("obfs="));
+        for line in &lines[1..] {
+            for forbidden in ["psk=", "version=", "ech-config=", "identity="] {
+                assert!(!line.contains(forbidden));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn anytls_dns_fallback_and_ipv6_keep_original_sni_and_cdn_host() {
+        let mut plain = anytls("Plain", None);
+        plain.obfs.sni.clear();
+        plain.anytls = None;
+        let nodes = RawNodes::new(&[plain, anytls("CDN", Some("/carrier"))]);
+        let resolver = RawProvider::default();
+        let lookup_fail = |_| async { anyhow::bail!("mock DNS failure") };
+        let unresolved = String::from_utf8(resolver.render(&nodes, lookup_fail).await).unwrap();
+        assert!(unresolved.contains("Plain = anytls, cdn.example.test, 443, password=mock-secret, sni=cdn.example.test, reuse=true, udp-relay=false"));
+        let resolved = resolver
+            .render(&nodes, |_| async {
+                Ok(vec!["2001:db8::1".parse().unwrap()])
+            })
+            .await;
+        assert_eq!(resolver.render(&nodes, lookup_fail).await, resolved);
+        let resolved = String::from_utf8(resolved).unwrap();
+        assert!(resolved.contains(
+            "Plain = anytls, 2001:db8::1, 443, password=mock-secret, sni=cdn.example.test,"
+        ));
+        assert!(resolved.contains("CDN = anytls, 2001:db8::1, 443, password=mock-secret, sni=origin.example.test, obfs=wss-tls, obfs-host=cdn.example.test, obfs-uri=/carrier,"));
+    }
+
+    #[test]
+    fn anytls_rejects_partial_cdn_profiles_and_unrepresentable_fields() {
+        let base = anytls("Mock", Some("/carrier"));
+        let mut invalid = Vec::new();
+        let mut p = base.clone();
+        p.anytls.as_mut().unwrap().websocket_path = None;
+        invalid.push(p);
+        let mut p = base.clone();
+        p.obfs.skip_cert_verify = true;
+        invalid.push(p);
+        let mut p = base.clone();
+        p.obfs.mode = "ech-tls".into();
+        invalid.push(p);
+        let mut p = base.clone();
+        p.obfs.alpn = "h3".into();
+        invalid.push(p);
+        let mut p = base.clone();
+        p.obfs.ech_config = "unexpected".into();
+        invalid.push(p);
+        let mut p = base.clone();
+        p.version = 6;
+        invalid.push(p);
+        for path in [
+            "/path,other=value",
+            "/path\nInjected = direct",
+            "/path#fragment",
+            "/path;comment",
+            "/path with space",
+            "/path\\escape",
+            "/path\"quoted",
+        ] {
+            let mut p = base.clone();
+            p.anytls.as_mut().unwrap().websocket_path = Some(path.into());
+            invalid.push(p);
+        }
+        for password in ["", "mock,value", "mock\nvalue", "mock value", "mock\"value"] {
+            let mut p = base.clone();
+            p.psk = password.into();
+            invalid.push(p);
+        }
+        let nodes = RawNodes::new(&invalid);
+        assert_eq!(nodes.skipped, invalid.len());
+        assert!(nodes.nodes.is_empty());
+        assert_eq!(RawNodes::new(&[base]).skipped, 0);
+    }
+
+    #[tokio::test]
+    async fn anytls_policy_collisions_and_optional_cdn_marker_follow_existing_contract() {
+        let mut a = anytls("Mock,A", Some("/carrier"));
+        a.anytls.as_mut().unwrap().uses_cdn = false;
+        let b = anytls("Mock=A", None);
+        let nodes = RawNodes::new(&[a, b]);
+        let output = RawProvider::default()
+            .render(&nodes, |_| async { anyhow::bail!("offline") })
+            .await;
+        let output = String::from_utf8(output).unwrap();
+        let lines: Vec<_> = output.lines().collect();
+        assert_eq!(lines.len(), 2);
+        for (line, name) in lines.iter().zip(["Mock,A", "Mock=A"]) {
+            assert!(line.starts_with(&format!(
+                "Mock A [{}] = anytls,",
+                node_selector(name).unwrap()
+            )));
+        }
+        assert!(lines[0].contains("obfs=wss-tls"));
+        assert!(!lines[1].contains("obfs="));
+    }
+
     #[tokio::test]
     async fn renders_exact_snell_parameters_and_prefers_ipv4() {
-        let proxy = test_proxy("Mock Fusion 01");
+        let mut proxy = test_proxy("Mock Fusion 01");
+        proxy.oixcloud = Some(crate::nodes::OixcloudMetadata {
+            traffic_rate: Some(2.into()),
+            warp: Some(true),
+        });
         let expected = format!(
             "Mock Fusion 01 = snell, 192.0.2.1, 443, psk=mock-secret, version=4, obfs=ech-tls, obfs-host=sni.example.test, ech-config={}, reuse=true, udp-relay=true\n",
             proxy.obfs.ech_config

@@ -542,6 +542,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_mixed_anytls_profiles_obey_filter_head_access_and_refresh_contracts() {
+        let mut anytls = crate::raw_provider::test_proxy("Mock AnyTLS Fusion");
+        anytls.proxy_type = "anytls".into();
+        anytls.version = 0;
+        anytls.identity = false;
+        anytls.obfs = crate::nodes::ObfsOptions {
+            sni: "origin.example.test".into(),
+            ..Default::default()
+        };
+        let mut cdn = anytls.clone();
+        cdn.name = "Mock CDN Extra".into();
+        cdn.server = "cdn.example.test".into();
+        cdn.anytls = Some(crate::nodes::AnyTlsOptions {
+            websocket_path: Some("/carrier?route=1".into()),
+            uses_cdn: true,
+            udp: true,
+        });
+        let proxies = [
+            crate::raw_provider::test_proxy("Mock Snell Fusion"),
+            anytls,
+            cdn,
+        ];
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let manager = Arc::new(
+            GatewayManager::raw_proxies_for_test(&proxies, 2, false).with_provider_refresh(sender),
+        );
+        let filtered = request_for_test(manager.clone(), "GET", "/surge-proxies.conf?raw=1").await;
+        assert!(filtered.contains("Mock Snell Fusion = snell,"));
+        assert!(filtered.contains("Mock AnyTLS Fusion = anytls,"));
+        assert!(!filtered.contains("Mock CDN Extra"));
+        let all = request_for_test(manager.clone(), "GET", "/surge-proxies.conf?raw=1&all=1").await;
+        assert!(all.contains("Mock CDN Extra = anytls, cdn.example.test, 443, password=mock-secret, sni=origin.example.test, obfs=wss-tls, obfs-host=cdn.example.test, obfs-uri=/carrier?route=1,"));
+        assert!(all.contains("Cache-Control: no-store"));
+        let head =
+            request_for_test(manager.clone(), "HEAD", "/surge-proxies.conf?raw=1&all=1").await;
+        assert_eq!(
+            head,
+            format!("{}\r\n\r\n", all.split_once("\r\n\r\n").unwrap().0)
+        );
+        assert!(!head.contains("mock-secret"));
+        let denied = request_from_peer(
+            manager.clone(),
+            "GET",
+            "/surge-proxies.conf?raw=1&all=1",
+            "192.0.2.1",
+        )
+        .await;
+        assert!(denied.starts_with("HTTP/1.1 403"));
+        assert!(!denied.contains("mock-secret"));
+        assert!(!denied.contains("/carrier"));
+        let normal = request_for_test(manager.clone(), "GET", "/surge-proxies.conf?all=1").await;
+        assert!(normal.contains("Mock CDN Extra = socks5,"));
+        assert!(!normal.contains("password=mock-secret"));
+        assert!(!normal.contains("obfs=wss-tls"));
+        let pending = tokio::spawn(request_for_test(
+            manager.clone(),
+            "GET",
+            "/surge-proxies.conf?raw=1&all=1&refresh=1",
+        ));
+        let refresh = receiver.recv().await.unwrap();
+        assert!(!pending.is_finished());
+        refresh
+            .reply
+            .send(crate::control::Response::success(
+                "refreshed",
+                serde_json::Value::Null,
+            ))
+            .unwrap();
+        assert_eq!(pending.await.unwrap(), all);
+        assert_eq!(manager.status().await["raw_skipped_nodes"]["all"], 0);
+    }
+
+    #[tokio::test]
     async fn non_raw_provider_bytes_and_query_flag_semantics_are_preserved() {
         let manager = Arc::new(GatewayManager::provider_for_test());
         let selector = crate::surge::node_selector("Mock Fusion 01").unwrap();
