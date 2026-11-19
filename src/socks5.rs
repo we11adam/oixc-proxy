@@ -313,8 +313,8 @@ async fn read_credentials(client: &mut TcpStream) -> Result<(String, String)> {
     let mut password = vec![0u8; password_length as usize];
     client.read_exact(&mut password).await?;
     Ok((
-        String::from_utf8_lossy(&username).into_owned(),
-        String::from_utf8_lossy(&password).into_owned(),
+        String::from_utf8(username).map_err(|_| anyhow::anyhow!("invalid SOCKS5 username"))?,
+        String::from_utf8(password).map_err(|_| anyhow::anyhow!("invalid SOCKS5 password"))?,
     ))
 }
 
@@ -358,10 +358,82 @@ async fn read_host(client: &mut TcpStream, address_type: u8) -> Result<String> {
             }
             let mut domain = vec![0u8; length];
             client.read_exact(&mut domain).await?;
-            Ok(String::from_utf8_lossy(&domain).into_owned())
+            let domain = std::str::from_utf8(&domain)
+                .map_err(|_| anyhow::anyhow!("invalid SOCKS5 domain encoding"))?;
+            validate_destination(domain)?;
+            Ok(domain.to_owned())
         }
         _ => bail!("SOCKS5 address type is unsupported"),
     }
+}
+
+#[cfg(test)]
+mod destination_tests {
+    use super::{decode_datagram, read_host, validate_destination};
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn tcp_and_udp_reject_invalid_domain_bytes_before_dialing() {
+        assert!(decode_datagram(&[0, 0, 0, 3, 1, 255, 0, 53]).is_err());
+        assert!(decode_datagram(&[0, 0, 0, 3, 3, b'a', 0, b'b', 0, 53]).is_err());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream.write_all(&[1, 255]).await.unwrap();
+        });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        assert!(read_host(&mut stream, 3).await.is_err());
+        peer.await.unwrap();
+    }
+
+    #[test]
+    fn validates_names_without_lossy_replacement_or_authority_injection() {
+        for valid in [
+            "example.test",
+            "_node.example.test.",
+            "192.0.2.1",
+            "2001:db8::1",
+        ] {
+            assert!(validate_destination(valid).is_ok());
+        }
+        for invalid in [
+            "",
+            "a..test",
+            "a b.test",
+            "a\0.test",
+            "a/b.test",
+            "user@host",
+            "a:443",
+            "-a.test",
+            "a-.test",
+            "a\u{fffd}.test",
+        ] {
+            assert!(validate_destination(invalid).is_err());
+        }
+    }
+}
+
+pub(crate) fn validate_destination(host: &str) -> Result<()> {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+    let name = host.strip_suffix('.').unwrap_or(host);
+    if name.is_empty()
+        || name.len() > 253
+        || !name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+    {
+        bail!("proxy destination name is invalid");
+    }
+    Ok(())
 }
 
 async fn serve_connect(
@@ -715,7 +787,10 @@ fn decode_datagram(packet: &[u8]) -> Result<(String, u16, &[u8])> {
             if length == 0 || packet.len() < offset + length + 2 {
                 bail!("SOCKS5 UDP datagram is truncated");
             }
-            let value = String::from_utf8_lossy(&packet[offset..offset + length]).into_owned();
+            let value = std::str::from_utf8(&packet[offset..offset + length])
+                .map_err(|_| anyhow::anyhow!("invalid SOCKS5 UDP domain encoding"))?;
+            validate_destination(value)?;
+            let value = value.to_owned();
             offset += length;
             value
         }

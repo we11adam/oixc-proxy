@@ -527,7 +527,8 @@ async fn read_proxy_request(client: &mut TcpStream, first_byte: u8) -> Result<Pa
         .position(|window| window == b"\r\n\r\n")
         .ok_or_else(|| anyhow::anyhow!("HTTP proxy request is truncated"))?;
     let leftover = request[split + 4..].to_vec();
-    let text = String::from_utf8_lossy(&request[..split]);
+    let text = std::str::from_utf8(&request[..split])
+        .map_err(|_| anyhow::anyhow!("HTTP proxy request is not valid UTF-8"))?;
     let mut lines = text.split("\r\n");
     let request_line = lines
         .next()
@@ -544,18 +545,34 @@ fn parse_request_line(
     headers: &[&str],
     credentials: Option<(String, String)>,
 ) -> Result<ParsedRequest> {
-    let mut fields = request_line.split_whitespace();
+    validate_request_headers(headers)?;
+    let mut fields = request_line.split(' ');
     let method = fields
         .next()
         .ok_or_else(|| anyhow::anyhow!("HTTP proxy request line is invalid"))?;
     let target = fields
         .next()
         .ok_or_else(|| anyhow::anyhow!("HTTP proxy request line is invalid"))?;
-    if fields.next().is_none() {
+    let version = fields.next();
+    if !method.bytes().all(header_token)
+        || method.is_empty()
+        || target.is_empty()
+        || target.bytes().any(|b| b <= 32 || b == 127)
+        || !matches!(version, Some("HTTP/1.0" | "HTTP/1.1"))
+        || fields.next().is_some()
+    {
         bail!("HTTP proxy request line is invalid");
     }
     if method.eq_ignore_ascii_case("CONNECT") {
+        if headers.iter().any(|h| {
+            let (name, value) = h.split_once(':').unwrap();
+            name.eq_ignore_ascii_case("transfer-encoding")
+                || (name.eq_ignore_ascii_case("content-length") && value.trim() != "0")
+        }) {
+            bail!("CONNECT request body framing is not supported");
+        }
         let (host, port) = parse_connect_target(target)?;
+        crate::socks5::validate_destination(&host)?;
         return Ok(ParsedRequest {
             host,
             port,
@@ -572,6 +589,41 @@ fn parse_request_line(
         forwarded: Some(forwarded),
         leftover: Vec::new(),
     })
+}
+
+fn header_token(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
+/// Authentication and forwarding must accept exactly the same header grammar.
+fn validate_request_headers(headers: &[&str]) -> Result<()> {
+    let mut authorization = false;
+    let mut host = false;
+    for line in headers {
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("HTTP request header is missing a colon"))?;
+        if name.is_empty()
+            || !name.bytes().all(header_token)
+            || value.bytes().any(|b| (b < 32 && b != b'\t') || b == 127)
+        {
+            bail!("HTTP request header is invalid");
+        }
+        let seen = if name.eq_ignore_ascii_case("proxy-authorization") {
+            Some(&mut authorization)
+        } else if name.eq_ignore_ascii_case("host") {
+            Some(&mut host)
+        } else {
+            None
+        };
+        if let Some(seen) = seen {
+            if *seen {
+                bail!("HTTP request contains ambiguous headers");
+            }
+            *seen = true;
+        }
+    }
+    Ok(())
 }
 
 fn parse_connect_target(target: &str) -> Result<(String, u16)> {
@@ -630,6 +682,7 @@ fn rewrite_absolute_request(
     request_line: &str,
     headers: &[&str],
 ) -> Result<(String, u16, ForwardedRequest)> {
+    validate_request_headers(headers)?;
     let mut fields = request_line.splitn(3, ' ');
     let method = fields
         .next()
@@ -650,6 +703,10 @@ fn rewrite_absolute_request(
         Some(Host::Ipv6(address)) => address.to_string(),
         None => bail!("HTTP proxy URL is missing a host"),
     };
+    crate::socks5::validate_destination(&host)?;
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        bail!("HTTP proxy URL contains unsupported user information or fragment");
+    }
     let port = url.port().unwrap_or(80);
     if port == 0 {
         bail!("HTTP proxy port is invalid");
@@ -922,6 +979,55 @@ mod tests {
         assert_eq!(
             parse_basic_proxy_auth(&refs).unwrap(),
             ("name-abc".to_owned(), "secret-1".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_credentials_and_invalid_headers_for_every_method() {
+        for headers in [
+            vec![
+                "Proxy-Authorization: Basic YTpi",
+                "proxy-authorization: Basic Yzpk",
+            ],
+            vec!["Proxy-Authorization : Basic YTpi"],
+            vec![" Proxy-Authorization: Basic YTpi"],
+            vec!["Proxy-Authorization\t: Basic YTpi"],
+            vec!["X: value\nProxy-Authorization: Basic YTpi"],
+            vec!["X: value\0"],
+            vec!["X: value\u{7f}"],
+            vec!["Missing-Colon"],
+            vec!["Host: a.test", "HOST: b.test"],
+        ] {
+            for line in [
+                "CONNECT example.test:443 HTTP/1.1",
+                "GET http://example.test/ HTTP/1.1",
+            ] {
+                assert!(parse_request_line(line, &headers, None).is_err());
+            }
+        }
+        for line in [
+            "CONNECT example.test:443 HTTP/1.1 extra",
+            "CONNECT\texample.test:443 HTTP/1.1",
+            "CONNECT example.test:443 HTTP/2.0",
+            "CONNECT example.test:443 HTTP/1.1\n",
+        ] {
+            assert!(parse_request_line(line, &[], None).is_err());
+        }
+        assert!(
+            parse_request_line(
+                "CONNECT example.test:443 HTTP/1.1",
+                &["Content-Length: 1"],
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            parse_request_line(
+                "CONNECT example.test:443 HTTP/1.1",
+                &["Transfer-Encoding: chunked"],
+                None
+            )
+            .is_err()
         );
     }
 
