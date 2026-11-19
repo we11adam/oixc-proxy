@@ -4,6 +4,15 @@
 
 Notable changes to `oixc-proxy` are recorded in this file. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- Detect Fake-IP answers for API and ordinary node names and recover through bounded physical-egress UDP/TCP DNS, with network-scoped caching and shared requests independent of waiter cancellation. Add TCP recovery and cancellation isolation to signed private DNS.
+- Distinguish transient refresh failures from explicit 401 / verified empty catalogs. Revoke confirmed-invalid nodes, persist a revocation marker and restore service on a valid refresh. Preserve the fail-closed, previous-catalog/cache-retaining contract of failed `refresh=1` requests; retain mapped ports through revocation and recovery.
+- Back off refreshes from 5 to 300 seconds and honor numeric or HTTP-date `Retry-After`. Manual, scheduled, ECH and provider refreshes share cooldowns; network changes never bypass server-directed waits.
+- Apply consistent HTTP header validation before authentication and forwarding, rejecting duplicate credentials, invalid names/control bytes, ambiguous request lines and CONNECT bodies. Validate SOCKS5 TCP/UDP destination names and UTF-8 without lossy replacement.
+
 ## [0.10.0] - 2026-11-08
 
 ### Added
