@@ -257,7 +257,8 @@ impl Client {
             .await
             .context("perform request")?;
         let status = response.status();
-        ensure_success(status, retry_after_seconds(&response))?;
+        let retry_after = retry_after_seconds(&response);
+        ensure_success(status, retry_after)?;
         let response_signature = response
             .headers()
             .get(HEADER_RESPONSE_SIGNATURE)
@@ -270,10 +271,12 @@ impl Client {
         let envelope: ManagedEnvelope = serde_json::from_slice(&body)
             .map_err(|_| api_failure(ErrorKind::InvalidResponse, None))?;
         if envelope.ret != StatusCode::OK.as_u16() as i32 {
-            return Err(api_failure(
-                http_error_kind(u16::try_from(envelope.ret).unwrap_or(0)),
-                u16::try_from(envelope.ret).ok(),
-            ));
+            return Err(ApiFailure {
+                kind: http_error_kind(u16::try_from(envelope.ret).unwrap_or(0)),
+                status: u16::try_from(envelope.ret).ok(),
+                retry_after_seconds: retry_after,
+            }
+            .into());
         }
         if envelope.config.is_empty() {
             bail!(
@@ -439,13 +442,28 @@ fn api_failure(kind: ErrorKind, status: Option<u16>) -> anyhow::Error {
 }
 
 fn retry_after_seconds(response: &reqwest::Response) -> Option<u64> {
-    response
-        .headers()
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .parse()
-        .ok()
+    parse_retry_after(
+        response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)?
+            .to_str()
+            .ok()?,
+        SystemTime::now(),
+    )
+}
+
+fn parse_retry_after(value: &str, now: SystemTime) -> Option<u64> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        return value.parse().ok();
+    }
+    let until = httpdate::parse_http_date(value).ok()?;
+    let remaining = until.duration_since(now).unwrap_or_default();
+    Some(
+        remaining
+            .as_secs()
+            .saturating_add(u64::from(remaining.subsec_nanos() != 0)),
+    )
 }
 
 fn describe_json_fields(body: &[u8]) -> String {
@@ -474,6 +492,26 @@ fn describe_json_fields(body: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_after_supports_seconds_dates_and_rejects_invalid_values() {
+        let now = UNIX_EPOCH + Duration::from_secs(784111177);
+        assert_eq!(parse_retry_after("60", now), Some(60));
+        assert_eq!(
+            parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT", now),
+            Some(600)
+        );
+        assert_eq!(
+            parse_retry_after(
+                "Sun, 06 Nov 1994 08:49:37 GMT",
+                now + Duration::from_secs(601)
+            ),
+            Some(0)
+        );
+        for invalid in ["-1", "+5", "nonsense", "18446744073709551616"] {
+            assert_eq!(parse_retry_after(invalid, now), None);
+        }
+    }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn mock_response(status: u16, body: &str) -> (Url, tokio::task::JoinHandle<String>) {

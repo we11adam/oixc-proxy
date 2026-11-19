@@ -479,6 +479,7 @@ struct CatalogService {
     manager: Arc<GatewayManager>,
     disable_filter: bool,
     events: crate::diagnostics::EventLog,
+    backoff: crate::catalog_refresh::RefreshBackoff,
 }
 
 impl CatalogService {
@@ -554,6 +555,9 @@ impl CatalogService {
         self.cache = cache;
         self.context = context;
         self.service = next;
+        if account_changed || api_changed {
+            self.backoff = Default::default();
+        }
         crate::perftrace::configure(self.service.runtime.perf_trace_sample_every);
         Ok(())
     }
@@ -563,6 +567,7 @@ impl CatalogService {
     }
 
     async fn refresh_with_policy(&mut self, require_cache_write: bool) -> Result<()> {
+        self.backoff.check()?;
         self.manager.refresh_started();
         let fetched = load_managed_catalog(&self.service.runtime, true, &self.network).await;
         self.finish_refresh(fetched, require_cache_write).await
@@ -580,12 +585,25 @@ impl CatalogService {
             }
             Err(error) => Err(error),
         };
+        if !require_cache_write && result.as_ref().is_err_and(confirms_revocation) {
+            // Persist a tombstone before retiring clients. If persistence fails,
+            // still disable live access and report the failure visibly.
+            let persisted = self.cache.revoke();
+            self.manager.revoke().await?;
+            self.managed.proxies.clear();
+            self.fetched_at = None;
+            if let Err(error) = persisted {
+                eprintln!("persist revoked node catalog: {error:#}");
+            }
+        }
+        self.backoff.record(result.as_ref().err());
         self.manager.refresh_finished(result.as_ref().err());
         self.events.record(
             crate::diagnostics::EventKind::CatalogRefresh,
             result.as_ref().err(),
         );
         if !require_cache_write
+            && !self.managed.proxies.is_empty()
             && let Err(error) = &result
             && matches!(
                 crate::diagnostics::classify(error),
@@ -770,7 +788,9 @@ async fn run_serve(args: &[String]) -> Result<()> {
         manager: manager.clone(),
         disable_filter: disable_node_filter,
         events,
+        backoff: Default::default(),
     };
+    let mut network_generation = catalog.network.snapshot().await.generation();
     loop {
         let request = tokio::select! {
             result = &mut socks_task => {
@@ -783,6 +803,12 @@ async fn run_serve(args: &[String]) -> Result<()> {
             request = control_rx.recv() => Some(request.context("service control queue closed")?),
             _ = refresh.tick() => None,
             _ = catalog_refresh.notified() => None,
+            _ = catalog.backoff.wait() => None,
+            generation = wait_network_change(&catalog.network, network_generation) => {
+                network_generation = generation;
+                catalog.backoff.network_changed();
+                None
+            },
         };
         if request
             .as_ref()
@@ -984,6 +1010,9 @@ async fn run_serve_map(args: &[String]) -> Result<()> {
     drop(error_tx);
 
     let mut mapped = managed.proxies;
+    let mut retired = std::collections::HashSet::new();
+    let mut backoff = crate::catalog_refresh::RefreshBackoff::default();
+    let mut network_generation = network.snapshot().await.generation();
     let mut refresh = tokio::time::interval(SERVE_MAP_REFRESH_INTERVAL);
     refresh.tick().await;
     loop {
@@ -995,16 +1024,39 @@ async fn run_serve_map(args: &[String]) -> Result<()> {
                 tokio::select! {
                     _ = refresh.tick() => {},
                     _ = transport.catalog_refresh.notified() => {},
+                    _ = backoff.wait() => {},
+                    generation = wait_network_change(&network, network_generation) => {
+                        network_generation = generation;
+                        backoff.network_changed();
+                    },
                 }
             } => {
+                if backoff.check().is_err() { continue; }
                 let refreshed = match load_managed_nodes(&runtime, disable_node_filter, &network).await {
-                    Ok(value) => value,
+                    Ok(value) => { backoff.record(None); value },
                     Err(error) => {
+                        backoff.record(Some(&error));
+                        if confirms_revocation(&error) {
+                            for (index, route) in routes.iter().enumerate() {
+                                route.get().client.close().await;
+                                retired.insert(index);
+                            }
+                        }
                         eprintln!("node catalog refresh failed: {error:#}");
                         continue;
                     }
                 };
-                let plan = plan_map_refresh(&mapped, &refreshed.proxies);
+                let mut plan = plan_map_refresh(&mapped, &refreshed.proxies);
+                for (index, proxy) in mapped.iter().enumerate() {
+                    if let Some(replacement) = refreshed.proxies.iter().find(|p| p.name == proxy.name) {
+                        if retired.contains(&index) && !plan.updates.iter().any(|(i, _)| *i == index) {
+                            plan.updates.push((index, replacement.clone()));
+                        }
+                    } else {
+                        routes[index].get().client.close().await;
+                        retired.insert(index);
+                    }
+                }
                 let mut updated = 0;
                 for (index, proxy) in plan.updates {
                     let route = match build_fixed_route(
@@ -1021,6 +1073,7 @@ async fn run_serve_map(args: &[String]) -> Result<()> {
                     };
                     routes[index].replace(route).client.close().await;
                     mapped[index] = proxy;
+                    retired.remove(&index);
                     updated += 1;
                 }
                 if updated > 0 {
@@ -1234,6 +1287,27 @@ async fn api_client(runtime: &RuntimeConfig, network: &NetworkMonitor) -> Result
 
 fn service_network(outbound_ip: IpAddr) -> NetworkMonitor {
     NetworkMonitor::new((!outbound_ip.is_loopback()).then_some(outbound_ip))
+}
+
+async fn wait_network_change(network: &NetworkMonitor, generation: u64) -> u64 {
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let current = network.snapshot().await.generation();
+        if current != generation {
+            return current;
+        }
+    }
+}
+
+fn confirms_revocation(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<crate::nodes::EmptyCatalog>().is_some()
+        || error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<crate::diagnostics::ApiFailure>())
+            .any(|failure| {
+                failure.kind == crate::diagnostics::ErrorKind::Authentication
+                    && failure.status == Some(401)
+            })
 }
 
 fn parse_flags(
@@ -1872,6 +1946,7 @@ mod tests {
             manager,
             disable_filter: false,
             events: crate::diagnostics::EventLog::default(),
+            backoff: Default::default(),
         }
     }
 
@@ -1930,6 +2005,115 @@ mod tests {
         assert_eq!(
             catalog.manager.status().await["catalog"]["refresh_failures"],
             6
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_revocation_is_distinct_from_transient_and_forced_failures() {
+        for empty in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("test.conf");
+            let mut catalog = cached_catalog_for_test(&path).await;
+            let managed = catalog.managed.clone();
+            let original = fs::read(directory.path().join("nodes-cache.yaml")).unwrap();
+            let failure = || -> anyhow::Error {
+                if empty {
+                    crate::nodes::EmptyCatalog.into()
+                } else {
+                    crate::diagnostics::ApiFailure {
+                        kind: crate::diagnostics::ErrorKind::Authentication,
+                        status: Some(401),
+                        retry_after_seconds: None,
+                    }
+                    .into()
+                }
+            };
+            assert!(catalog.finish_refresh(Err(failure()), true).await.is_err());
+            assert_eq!(
+                fs::read(directory.path().join("nodes-cache.yaml")).unwrap(),
+                original
+            );
+            assert!(catalog.manager.provider(true, true).await.is_ok());
+            assert!(catalog.finish_refresh(Err(failure()), false).await.is_err());
+            assert!(catalog.cache.load().is_none());
+            assert!(catalog.managed.proxies.is_empty());
+            assert_eq!(catalog.manager.status().await["ready"], false);
+            assert!(catalog.manager.provider(true, true).await.is_err());
+            assert!(catalog.manager.clash_provider(true, true).await.is_err());
+            assert!(
+                catalog
+                    .manager
+                    .raw_provider(true, "127.0.0.1".parse().unwrap())
+                    .await
+                    .is_err()
+            );
+            catalog
+                .finish_refresh(
+                    Ok(CatalogSnapshot {
+                        managed,
+                        fetched_at: Some(2),
+                        userinfo: None,
+                    }),
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(catalog.manager.status().await["ready"], true);
+            assert!(catalog.cache.load().is_some());
+            assert!(catalog.manager.provider(true, true).await.is_ok());
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let mut catalog = cached_catalog_for_test(&directory.path().join("test.conf")).await;
+        for kind in [
+            crate::diagnostics::ErrorKind::Timeout,
+            crate::diagnostics::ErrorKind::Forbidden,
+            crate::diagnostics::ErrorKind::InvalidResponse,
+        ] {
+            let error = crate::diagnostics::ApiFailure {
+                kind,
+                status: Some(403),
+                retry_after_seconds: None,
+            };
+            assert!(
+                catalog
+                    .finish_refresh(Err(error.into()), false)
+                    .await
+                    .is_err()
+            );
+            assert!(catalog.manager.provider(true, true).await.is_ok());
+            assert!(catalog.cache.load().is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_cooldown_refuses_refresh_without_touching_catalog_or_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut catalog = cached_catalog_for_test(&directory.path().join("test.conf")).await;
+        let original = fs::read(directory.path().join("nodes-cache.yaml")).unwrap();
+        let previous = catalog.manager.current().await.unwrap();
+        let limited = crate::diagnostics::ApiFailure {
+            kind: crate::diagnostics::ErrorKind::RateLimited,
+            status: Some(429),
+            retry_after_seconds: Some(120),
+        }
+        .into();
+        catalog.backoff.record(Some(&limited));
+        let error = catalog.refresh_with_policy(true).await.unwrap_err();
+        assert_eq!(
+            crate::diagnostics::classify(&error),
+            crate::diagnostics::ErrorKind::RateLimited
+        );
+        assert!(Arc::ptr_eq(
+            &previous,
+            &catalog.manager.current().await.unwrap()
+        ));
+        assert_eq!(
+            fs::read(directory.path().join("nodes-cache.yaml")).unwrap(),
+            original
+        );
+        assert_eq!(
+            catalog.manager.status().await["catalog"]["refresh_failures"],
+            0
         );
     }
 
@@ -2039,6 +2223,7 @@ mod tests {
             manager: manager.clone(),
             disable_filter: false,
             events: crate::diagnostics::EventLog::default(),
+            backoff: Default::default(),
         };
         assert!(catalog.refresh().await.is_err());
         assert!(Arc::ptr_eq(&previous, &manager.current().await.unwrap()));

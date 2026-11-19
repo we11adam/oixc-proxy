@@ -53,6 +53,7 @@ pub struct Router {
     raw_filtered: RawNodes,
     raw_all: RawNodes,
     allow_remote_raw_provider: bool,
+    revoked: bool,
 }
 
 pub struct GatewayManager {
@@ -182,6 +183,7 @@ impl Router {
             raw_filtered: RawNodes::new(published),
             raw_all: RawNodes::new(proxies),
             allow_remote_raw_provider: runtime.allow_remote_raw_provider,
+            revoked: false,
         })
     }
 
@@ -274,6 +276,7 @@ impl GatewayManager {
             raw_filtered: RawNodes::new(&proxies[..published]),
             raw_all: RawNodes::new(proxies),
             allow_remote_raw_provider: allow_remote,
+            revoked: false,
         })
     }
 
@@ -365,7 +368,7 @@ impl GatewayManager {
             let router = self.router.read().await;
             router
                 .as_ref()
-                .map(|r| (true, r.runtimes.len(), r.published_count, r.node_statuses(),
+                .map(|r| (!r.revoked, r.runtimes.len(), r.published_count, r.node_statuses(),
                     serde_json::json!({"filtered": r.raw_filtered.skipped, "all": r.raw_all.skipped})))
                 .unwrap_or((false, 0, 0, Vec::new(), serde_json::Value::Null))
         };
@@ -401,6 +404,7 @@ impl GatewayManager {
             .read()
             .await
             .as_ref()
+            .filter(|router| !router.revoked)
             .map(|router| router.provider(include_all, socks))
             .ok_or_else(|| anyhow::anyhow!("gateway unavailable"))
     }
@@ -415,6 +419,9 @@ impl GatewayManager {
         let router = self.current().await?;
         if !raw_peer_allowed(peer, router.allow_remote_raw_provider) {
             return Ok(None);
+        }
+        if router.revoked {
+            bail!("node catalog has been revoked");
         }
         let transport = self.transport.clone();
         let nodes = if include_all {
@@ -442,6 +449,7 @@ impl GatewayManager {
             .read()
             .await
             .as_ref()
+            .filter(|router| !router.revoked)
             .map(|router| router.clash_provider(include_all, socks))
             .ok_or_else(|| anyhow::anyhow!("gateway unavailable"))
     }
@@ -468,6 +476,31 @@ impl GatewayManager {
             .await
             .clone()
             .ok_or_else(|| anyhow::anyhow!("gateway is closed"))
+    }
+
+    pub(crate) async fn revoke(&self) -> Result<()> {
+        let previous = self.current().await?;
+        let docs = ProviderDocs {
+            surge_http: Arc::from([]),
+            surge_socks: Arc::from([]),
+            clash_http: Arc::from([]),
+            clash_socks: Arc::from([]),
+        };
+        self.replace(Router {
+            routes: HashMap::new(),
+            runtimes: HashMap::new(),
+            filtered: docs.clone(),
+            all: docs,
+            routing_secret: previous.routing_secret.clone(),
+            published_count: 0,
+            raw_filtered: RawNodes::new(&[]),
+            raw_all: RawNodes::new(&[]),
+            allow_remote_raw_provider: previous.allow_remote_raw_provider,
+            revoked: true,
+        })
+        .await?;
+        self.update_subscription(None, None).await;
+        Ok(())
     }
 
     pub async fn replace(&self, replacement: Router) -> Result<()> {

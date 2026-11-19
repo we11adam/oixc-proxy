@@ -27,6 +27,8 @@ struct CacheEnvelope {
     fetched_at: Option<u64>,
     #[serde(default)]
     userinfo: serde_json::Value,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    revoked: bool,
 }
 
 pub struct CatalogSnapshot {
@@ -106,6 +108,7 @@ impl CatalogCache {
             managed: managed.clone(),
             fetched_at,
             userinfo: serde_json::to_value(userinfo)?,
+            revoked: false,
         };
         let content = serde_yaml::to_string(&envelope).context("encode node catalog cache")?;
         write_private_atomic(&self.path, content.as_bytes())
@@ -115,6 +118,20 @@ impl CatalogCache {
         if let Err(error) = self.store(managed) {
             eprintln!("node catalog cache write failed: {error:#}");
         }
+    }
+
+    pub(crate) fn revoke(&self) -> Result<()> {
+        let envelope = CacheEnvelope {
+            version: CACHE_FORMAT_VERSION,
+            account_fingerprint: self.account_fingerprint.clone(),
+            managed: ManagedConfig {
+                proxies: Vec::new(),
+            },
+            fetched_at: None,
+            userinfo: serde_json::Value::Null,
+            revoked: true,
+        };
+        write_private_atomic(&self.path, serde_yaml::to_string(&envelope)?.as_bytes())
     }
 
     pub fn store_snapshot_or_log(&self, snapshot: &CatalogSnapshot) {
@@ -152,6 +169,9 @@ fn parse_envelope(content: &[u8], expected_fingerprint: &str) -> Result<CatalogS
             .ct_eq(expected_fingerprint.as_bytes()),
     ) {
         bail!("cache belongs to a different account");
+    }
+    if envelope.revoked {
+        bail!("cached account catalog has been revoked");
     }
     envelope.managed.validate()?;
     let userinfo = serde_json::from_value::<crate::subscription::UserInfo>(envelope.userinfo)

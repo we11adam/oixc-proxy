@@ -5,6 +5,12 @@ use serde::{Deserialize, Serialize};
 
 const MAX_MANAGED_CONFIG_BYTES: usize = 8 << 20;
 
+/// Only a successfully authenticated/decrypted document with an explicitly
+/// empty array is authoritative. An all-invalid array is still a parse failure.
+#[derive(Debug, thiserror::Error)]
+#[error("remote catalog explicitly contains no nodes")]
+pub(crate) struct EmptyCatalog;
+
 #[derive(Clone, Debug, Default)]
 pub struct NodeFilter {
     lines: Vec<String>,
@@ -214,6 +220,9 @@ impl ManagedConfig {
         })?;
         if documents.next().is_some() {
             bail!("managed config contains multiple YAML documents");
+        }
+        if remote.proxies.is_empty() {
+            return Err(EmptyCatalog.into());
         }
         let mut proxies = Vec::with_capacity(remote.proxies.len());
         let mut names = HashSet::with_capacity(remote.proxies.len());
@@ -709,6 +718,16 @@ proxies:
         assert!(ManagedConfig::parse(content.as_bytes()).is_err());
         assert!(ManagedConfig::parse(b"proxies: []\n").is_err());
         assert!(ManagedConfig::parse(b"other: true\n").is_err());
+        assert!(
+            ManagedConfig::parse(b"proxies: []\n")
+                .unwrap_err()
+                .is::<EmptyCatalog>()
+        );
+        assert!(
+            !ManagedConfig::parse(content.as_bytes())
+                .unwrap_err()
+                .is::<EmptyCatalog>()
+        );
     }
 
     #[test]
