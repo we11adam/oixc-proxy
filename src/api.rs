@@ -92,6 +92,9 @@ impl Client {
             .default_headers(headers)
             .user_agent(USER_AGENT);
         if let Some(network) = network {
+            builder = builder.dns_resolver(std::sync::Arc::new(crate::transport::dns::ApiDns(
+                network.clone(),
+            )));
             if let Some(source) = network
                 .preferred_source()
                 .context("select API outbound address")?

@@ -1,3 +1,4 @@
+pub(crate) mod dns;
 mod ech;
 mod private_dns;
 mod trust;

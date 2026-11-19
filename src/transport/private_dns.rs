@@ -9,7 +9,7 @@ use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::{Signer, SigningKey};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tokio::time::timeout;
 
 use crate::network::{NetworkSnapshot, bind_udp_socket};
@@ -22,6 +22,8 @@ const PARTIAL_CACHE_TTL: Duration = Duration::from_secs(30);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 const QUERY_ATTEMPTS: usize = 2;
 const FAMILY_GRACE: Duration = Duration::from_millis(50);
+type SharedAnswer = Option<std::result::Result<Vec<IpAddr>, ()>>;
+type PendingLookups = HashMap<(String, u64), watch::Sender<SharedAnswer>>;
 
 #[derive(Clone)]
 pub struct PrivateDnsResolver {
@@ -29,7 +31,7 @@ pub struct PrivateDnsResolver {
     seed: Arc<[u8; 32]>,
     server: SocketAddr,
     cache: Arc<Mutex<HashMap<String, CacheEntry>>>,
-    lookup_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    pending: Arc<Mutex<PendingLookups>>,
 }
 
 #[derive(Clone)]
@@ -54,7 +56,7 @@ impl PrivateDnsResolver {
                 .parse()
                 .map_err(|_| anyhow::anyhow!("private DNS server is invalid"))?,
             cache: Arc::new(Mutex::new(HashMap::new())),
-            lookup_locks: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -71,16 +73,48 @@ impl PrivateDnsResolver {
             return Ok(Some(addresses));
         }
 
-        let lookup_lock = {
-            let mut locks = self.lookup_locks.lock().await;
-            locks
-                .entry(host.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
+        let key = (host.clone(), network.generation());
+        let mut pending = self.pending.lock().await;
+        let mut rx = if let Some(tx) = pending.get(&key) {
+            tx.subscribe()
+        } else {
+            if pending.len() >= 1024 {
+                bail!("private DNS recovery capacity exceeded");
+            }
+            let (tx, rx) = watch::channel(None);
+            pending.insert(key.clone(), tx.clone());
+            let resolver = self.clone();
+            let network = network.clone();
+            tokio::spawn(async move {
+                let result = timeout(
+                    Duration::from_secs(9),
+                    resolver.lookup_fresh(host, &network),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .ok_or(());
+                tx.send_replace(Some(result));
+                resolver.pending.lock().await.remove(&key);
+            });
+            rx
         };
-        let _lookup_guard = lookup_lock.lock().await;
+        drop(pending);
+        loop {
+            if let Some(result) = rx.borrow_and_update().clone() {
+                return result
+                    .map(Some)
+                    .map_err(|_| anyhow::anyhow!("resolve ECH-TLS node"));
+            }
+            rx.changed()
+                .await
+                .map_err(|_| anyhow::anyhow!("private DNS recovery stopped"))?;
+        }
+    }
+
+    async fn lookup_fresh(&self, host: String, network: &NetworkSnapshot) -> Result<Vec<IpAddr>> {
         if let Some(addresses) = self.cached(&host, network.generation()).await {
-            return Ok(Some(addresses));
+            return Ok(addresses);
         }
 
         let unix_seconds = SystemTime::now()
@@ -94,7 +128,16 @@ impl PrivateDnsResolver {
         if addresses.is_empty() {
             bail!("resolve ECH-TLS node");
         }
-        self.cache.lock().await.insert(
+        let mut cache = self.cache.lock().await;
+        if cache.len() >= 1024 {
+            cache.retain(|_, entry| {
+                entry.expires > Instant::now() && entry.network_generation == network.generation()
+            });
+            if cache.len() >= 1024 {
+                cache.clear();
+            }
+        }
+        cache.insert(
             host,
             CacheEntry {
                 addresses: addresses.clone(),
@@ -107,7 +150,7 @@ impl PrivateDnsResolver {
                 network_generation: network.generation(),
             },
         );
-        Ok(Some(addresses))
+        Ok(addresses)
     }
 
     async fn query(
@@ -122,6 +165,14 @@ impl PrivateDnsResolver {
             {
                 return Ok(result);
             }
+        }
+        if let Ok(Ok(result)) = timeout(
+            QUERY_TIMEOUT,
+            super::dns::query(self.server, name, record_type, network),
+        )
+        .await
+        {
+            return Ok(result);
         }
         bail!("resolve ECH-TLS node")
     }
@@ -199,7 +250,7 @@ impl PrivateDnsResolver {
 /// period once the other has produced addresses. The result is complete only
 /// when both lookups succeeded, so a failed family is retried soon instead of
 /// being cached for the full TTL.
-async fn merge_families<F>(ipv4: F, ipv6: F) -> (Vec<IpAddr>, bool)
+pub(super) async fn merge_families<F>(ipv4: F, ipv6: F) -> (Vec<IpAddr>, bool)
 where
     F: Future<Output = Result<Vec<IpAddr>>>,
 {
@@ -225,7 +276,11 @@ where
 
 /// Parses a reply to `query`. `Ok(None)` means the packet does not answer
 /// this query and should be ignored; errors are failures worth retrying.
-fn parse_response(response: &[u8], id: u16, query: &Query) -> Result<Option<Vec<IpAddr>>> {
+pub(super) fn parse_response(
+    response: &[u8],
+    id: u16,
+    query: &Query,
+) -> Result<Option<Vec<IpAddr>>> {
     let Ok(response) = Message::from_vec(response) else {
         return Ok(None);
     };

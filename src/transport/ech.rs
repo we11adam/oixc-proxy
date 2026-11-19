@@ -14,7 +14,7 @@ use rustls::crypto::CryptoProvider;
 use rustls::internal::msgs::codec::Codec as _;
 use rustls::pki_types::{EchConfigListBytes, ServerName};
 use rustls::{CertificateError, ClientConfig, PeerIncompatible, ProtocolVersion};
-use tokio::net::{TcpSocket, TcpStream, lookup_host};
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::task::JoinSet;
 use tokio::time::{Instant as TokioInstant, Sleep, sleep, timeout};
 use tokio_rustls::TlsConnector;
@@ -655,10 +655,12 @@ async fn resolve_addresses(
             .into_iter()
             .map(|ip| SocketAddr::new(ip, port))
             .collect()),
-        None => lookup_host((host, port))
-            .await
-            .map(|addresses| addresses.collect())
-            .map_err(|error| anyhow::Error::new(error).context("resolve ECH-TLS node")),
+        None => Ok(super::dns::DirectDns::shared()
+            .lookup(host, network)
+            .await?
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect()),
     }
 }
 
