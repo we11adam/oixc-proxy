@@ -37,6 +37,9 @@ jobs:
         shell: bash
         run: cargo +1.99.1 test --locked --all-features
 
+      - name: Test installer restart and rollback
+        run: python3 tests/install_restart.py
+
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}

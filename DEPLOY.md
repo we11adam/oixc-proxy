@@ -40,10 +40,22 @@ sh install.sh
 下载脚本。OpenWrt 没有 `gh` 时，先在已认证的控制机下载并校验对应资产，
 再通过 `scp -O` 传入设备。
 
-固定版本用 `sh install.sh --version v0.4.0`。OpenWrt 的 procd 配置默认使用
-`/usr/bin/oixc-proxy`，因此传入 `--install-dir /usr/bin`。脚本只安装二进制，
-不会创建配置、安装服务或重启现有进程；首次安装继续按对应平台章节操作，
-更新已有服务则在安装后按对应章节重启并检查健康端点。
+固定版本用 `sh install.sh --version v0.11.0`。OpenWrt 的 procd 配置默认使用
+`/usr/bin/oixc-proxy`，因此传入 `--install-dir /usr/bin`。首次安装后按对应平台章节配置服务。
+
+### 一条命令升级现有服务
+
+从 v0.11.0 起，安装脚本可以升级正在运行的 macOS launchd 或 Linux systemd 服务。用服务用户运行脚本，目标机需有 `curl` 和 `lsof`。
+
+```sh
+sh install.sh --version v0.11.0 --restart
+```
+
+默认使用当前用户的 `gui/<uid>/io.oixc.proxy` 或 `user/oixc-proxy.service`，并访问 `http://127.0.0.1:6173`。系统级服务用 `--service-target system/io.oixc.proxy`（macOS）或 `--service-target system/oixc-proxy.service`（Linux）。脚本按需调用 sudo。自定义订阅端口用 `--nodelist-url` 指定实际监听地址，例如 `http://127.0.0.1:6177`。自定义二进制目录用 `--install-dir` 指定，与服务使用的路径一致。
+
+脚本先验证旧进程和订阅端点，再原子替换二进制。macOS 通过 SIGTERM 让旧进程退出后再启动，Linux 通过 systemd 重启并要求停止信号为 SIGTERM 或 SIGINT。新进程须使用相同的 TCP 监听地址，且 `/healthz` 返回 204、订阅返回 200。失败时脚本恢复 `oixc-proxy.previous` 并再次验证服务，退出码仍为非零。系统级和用户级服务均使用已有配置。
+
+OpenWrt 通过 [procd 更新流程](#openwrt斐讯-n1) 重启服务。单独运行 `install.sh` 会安装二进制。修改端口时仍按对应平台的服务章节重启。
 
 从源码构建需要 Rust 工具链（1.99.1 或更新），`cargo --version` 可运行；仓库、CI 和 release 固定使用 1.99.1。使用已编译的 Release 不需要安装 Rust。
 未安装时用 [rustup](https://rustup.rs/)：
