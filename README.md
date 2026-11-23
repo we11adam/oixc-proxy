@@ -22,11 +22,11 @@ sh install.sh
 安装脚本会检测主机目标平台，用 Release 中的 `SHA256SUMS` 验证压缩包，检查二进制版本，并以原子方式安装到 `/usr/local/bin/oixc-proxy`。可通过以下命令安装指定版本或安装到用户可写目录：
 
 ```sh
-sh install.sh --version v0.10.0
+sh install.sh --version v0.11.0
 sh install.sh --install-dir "$HOME/.local/bin"
 ```
 
-安装脚本只安装二进制，不会创建配置、安装服务或重启现有进程。接下来可按照下方平台服务说明操作，也可查阅完整的[部署指南](DEPLOY.md)。
+默认安装二进制。macOS 和 Linux 的现有服务可用 `sh install.sh --version v0.11.0 --restart` 一次完成更新、优雅重启和健康检查，失败时自动回滚。使用自定义端口或系统级服务时，参见[部署指南](DEPLOY.md#一条命令升级现有服务)。
 
 Windows 从 v0.7.0 起提供 [`install.ps1`](install.ps1) 和 x64 发布包，支持校验发布资产及安装原生 Windows 服务；见[Windows 部署说明](#在-windows-上安装服务)。旧版 Release 没有 Windows 产物。
 
@@ -39,7 +39,7 @@ Windows 从 v0.7.0 起提供 [`install.ps1`](install.ps1) 和 x64 发布包，�
 ```text
 使用 $oixc-proxy-deploy 将最新 Release 安装到本机，并验证版本和健康状态。
 
-使用 $oixc-proxy-deploy 将 v0.10.0 更新到 root@router.lan，保留现有配置和服务方式，
+使用 $oixc-proxy-deploy 将 root@router.lan 更新到 v0.11.0，保留现有配置和服务方式，
 并验证新 PID、监听端口、/healthz 与 provider 端点；失败时回滚。
 
 使用 $oixc-proxy-deploy 发布 Cargo.toml 中的当前版本，

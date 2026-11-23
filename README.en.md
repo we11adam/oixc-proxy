@@ -42,13 +42,14 @@ release `SHA256SUMS`, checks the binary version and atomically installs
 with:
 
 ```sh
-sh install.sh --version v0.10.0
+sh install.sh --version v0.11.0
 sh install.sh --install-dir "$HOME/.local/bin"
 ```
 
-It installs only the binary; it does not create a config, install a service or
-restart an existing process. Continue with the platform service instructions
-below or the complete [deployment guide](DEPLOY.md).
+By default, the script installs the binary. On macOS and Linux, run
+`sh install.sh --version v0.11.0 --restart` to upgrade an existing launchd
+or systemd service, restart it gracefully, and roll back if health checks fail.
+For custom listeners or system services, see the [deployment guide](DEPLOY.md#一条命令升级现有服务).
 
 Windows uses [`install.ps1`](install.ps1), with optional native Windows service
 installation; see [Windows setup](#install-on-windows). Windows assets will be
@@ -68,7 +69,7 @@ Example prompts:
 Use $oixc-proxy-deploy to install the latest Release locally, then verify the
 version and health status.
 
-Use $oixc-proxy-deploy to update root@router.lan to v0.10.0. Preserve its
+Use $oixc-proxy-deploy to update root@router.lan to v0.11.0. Preserve its
 existing config and service mechanism; verify the new PID, listeners, /healthz,
 and provider endpoint, and roll back on failure.
 

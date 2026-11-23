@@ -4,7 +4,11 @@
 
 本文件记录 `oixc-proxy` 各版本中值得注意的变更。版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.11.0] - 2026-11-24
+
+### 新功能
+
+- `install.sh --restart` 可更新正在运行的 macOS launchd 和 Linux systemd 服务。原子替换二进制后优雅重启，验证新 PID、监听地址和 HTTP 端点，失败时自动恢复旧二进制并验证服务。
 
 ### 修复
 
@@ -214,6 +218,7 @@
 - DNS 与 TCP 竞速：共享传输上下文、合并签名 DNS 查询、A/AAAA 并发查询、错开的连接尝试。
 - 拨号时间预算、采样的性能 tracing 和连接复用调优。
 
+[0.11.0]: https://github.com/we11adam/oixc-proxy/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/we11adam/oixc-proxy/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/we11adam/oixc-proxy/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/we11adam/oixc-proxy/compare/v0.7.0...v0.8.0
