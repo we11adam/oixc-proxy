@@ -18,10 +18,14 @@ use serde::{Deserialize, Serialize};
 const MAX_LINE: usize = 1024;
 static ACTIVE: OnceLock<Arc<Counters>> = OnceLock::new();
 
+#[repr(align(64))]
+#[derive(Default)]
+struct AlignedCounter(AtomicU64);
+
 #[derive(Default)]
 struct Counters {
     enabled: AtomicBool,
-    values: [AtomicU64; 4],
+    values: [AlignedCounter; 4],
 }
 
 #[derive(Clone, Copy)]
@@ -37,17 +41,19 @@ pub(crate) fn record(direction: Direction, bytes: usize) {
         && let Some(counters) = ACTIVE.get()
         && counters.enabled.load(Ordering::Relaxed)
     {
-        counters.values[direction as usize].fetch_add(bytes as u64, Ordering::Relaxed);
+        counters.values[direction as usize]
+            .0
+            .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 }
 
 impl Counters {
     fn snapshot(&self) -> Bytes {
         Bytes {
-            tcp_upload: self.values[0].load(Ordering::Relaxed),
-            tcp_download: self.values[1].load(Ordering::Relaxed),
-            udp_upload: self.values[2].load(Ordering::Relaxed),
-            udp_download: self.values[3].load(Ordering::Relaxed),
+            tcp_upload: self.values[0].0.load(Ordering::Relaxed),
+            tcp_download: self.values[1].0.load(Ordering::Relaxed),
+            udp_upload: self.values[2].0.load(Ordering::Relaxed),
+            udp_download: self.values[3].0.load(Ordering::Relaxed),
         }
     }
 }
@@ -774,15 +780,15 @@ mod tests {
             previous: Bytes::default(),
             since: 0,
         };
-        counters.values[0].store(100, Ordering::Relaxed);
+        counters.values[0].0.store(100, Ordering::Relaxed);
         sampler.flush(&mut journal, &counters, 60).unwrap();
-        counters.values[0].store(250, Ordering::Relaxed);
+        counters.values[0].0.store(250, Ordering::Relaxed);
         journal.poisoned = true; // Simulate persistent IO failure.
         assert!(sampler.flush(&mut journal, &counters, 120).is_err());
         assert_eq!(sampler.since, 60);
         assert_eq!(sampler.previous.tcp_upload, 100);
         journal.poisoned = false;
-        counters.values[0].store(400, Ordering::Relaxed);
+        counters.values[0].0.store(400, Ordering::Relaxed);
         sampler.flush(&mut journal, &counters, 180).unwrap();
         sampler.flush(&mut journal, &counters, 181).unwrap();
         let all = query(&path, None, None).unwrap();
@@ -798,7 +804,7 @@ mod tests {
         let journal = Journal::open(&path).unwrap();
         let counters = Arc::new(Counters::default());
         for (index, counter) in counters.values.iter().enumerate() {
-            counter.store((index + 1) as u64, Ordering::Relaxed);
+            counter.0.store((index + 1) as u64, Ordering::Relaxed);
         }
         let (sender, stop) = mpsc::channel();
         sender.send(()).unwrap();
