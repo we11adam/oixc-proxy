@@ -524,6 +524,15 @@ impl GatewayManager {
             previous.retire_exclusive_runtimes(None).await;
         }
     }
+
+    pub async fn prune_idle(&self, network_generation: u64) {
+        let Some(router) = self.router.read().await.clone() else {
+            return;
+        };
+        for runtime in router.runtimes.values() {
+            runtime.route.client.prune_idle(network_generation).await;
+        }
+    }
 }
 
 fn raw_peer_allowed(peer: IpAddr, allow_remote: bool) -> bool {

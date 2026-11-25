@@ -84,6 +84,12 @@ impl Client {
             Self::AnyTls(c) => c.close().await,
         }
     }
+    pub async fn prune_idle(&self, network_generation: u64) {
+        match self {
+            Self::Snell(c) => c.prune_idle(network_generation).await,
+            Self::AnyTls(c) => c.prune_idle(network_generation).await,
+        }
+    }
 }
 pub enum Session {
     Snell(snell::SnellSession),

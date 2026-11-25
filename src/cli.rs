@@ -26,6 +26,8 @@ use crate::transport::TransportContext;
 use crate::upstream::Client;
 
 const SERVE_MAP_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
+const IDLE_PRUNE_INTERVAL: Duration = Duration::from_secs(30);
+const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 const USAGE: &str = "Usage:
   oixc-proxy traffic [--config PATH | --file PATH] [--all] [--from TIME] [--to TIME] [--json]
@@ -252,9 +254,37 @@ async fn run_with_traffic(args: &[String], map: bool) -> Result<()> {
     );
     let shutdown = shutdown_signal()?;
     let recorder = crate::traffic::Recorder::start(&path)?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut signal_task = tokio::spawn(async move {
+        let result = shutdown.await;
+        let _ = shutdown_tx.send(true);
+        result
+    });
+    let mut service_task = tokio::spawn({
+        let args = args.to_vec();
+        async move {
+            if map {
+                run_serve_map(&args, shutdown_rx).await
+            } else {
+                run_serve(&args, shutdown_rx).await
+            }
+        }
+    });
     let result = tokio::select! {
-        result = async { if map { run_serve_map(args).await } else { run_serve(args).await } } => result,
-        result = shutdown => result,
+        result = &mut service_task => {
+            signal_task.abort();
+            result.context("service task failed")?
+        }
+        signal = &mut signal_task => {
+            let signal = signal.context("shutdown signal task failed")?;
+            let _ = tokio::time::timeout(
+                SHUTDOWN_CLOSE_TIMEOUT + Duration::from_secs(1),
+                &mut service_task,
+            )
+            .await;
+            service_task.abort();
+            signal
+        }
     };
     let saved = tokio::task::spawn_blocking(move || recorder.stop())
         .await
@@ -673,7 +703,10 @@ impl CatalogService {
     }
 }
 
-async fn run_serve(args: &[String]) -> Result<()> {
+async fn run_serve(
+    args: &[String],
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     rlimit::raise_nofile_limit();
     let default = default_proxy_config_path()?;
     let flags = serve_flags(args, false)?;
@@ -791,8 +824,17 @@ async fn run_serve(args: &[String]) -> Result<()> {
         backoff: Default::default(),
     };
     let mut network_generation = catalog.network.snapshot().await.generation();
+    let mut prune_idle = tokio::time::interval(IDLE_PRUNE_INTERVAL);
+    prune_idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    prune_idle.tick().await;
     loop {
-        let request = tokio::select! {
+        enum LoopEvent {
+            Control(crate::control::Request),
+            Refresh,
+            PruneIdle,
+            Shutdown,
+        }
+        let event = tokio::select! {
             result = &mut socks_task => {
                 return result.context("SOCKS5 server task failed")?;
             }
@@ -800,15 +842,33 @@ async fn run_serve(args: &[String]) -> Result<()> {
                 return result.context("nodelist HTTP task failed")?;
             }
             result = control.finished() => return result,
-            request = control_rx.recv() => Some(request.context("service control queue closed")?),
-            _ = refresh.tick() => None,
-            _ = catalog_refresh.notified() => None,
-            _ = catalog.backoff.wait() => None,
+            _ = shutdown.changed() => LoopEvent::Shutdown,
+            request = control_rx.recv() => LoopEvent::Control(request.context("service control queue closed")?),
+            _ = refresh.tick() => LoopEvent::Refresh,
+            _ = catalog_refresh.notified() => LoopEvent::Refresh,
+            _ = catalog.backoff.wait() => LoopEvent::Refresh,
+            _ = prune_idle.tick() => LoopEvent::PruneIdle,
             generation = wait_network_change(&catalog.network, network_generation) => {
                 network_generation = generation;
                 catalog.backoff.network_changed();
-                None
+                manager.prune_idle(network_generation).await;
+                LoopEvent::Refresh
             },
+        };
+        let request = match event {
+            LoopEvent::Shutdown => {
+                socks_task.abort();
+                http_task.abort();
+                let _ = tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, manager.close()).await;
+                return Ok(());
+            }
+            LoopEvent::PruneIdle => {
+                let current_gen = catalog.network.snapshot().await.generation();
+                manager.prune_idle(current_gen).await;
+                continue;
+            }
+            LoopEvent::Refresh => None,
+            LoopEvent::Control(request) => Some(request),
         };
         if request
             .as_ref()
@@ -894,7 +954,10 @@ async fn run_serve(args: &[String]) -> Result<()> {
     }
 }
 
-async fn run_serve_map(args: &[String]) -> Result<()> {
+async fn run_serve_map(
+    args: &[String],
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     rlimit::raise_nofile_limit();
     let flags = serve_flags(args, true)?;
     let disable_node_filter = flags.contains_key("disable-node-filter");
@@ -1015,10 +1078,28 @@ async fn run_serve_map(args: &[String]) -> Result<()> {
     let mut network_generation = network.snapshot().await.generation();
     let mut refresh = tokio::time::interval(SERVE_MAP_REFRESH_INTERVAL);
     refresh.tick().await;
+    let mut prune_idle = tokio::time::interval(IDLE_PRUNE_INTERVAL);
+    prune_idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    prune_idle.tick().await;
     loop {
         tokio::select! {
             error = error_rx.recv() => {
                 return error.context("SOCKS5 map listener stopped")?;
+            }
+            _ = shutdown.changed() => {
+                let _ = tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, async {
+                    for route in &routes {
+                        route.get().client.close().await;
+                    }
+                })
+                .await;
+                return Ok(());
+            }
+            _ = prune_idle.tick() => {
+                let current_gen = network.snapshot().await.generation();
+                for route in &routes {
+                    route.get().client.prune_idle(current_gen).await;
+                }
             }
             _ = async {
                 tokio::select! {
@@ -1028,6 +1109,9 @@ async fn run_serve_map(args: &[String]) -> Result<()> {
                     generation = wait_network_change(&network, network_generation) => {
                         network_generation = generation;
                         backoff.network_changed();
+                        for route in &routes {
+                            route.get().client.prune_idle(network_generation).await;
+                        }
                     },
                 }
             } => {

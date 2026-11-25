@@ -399,6 +399,30 @@ impl SnellClient {
         }
     }
 
+    pub async fn prune_idle(&self, network_generation: u64) {
+        if !self.inner.options.reuse {
+            return;
+        }
+        let mut stale = Vec::new();
+        {
+            let mut idle = self.inner.idle.lock().await;
+            let mut kept = Vec::with_capacity(idle.len());
+            for entry in idle.drain(..) {
+                if entry.idle_since.elapsed() <= self.inner.options.idle_timeout
+                    && entry.physical.network_generation == network_generation
+                {
+                    kept.push(entry);
+                } else {
+                    stale.push(entry);
+                }
+            }
+            *idle = kept;
+        }
+        for entry in stale {
+            tokio::spawn(entry.physical.retire());
+        }
+    }
+
     async fn open_tcp(&self, host: &str, port: u16, reuse: bool) -> Result<PhysicalConnection> {
         let request = build_connect_request(host, port, reuse)?;
         self.open_command(&request, true).await
@@ -654,7 +678,7 @@ impl SnellPacketSession {
 
     pub async fn close(self) {
         let mut writer = self.writer.into_inner();
-        let _ = writer.records.shutdown().await;
+        let _ = timeout(RETIRE_TIMEOUT, writer.records.shutdown()).await;
     }
 }
 
