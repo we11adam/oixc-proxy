@@ -532,13 +532,17 @@ async fn drive_relay(
     }
 }
 
+// Align upload reads to an exact multiple of Snell's 16383-byte maximum record
+// payload so full reads never emit a tiny 2-byte trailing encrypted record.
+const UPLOAD_BUFFER_SIZE: usize = 4 * 16_383;
+
 async fn upload(
     mut client: OwnedReadHalf,
     mut session: SnellSessionWriter<'_>,
     mut stop: oneshot::Receiver<()>,
     activity: &Activity,
 ) -> Result<UploadEnd> {
-    let mut buffer = vec![0u8; 32 << 10];
+    let mut buffer = vec![0u8; UPLOAD_BUFFER_SIZE];
     let mut first_data = true;
     loop {
         let read = tokio::select! {
@@ -603,7 +607,10 @@ async fn serve_udp_associate(mut client: TcpStream, route: Route, options: Optio
         }
     };
     write_reply(&mut client, 0, Some(advertised)).await?;
-    let control_ip = client.peer_addr().ok().map(|address| address.ip());
+    let control_ip = client
+        .peer_addr()
+        .ok()
+        .map(|address| canonical_ip(address.ip()));
     let client_address = Arc::new(Mutex::new(None::<SocketAddr>));
     let activity = Activity::new();
 
@@ -689,6 +696,13 @@ fn is_datagram_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<DatagramError>().is_some()
 }
 
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+    }
+}
+
 async fn udp_client_loop(
     local: Arc<UdpSocket>,
     upstream: Arc<SnellPacketSession>,
@@ -699,7 +713,7 @@ async fn udp_client_loop(
     let mut buffer = vec![0u8; 64 << 10];
     loop {
         let (length, source) = local.recv_from(&mut buffer).await?;
-        if control_ip.is_some_and(|ip| source.ip() != ip) {
+        if control_ip.is_some_and(|ip| canonical_ip(source.ip()) != ip) {
             continue;
         }
         let mut allowed = client_address.lock().await;
@@ -1035,5 +1049,15 @@ mod tests {
         assert_eq!(advertised.port(), start + 1);
         drop(occupied);
         drop(socket);
+    }
+
+    #[test]
+    fn canonical_ip_normalizes_ipv4_mapped_ipv6() {
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        let v4: IpAddr = "127.0.0.1".parse().unwrap();
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(canonical_ip(mapped), v4);
+        assert_eq!(canonical_ip(v4), v4);
+        assert_eq!(canonical_ip(v6), v6);
     }
 }

@@ -17,6 +17,7 @@ use crate::upstream::{
 const BODY_BATCH_SIZE: usize = 32 << 10;
 const CHUNK_LINE_LIMIT: usize = 4 << 10;
 const TRAILER_LIMIT: usize = 8 << 10;
+const REQUEST_HEAD_LIMIT: usize = 32 << 10;
 const RESPONSE_HEAD_LIMIT: usize = 64 << 10;
 const LINGER_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -141,7 +142,7 @@ async fn relay_one_request(
     let mut request =
         BufReader::with_capacity(BODY_BATCH_SIZE, Cursor::new(leftover).chain(client_read));
     let activity = Activity::new();
-    let clean = {
+    let (clean, linger_client) = {
         let (remote_read, remote_write) = session.split();
         let mut sink = ActiveSink {
             writer: remote_write,
@@ -156,25 +157,33 @@ async fn relay_one_request(
         let relay = async {
             tokio::pin!(upload, download);
             tokio::select! {
-                upload_result = &mut upload => upload_result.is_ok() && download.await.is_ok(),
+                upload_result = &mut upload => {
+                    let ok = upload_result.is_ok() && download.await.is_ok();
+                    (ok, ok)
+                }
                 download_result = &mut download => {
-                    let _ = download_result;
-                    false
+                    // Origin may reject an upload early (e.g. 401/413) and close
+                    // before the request body finishes. Retire the upstream, but
+                    // still drain client input briefly so kernel RST does not
+                    // wipe the already-delivered response.
+                    (false, download_result.is_ok())
                 }
             }
         };
         socks5::until_idle(relay, &activity, idle_timeout)
             .await
-            .unwrap_or(false)
+            .unwrap_or((false, false))
     };
     session.finish(clean, false).await;
     crate::perftrace::stage("http.relay", started, clean, &[]);
+    if linger_client {
+        // Closing a socket with unread input makes the kernel send RST, which can
+        // destroy response bytes the client has not read yet.
+        let _ = timeout(LINGER_TIMEOUT, discard_until_eof(&mut request)).await;
+    }
     if !clean {
         bail!("HTTP proxy relay ended with an error");
     }
-    // Closing a socket with unread input makes the kernel send RST, which can
-    // destroy response bytes the client has not read yet.
-    let _ = timeout(LINGER_TIMEOUT, discard_until_eof(&mut request)).await;
     Ok(())
 }
 
@@ -508,24 +517,29 @@ enum BodyFraming {
 
 async fn read_proxy_request(client: &mut TcpStream, first_byte: u8) -> Result<ParsedRequest> {
     let mut request = vec![first_byte];
-    let mut buffer = [0u8; 1024];
-    loop {
-        if request.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
+    let mut buffer = [0u8; 4096];
+    let mut searched = 0usize;
+    let split = loop {
+        if let Some(pos) = request[searched..]
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+        {
+            let split = searched + pos;
+            if split > REQUEST_HEAD_LIMIT {
+                bail!("HTTP proxy request headers are too large");
+            }
+            break split;
         }
+        if request.len() > REQUEST_HEAD_LIMIT {
+            bail!("HTTP proxy request headers are too large");
+        }
+        searched = request.len().saturating_sub(3);
         let read = client.read(&mut buffer).await?;
         if read == 0 {
             bail!("unexpected EOF in HTTP proxy request");
         }
         request.extend_from_slice(&buffer[..read]);
-        if request.len() > 8 << 10 {
-            bail!("HTTP proxy request headers are too large");
-        }
-    }
-    let split = request
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| anyhow::anyhow!("HTTP proxy request is truncated"))?;
+    };
     let leftover = request[split + 4..].to_vec();
     let text = std::str::from_utf8(&request[..split])
         .map_err(|_| anyhow::anyhow!("HTTP proxy request is not valid UTF-8"))?;
@@ -1229,5 +1243,37 @@ mod tests {
             );
         }
         assert!(forward(b"short", BodyFraming::Length(6)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn accepts_large_headers_with_pipelined_body_and_rejects_oversized_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let big_cookie = "a".repeat(10_000);
+        let payload = format!(
+            "POST http://example.com/upload HTTP/1.1\r\nHost: example.com\r\nCookie: {big_cookie}\r\nContent-Length: 5\r\n\r\nhello"
+        );
+        let sender = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream.write_all(payload.as_bytes()).await.unwrap();
+        });
+        let (mut server, _) = listener.accept().await.unwrap();
+        let first = server.read_u8().await.unwrap();
+        let parsed = read_proxy_request(&mut server, first).await.unwrap();
+        assert_eq!(parsed.leftover, b"hello");
+        sender.await.unwrap();
+
+        let huge = format!(
+            "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nX-Huge: {}\r\n\r\n",
+            "b".repeat(REQUEST_HEAD_LIMIT + 100)
+        );
+        let sender = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let _ = stream.write_all(huge.as_bytes()).await;
+        });
+        let (mut server, _) = listener.accept().await.unwrap();
+        let first = server.read_u8().await.unwrap();
+        assert!(read_proxy_request(&mut server, first).await.is_err());
+        sender.await.unwrap();
     }
 }
