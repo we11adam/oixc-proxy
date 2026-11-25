@@ -39,9 +39,16 @@ pub struct EchConnection {
     pub network_generation: u64,
 }
 
+struct CachedAnyTlsConfigs {
+    generation: u64,
+    plain: Arc<ClientConfig>,
+    cdn_outer: Arc<ClientConfig>,
+}
+
 pub struct TransportContext {
     roots: Arc<TrustStore>,
     provider: Arc<CryptoProvider>,
+    anytls_configs: Mutex<Option<CachedAnyTlsConfigs>>,
     resolver: PrivateDnsResolver,
     network: NetworkMonitor,
     pub catalog_refresh: Arc<CatalogRefresh>,
@@ -75,9 +82,44 @@ impl TransportContext {
     #[cfg(test)]
     pub(crate) async fn test_roots(&self, roots: rustls::RootCertStore) {
         self.roots.replace_for_test(roots).await;
+        *self
+            .anytls_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
     pub(crate) async fn network_generation(&self) -> u64 {
         self.network.snapshot().await.generation()
+    }
+
+    fn anytls_tls_configs(
+        &self,
+        trust: &TrustSnapshot,
+    ) -> Result<(Arc<ClientConfig>, Arc<ClientConfig>)> {
+        let mut cached = self
+            .anytls_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = &*cached
+            && entry.generation == trust.generation
+        {
+            return Ok((entry.plain.clone(), entry.cdn_outer.clone()));
+        }
+        let build = |alpn: Vec<Vec<u8>>| -> Result<Arc<ClientConfig>> {
+            let mut config = ClientConfig::builder_with_provider(self.provider.clone())
+                .with_safe_default_protocol_versions()?
+                .with_root_certificates(trust.roots.clone())
+                .with_no_client_auth();
+            config.alpn_protocols = alpn;
+            Ok(Arc::new(config))
+        };
+        let plain = build(Vec::new())?;
+        let cdn_outer = build(vec![b"http/1.1".to_vec()])?;
+        *cached = Some(CachedAnyTlsConfigs {
+            generation: trust.generation,
+            plain: plain.clone(),
+            cdn_outer: cdn_outer.clone(),
+        });
+        Ok((plain, cdn_outer))
     }
 
     /// AnyTLS uses ordinary verified TLS, and a second TLS layer for CDN nodes.
@@ -85,9 +127,13 @@ impl TransportContext {
     pub(crate) async fn dial_anytls(
         &self,
         proxy: &Proxy,
+        last_success: &Mutex<Option<(u64, SocketAddr)>>,
     ) -> Result<(super::websocket::BoxStream, SocketAddr, u64)> {
         let before = self.roots.snapshot().await;
-        match self.dial_anytls_with_roots(proxy, &before).await {
+        match self
+            .dial_anytls_with_roots(proxy, &before, last_success)
+            .await
+        {
             Err(error)
                 if error.chain().any(|cause| {
                     cause
@@ -96,7 +142,12 @@ impl TransportContext {
                 }) =>
             {
                 let after = self.roots.refresh(before.generation).await;
-                self.dial_anytls_with_roots(proxy, &after).await
+                if after.generation != before.generation {
+                    self.dial_anytls_with_roots(proxy, &after, last_success)
+                        .await
+                } else {
+                    Err(error)
+                }
             }
             result => result,
         }
@@ -106,18 +157,27 @@ impl TransportContext {
         &self,
         proxy: &Proxy,
         trust: &TrustSnapshot,
+        last_success: &Mutex<Option<(u64, SocketAddr)>>,
     ) -> Result<(super::websocket::BoxStream, SocketAddr, u64)> {
         let network = self.network.snapshot().await;
         let addresses =
             resolve_addresses(&self.resolver, &network, &proxy.server, proxy.port).await?;
+        let preferred = last_success
+            .lock()
+            .ok()
+            .and_then(|value| value.filter(|(generation, _)| *generation == network.generation()))
+            .map(|(_, address)| address);
         let addresses = interleave_addresses(
             addresses
                 .into_iter()
                 .filter(|a| network.supports(*a))
                 .collect(),
-            None,
+            preferred,
         );
-        let (raw, _) = connect_happy_eyeballs(addresses, network.clone()).await?;
+        let (raw, connected_addr) = connect_happy_eyeballs(addresses, network.clone()).await?;
+        if let Ok(mut guard) = last_success.lock() {
+            *guard = Some((network.generation(), connected_addr));
+        }
         raw.set_nodelay(true)?;
         let local = raw.local_addr()?;
         let sni = if proxy.obfs.sni.is_empty() {
@@ -125,20 +185,13 @@ impl TransportContext {
         } else {
             &proxy.obfs.sni
         };
-        let config = |alpn: Vec<Vec<u8>>| -> Result<TlsConnector> {
-            let mut config = ClientConfig::builder_with_provider(self.provider.clone())
-                .with_safe_default_protocol_versions()?
-                .with_root_certificates(trust.roots.as_ref().clone())
-                .with_no_client_auth();
-            config.alpn_protocols = alpn;
-            Ok(TlsConnector::from(Arc::new(config)))
-        };
+        let (plain_config, cdn_outer_config) = self.anytls_tls_configs(trust)?;
         let stream: super::websocket::BoxStream = if let Some(path) = proxy
             .anytls
             .as_ref()
             .and_then(|o| o.websocket_path.as_ref())
         {
-            let outer = config(vec![b"http/1.1".to_vec()])?
+            let outer = TlsConnector::from(cdn_outer_config)
                 .connect(
                     ServerName::try_from(proxy.server.clone())
                         .map_err(|_| anyhow::anyhow!("invalid AnyTLS CDN name"))?,
@@ -155,7 +208,7 @@ impl TransportContext {
             }
             let ws = super::websocket::upgrade(outer, &proxy.server, path).await?;
             Box::new(
-                config(Vec::new())?
+                TlsConnector::from(plain_config)
                     .connect(
                         ServerName::try_from(sni.clone())
                             .map_err(|_| anyhow::anyhow!("invalid AnyTLS SNI"))?,
@@ -165,7 +218,7 @@ impl TransportContext {
             )
         } else {
             Box::new(
-                config(Vec::new())?
+                TlsConnector::from(plain_config)
                     .connect(
                         ServerName::try_from(sni.clone())
                             .map_err(|_| anyhow::anyhow!("invalid AnyTLS SNI"))?,
@@ -204,6 +257,7 @@ impl TransportContext {
         Ok(Self {
             roots: Arc::new(TrustStore::new()?),
             provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+            anytls_configs: Mutex::new(None),
             resolver: PrivateDnsResolver::built_in()?,
             network,
             catalog_refresh: Arc::new(CatalogRefresh::default()),

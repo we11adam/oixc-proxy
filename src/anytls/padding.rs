@@ -4,22 +4,26 @@ use std::collections::BTreeMap;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 const DEFAULT: &str = "stop=8\n0=30-30\n1=100-400\n2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000\n3=9-9,500-1000\n4=500-1000\n5=500-1000\n6=500-1000\n7=500-1000";
+
 #[derive(Clone)]
 pub(super) struct Scheme {
     pub hash: String,
     stop: u32,
     entries: BTreeMap<u32, Vec<Entry>>,
 }
+
 #[derive(Clone)]
 enum Entry {
     Check,
     Range(usize, usize),
 }
+
 impl Default for Scheme {
     fn default() -> Self {
         Self::parse(DEFAULT.as_bytes()).expect("built-in AnyTLS padding")
     }
 }
+
 impl Scheme {
     pub fn parse(raw: &[u8]) -> Result<Self> {
         if raw.len() > 8192 {
@@ -72,6 +76,11 @@ impl Scheme {
             entries,
         })
     }
+
+    pub fn stop(&self) -> u32 {
+        self.stop
+    }
+
     pub fn sizes(&self, index: u32) -> Result<Vec<Option<usize>>> {
         if index >= self.stop {
             return Ok(Vec::new());
@@ -85,15 +94,17 @@ impl Scheme {
                 Entry::Range(lo, hi) => Ok(Some(if lo == hi {
                     *lo
                 } else {
-                    *lo + random(*hi - *lo)?
+                    *lo + random(*hi - *lo + 1)?
                 })),
             })
             .collect()
     }
+
     pub fn authentication_padding(&self) -> Result<usize> {
         Ok(self.sizes(0)?.into_iter().flatten().next().unwrap_or(0))
     }
 }
+
 fn random(limit: usize) -> Result<usize> {
     let mut bytes = [0; 8];
     getrandom::fill(&mut bytes).map_err(|_| anyhow::anyhow!("generate AnyTLS padding"))?;
@@ -106,7 +117,16 @@ pub(super) async fn write<W: AsyncWrite + Unpin>(
     index: u32,
     mut data: &[u8],
 ) -> Result<()> {
-    for size in scheme.sizes(index)? {
+    if index >= scheme.stop {
+        if !data.is_empty() {
+            writer.write_all(data).await?;
+        }
+        writer.flush().await?;
+        return Ok(());
+    }
+    let sizes = scheme.sizes(index)?;
+    let mut scratch = Vec::new();
+    for size in sizes {
         let Some(size) = size else {
             if data.is_empty() {
                 break;
@@ -116,21 +136,37 @@ pub(super) async fn write<W: AsyncWrite + Unpin>(
         };
         if data.len() > size {
             writer.write_all(&data[..size]).await?;
+            writer.flush().await?;
             data = &data[size..];
         } else if !data.is_empty() {
-            let mut packet = data.to_vec();
-            if size > data.len() + 7 {
-                packet.extend(super::frame(0, 0, &vec![0; size - data.len() - 7])?);
+            scratch.clear();
+            scratch.extend_from_slice(data);
+            if size >= data.len() + 7 {
+                append_waste_frame(&mut scratch, size - data.len() - 7)?;
             }
-            writer.write_all(&packet).await?;
+            writer.write_all(&scratch).await?;
+            writer.flush().await?;
             data = &[];
         } else {
-            writer
-                .write_all(&super::frame(0, 0, &vec![0; size])?)
-                .await?;
+            scratch.clear();
+            append_waste_frame(&mut scratch, size)?;
+            writer.write_all(&scratch).await?;
+            writer.flush().await?;
         }
     }
-    writer.write_all(data).await?;
-    writer.flush().await?;
+    if !data.is_empty() {
+        writer.write_all(data).await?;
+        writer.flush().await?;
+    }
+    Ok(())
+}
+
+fn append_waste_frame(out: &mut Vec<u8>, payload_len: usize) -> Result<()> {
+    let len = u16::try_from(payload_len).map_err(|_| anyhow::anyhow!("AnyTLS frame too large"))?;
+    out.reserve(7 + payload_len);
+    out.push(0);
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(&len.to_be_bytes());
+    out.resize(out.len() + payload_len, 0);
     Ok(())
 }

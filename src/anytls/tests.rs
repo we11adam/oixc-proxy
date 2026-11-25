@@ -104,13 +104,7 @@ async fn authenticate(
     io.read_exact(&mut padding).await.unwrap();
     assert_eq!(n, 30);
     let (r, w) = tokio::io::split(io);
-    (
-        FrameReader {
-            io: r,
-            buffer: Vec::new(),
-        },
-        w,
-    )
+    (FrameReader::new(r), w)
 }
 async fn non_padding<R: AsyncRead + Unpin>(r: &mut FrameReader<R>) -> Frame {
     loop {
@@ -246,15 +240,7 @@ async fn malformed_frames_and_synack_errors_fail_without_leaking_remote_text() {
     let (mut tx, rx) = tokio::io::duplex(32);
     tx.write_all(&[2, 0, 0, 0, 1, 0, 4, 1]).await.unwrap();
     drop(tx);
-    assert!(
-        FrameReader {
-            io: rx,
-            buffer: Vec::new()
-        }
-        .next()
-        .await
-        .is_err()
-    );
+    assert!(FrameReader::new(rx).next().await.is_err());
 }
 
 #[tokio::test]
@@ -262,10 +248,7 @@ async fn cancellation_preserves_partial_frame_and_idle_heartbeats_are_serviced()
     let (mut tx, rx) = tokio::io::duplex(64);
     let wire = frame(2, 9, b"test").unwrap();
     tx.write_all(&wire[..4]).await.unwrap();
-    let mut r = FrameReader {
-        io: rx,
-        buffer: Vec::new(),
-    };
+    let mut r = FrameReader::new(rx);
     assert!(timeout(Duration::from_millis(10), r.next()).await.is_err());
     tx.write_all(&wire[4..]).await.unwrap();
     assert_eq!(r.next().await.unwrap().data, b"test");
@@ -447,4 +430,150 @@ async fn bad_inner_certificate_and_synack_timeout_do_not_create_idle_sessions() 
         .await
         .expect("SYN-ACK timeout peer must observe connection closure")
         .unwrap();
+}
+
+#[tokio::test]
+async fn client_half_close_does_not_send_fin_and_preserves_server_response() {
+    let (client, listener, inner, outer) = fixture(false).await;
+    let peer = tokio::spawn(async move {
+        let (mut r, mut w) = authenticate(carrier(&listener, inner, outer, false).await).await;
+        assert_eq!(non_padding(&mut r).await.command, 4);
+        w.write_all(&frame(10, 0, b"v=2").unwrap()).await.unwrap();
+        let syn = non_padding(&mut r).await;
+        let id = syn.id;
+        assert_eq!(non_padding(&mut r).await.command, 2);
+        w.write_all(&frame(7, id, &[]).unwrap()).await.unwrap();
+        w.flush().await.unwrap();
+        let req = non_padding(&mut r).await;
+        assert_eq!((req.command, req.data.as_slice()), (2, b"GET /".as_slice()));
+        // Verify no premature cmdFIN arrives after client TCP half-close.
+        assert!(
+            timeout(Duration::from_millis(50), non_padding(&mut r))
+                .await
+                .is_err(),
+            "client half-close must not send AnyTLS cmdFIN while awaiting response"
+        );
+        let mut resp = frame(2, id, b"HTTP/1.0 200 OK").unwrap();
+        resp.extend(frame(3, id, &[]).unwrap());
+        w.write_all(&resp).await.unwrap();
+        w.flush().await.unwrap();
+    });
+    let inbound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = inbound.local_addr().unwrap();
+    let options = crate::socks5::Options {
+        handshake_timeout: Duration::from_secs(3),
+        tcp_idle_timeout: Duration::from_secs(3),
+        udp_idle_timeout: Duration::from_secs(3),
+        udp_relay: crate::socks5::UdpRelay::ephemeral("127.0.0.1".parse().unwrap()),
+        mode: crate::socks5::Mode::Fixed {
+            route: crate::socks5::FixedRoute::new(crate::gateway::Route {
+                client: crate::upstream::Client::AnyTls(client.clone()),
+                udp: false,
+            }),
+            credentials: None,
+        },
+    };
+    let gateway = tokio::spawn(async move {
+        let (stream, _) = inbound.accept().await.unwrap();
+        crate::socks5::serve_connection(stream, options)
+            .await
+            .unwrap();
+    });
+    let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+    conn.write_all(&[5, 1, 0]).await.unwrap();
+    let mut rep = [0; 2];
+    conn.read_exact(&mut rep).await.unwrap();
+    let mut req = vec![5, 1, 0];
+    req.extend(socks_address("example.org", 80).unwrap());
+    conn.write_all(&req).await.unwrap();
+    let mut rep = [0; 10];
+    conn.read_exact(&mut rep).await.unwrap();
+    conn.write_all(b"GET /").await.unwrap();
+    conn.shutdown().await.unwrap();
+    let mut body = Vec::new();
+    conn.read_to_end(&mut body).await.unwrap();
+    assert_eq!(body, b"HTTP/1.0 200 OK");
+    gateway.await.unwrap();
+    peer.await.unwrap();
+    client.close().await;
+}
+
+#[tokio::test]
+async fn udp_over_tcp_v2_drops_fqdn_datagram_without_closing_session() {
+    let (client, listener, inner, outer) = fixture(false).await;
+    let server = tokio::spawn(async move {
+        let (mut r, mut w) = authenticate(carrier(&listener, inner, outer, false).await).await;
+        assert_eq!(non_padding(&mut r).await.command, 4);
+        w.write_all(&frame(10, 0, b"v=2").unwrap()).await.unwrap();
+        let syn = non_padding(&mut r).await;
+        let id = syn.id;
+        non_padding(&mut r).await;
+        w.write_all(&frame(7, id, &[]).unwrap()).await.unwrap();
+        w.flush().await.unwrap();
+        assert_eq!(non_padding(&mut r).await.data, [0, 1, 0, 0, 0, 0, 0, 0]);
+        // Send an FQDN datagram (kind=2) followed by a valid IPv4 datagram.
+        let mut packets = vec![2, 4];
+        packets.extend(b"a.io");
+        packets.extend([0, 53, 0, 4]);
+        packets.extend(b"skip");
+        packets.extend([0, 1, 2, 3, 4, 0, 53, 0, 2]);
+        packets.extend(b"ok");
+        w.write_all(&frame(2, id, &packets).unwrap()).await.unwrap();
+        w.flush().await.unwrap();
+        assert_eq!(non_padding(&mut r).await.command, 3);
+    });
+    let s = client.dial_udp().await.unwrap();
+    let mut buf = Vec::new();
+    let err = s.read_from(&mut buf).await.unwrap_err();
+    assert!(err.downcast_ref::<crate::snell::DatagramError>().is_some());
+    assert_eq!(
+        s.read_from(&mut buf).await.unwrap(),
+        ("1.2.3.4:53".parse().unwrap(), 0)
+    );
+    assert_eq!(buf, b"ok");
+    s.close().await;
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn stalled_node_permit_does_not_consume_global_dial_budget() {
+    let (mut client, _, _, _) = fixture(false).await;
+    let global = Arc::new(Semaphore::new(1));
+    let node = Arc::new(Semaphore::new(1));
+    let _hold_node = node.clone().acquire_owned().await.unwrap();
+    Arc::get_mut(&mut client.inner).unwrap().global = global.clone();
+    Arc::get_mut(&mut client.inner).unwrap().node = node;
+    Arc::get_mut(&mut client.inner).unwrap().timeout = Duration::from_millis(80);
+    let dial = tokio::spawn(async move { client.dial_tcp("example.org", 443).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        global.available_permits(),
+        1,
+        "a dial blocked on per-node concurrency must not hold a global dial permit"
+    );
+    assert!(dial.await.unwrap().is_err());
+}
+
+#[tokio::test]
+async fn padding_handles_exact_seven_byte_gap_and_inclusive_upper_bound() {
+    let scheme = Scheme::parse(b"stop=2\n1=19-19").unwrap();
+    let (mut tx, mut rx) = tokio::io::duplex(64);
+    let payload = frame(2, 1, b"hello").unwrap(); // 12 bytes; 19 == 12 + 7
+    padding::write(&mut tx, &scheme, 1, &payload).await.unwrap();
+    drop(tx);
+    let mut data = Vec::new();
+    rx.read_to_end(&mut data).await.unwrap();
+    assert_eq!(data.len(), 19);
+    assert_eq!(&data[..12], payload.as_slice());
+    assert_eq!(&data[12..], &[0, 0, 0, 0, 0, 0, 0]);
+
+    let range = Scheme::parse(b"stop=2\n1=10-11").unwrap();
+    let mut saw_upper = false;
+    for _ in 0..64 {
+        if range.sizes(1).unwrap() == vec![Some(11)] {
+            saw_upper = true;
+            break;
+        }
+    }
+    assert!(saw_upper, "padding range must include its upper bound");
 }
