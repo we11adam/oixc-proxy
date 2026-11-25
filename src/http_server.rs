@@ -5,19 +5,30 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 use crate::gateway::{
     CLASH_PROVIDER_PATH, GatewayManager, HEALTH_PATH, PROVIDER_PATH, STATUS_PATH,
 };
 
+const MAX_CONNECTIONS: usize = 64;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub async fn serve(listener: TcpListener, manager: Arc<GatewayManager>) -> Result<()> {
+    let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         let connection = crate::accept::accept(&listener, "nodelist HTTP")
             .await
             .context("accept nodelist HTTP connection")?;
+        let permit = slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("nodelist HTTP connection limiter is closed"))?;
         let manager = manager.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let _ = serve_connection(connection, manager).await;
         });
     }
@@ -276,11 +287,16 @@ async fn write_response(
         response.push_str("\r\n");
     }
     response.push_str("\r\n");
-    connection.write_all(response.as_bytes()).await?;
-    if !head {
-        connection.write_all(body).await?;
-    }
-    connection.shutdown().await?;
+    timeout(WRITE_TIMEOUT, async {
+        connection.write_all(response.as_bytes()).await?;
+        if !head {
+            connection.write_all(body).await?;
+        }
+        connection.shutdown().await?;
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("nodelist HTTP response timed out"))??;
     Ok(())
 }
 
@@ -870,5 +886,15 @@ mod tests {
         assert!(query_flag("all=1&http=1", "http"));
         assert!(!query_flag("all=1", "http"));
         assert!(!query_flag("http=true", "http"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_response_write_times_out() {
+        let (_client, mut server) = tokio::io::duplex(64);
+        let body = vec![b'x'; 4096];
+        let error = write_response(&mut server, 200, "OK", &[], &body, false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
     }
 }

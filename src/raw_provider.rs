@@ -15,6 +15,7 @@ use crate::surge::{node_selector, sanitize_policy_name};
 
 const CONCURRENCY: usize = 8;
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_LAST_GOOD_ENTRIES: usize = 1024;
 
 pub(crate) struct RawNodes {
     nodes: Vec<RawNode>,
@@ -166,7 +167,11 @@ impl RawProvider {
                 .find(|ip| ip.is_ipv4())
                 .or(addresses.first())
         {
-            self.last_good.lock().await.insert(key, *ip);
+            let mut last_good = self.last_good.lock().await;
+            if last_good.len() >= MAX_LAST_GOOD_ENTRIES && !last_good.contains_key(&key) {
+                last_good.clear();
+            }
+            last_good.insert(key, *ip);
             return ip.to_string();
         }
         self.last_good
