@@ -25,6 +25,10 @@ use tokio_tungstenite::{
 const HEADER_LIMIT: usize = 64 << 10;
 const FRAME_LIMIT: usize = 1 << 20;
 const CHUNK: usize = 64 << 10;
+const DUPLEX_BUFFER: usize = 256 << 10;
+const COMMAND_QUEUE: usize = 16;
+const WRITE_BATCH_FRAMES: usize = 8;
+const CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
@@ -142,7 +146,12 @@ pub async fn upgrade<S: IoStream + 'static>(
     let mut stream = BufReader::new(stream);
     let days = crate::diagnostics::unix_now().saturating_sub(1_768_262_400) / 86_400;
     let major = 144 + days / 35;
-    stream.write_all(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36\r\n\r\n").as_bytes()).await?;
+    let host_header = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    stream.write_all(format!("GET {path} HTTP/1.1\r\nHost: {host_header}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36\r\n\r\n").as_bytes()).await?;
     stream.flush().await?;
     // Read only through the terminator. BufReader retains an early first frame.
     let mut head = Vec::new();
@@ -226,64 +235,146 @@ fn validate_response(head: &[u8], key: &str) -> Result<()> {
 }
 
 fn bridge<S: IoStream + 'static>(ws: WebSocketStream<S>) -> WebSocketIo {
-    let (stream, worker) = tokio::io::duplex(CHUNK);
-    let (commands, mut queued) = futures_channel::mpsc::channel::<Command>(2);
+    let (stream, worker) = tokio::io::duplex(DUPLEX_BUFFER);
+    let (commands, mut queued) = futures_channel::mpsc::channel::<Command>(COMMAND_QUEUE);
     let task = tokio::spawn(async move {
         let (sink, mut source) = ws.split();
         let sink = std::sync::Arc::new(tokio::sync::Mutex::new(sink));
+        let upload_done = std::sync::Arc::new(tokio::sync::Notify::new());
+        let upload_finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let download_done = std::sync::Arc::new(tokio::sync::Notify::new());
+        let download_finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut write = worker;
-        let upload = async {
-            while let Some(command) = queued.next().await {
-                match command {
-                    Command::Data(data) => {
-                        if sink
-                            .lock()
-                            .await
-                            .send(Message::Binary(data.into()))
-                            .await
-                            .is_err()
-                        {
-                            return;
+
+        let upload = {
+            let sink = sink.clone();
+            let upload_done = upload_done.clone();
+            let upload_finished = upload_finished.clone();
+            let download_done = download_done.clone();
+            let download_finished = download_finished.clone();
+            async move {
+                let mut pending_command = None;
+                loop {
+                    let command = match pending_command.take() {
+                        Some(cmd) => cmd,
+                        None => {
+                            if download_finished.load(std::sync::atomic::Ordering::Acquire) {
+                                match queued.try_recv() {
+                                    Ok(cmd) => cmd,
+                                    Err(_) => break,
+                                }
+                            } else {
+                                tokio::select! {
+                                    cmd = queued.next() => match cmd {
+                                        Some(cmd) => cmd,
+                                        None => break,
+                                    },
+                                    _ = download_done.notified() => {
+                                        match queued.try_recv() {
+                                            Ok(cmd) => cmd,
+                                            Err(_) => break,
+                                        }
+                                    }
+                                }
+                            }
                         }
-                    }
-                    Command::Barrier(close, ack) => {
-                        let result = if close {
-                            sink.lock().await.close().await
-                        } else {
-                            sink.lock().await.flush().await
-                        };
-                        let failed = result.is_err();
-                        let _ = ack.send(result.map_err(|_| closed()));
-                        if failed || close {
-                            return;
+                    };
+                    match command {
+                        Command::Data(data) => {
+                            let mut guard = sink.lock().await;
+                            if guard.feed(Message::Binary(data.into())).await.is_err() {
+                                break;
+                            }
+                            let mut batched = 1usize;
+                            while batched < WRITE_BATCH_FRAMES {
+                                match queued.try_recv() {
+                                    Ok(Command::Data(more)) => {
+                                        if guard.feed(Message::Binary(more.into())).await.is_err() {
+                                            upload_finished
+                                                .store(true, std::sync::atomic::Ordering::Release);
+                                            upload_done.notify_waiters();
+                                            return;
+                                        }
+                                        batched += 1;
+                                    }
+                                    Ok(barrier @ Command::Barrier(_, _)) => {
+                                        pending_command = Some(barrier);
+                                        break;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            if pending_command.is_none() && guard.flush().await.is_err() {
+                                break;
+                            }
+                        }
+                        Command::Barrier(close, ack) => {
+                            let result = if close {
+                                sink.lock().await.close().await
+                            } else {
+                                sink.lock().await.flush().await
+                            };
+                            let failed = result.is_err();
+                            let _ = ack.send(result.map_err(|_| closed()));
+                            if failed || close {
+                                break;
+                            }
                         }
                     }
                 }
+                upload_finished.store(true, std::sync::atomic::Ordering::Release);
+                upload_done.notify_waiters();
             }
         };
-        let download = async {
-            while let Some(message) = source.next().await {
-                match message {
-                    Ok(Message::Binary(data)) => {
-                        if write.write_all(&data).await.is_err() {
-                            return;
+
+        let download = {
+            let sink = sink.clone();
+            let upload_done = upload_done.clone();
+            let upload_finished = upload_finished.clone();
+            let download_done = download_done.clone();
+            let download_finished = download_finished.clone();
+            async move {
+                loop {
+                    let message = if upload_finished.load(std::sync::atomic::Ordering::Acquire) {
+                        match tokio::time::timeout(CLOSE_GRACE, source.next()).await {
+                            Ok(msg) => msg,
+                            Err(_) => break,
                         }
-                    }
-                    Ok(Message::Ping(_)) => {
-                        if sink.lock().await.flush().await.is_err() {
-                            return;
+                    } else {
+                        tokio::select! {
+                            msg = source.next() => msg,
+                            _ = upload_done.notified() => continue,
                         }
+                    };
+                    let Some(message) = message else {
+                        break;
+                    };
+                    match message {
+                        Ok(Message::Binary(data)) => {
+                            if write.write_all(&data).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Message::Ping(_)) => {
+                            if sink.lock().await.flush().await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Message::Pong(_)) => {}
+                        Ok(Message::Close(_)) => {
+                            let _ = sink.lock().await.flush().await;
+                            break;
+                        }
+                        _ => break,
                     }
-                    Ok(Message::Pong(_)) => {}
-                    Ok(Message::Close(_)) => {
-                        let _ = sink.lock().await.flush().await;
-                        return;
-                    }
-                    _ => return,
                 }
+                let _ = write.shutdown().await;
+                download_finished.store(true, std::sync::atomic::Ordering::Release);
+                download_done.notify_waiters();
             }
         };
-        tokio::select! {_ = upload=>{}, _ = download=>{}}
+
+        tokio::join!(upload, download);
     });
     WebSocketIo {
         stream,
@@ -409,5 +500,46 @@ mod tests {
         let response=b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
         assert!(validate_response(response, "dGhlIHNhbXBsZSBub25jZQ==").is_ok());
         assert!(validate_response(response, "wrong").is_err());
+    }
+
+    #[tokio::test]
+    async fn half_close_preserves_in_flight_inbound_data_and_brackets_ipv6_host() {
+        let (client, server) = tokio::io::duplex(65536);
+        let (reply_sent_tx, reply_sent_rx) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut server = test_server(server).await.unwrap();
+            let mut req = [0u8; 4];
+            server.read_exact(&mut req).await.unwrap();
+            assert_eq!(&req, b"ping");
+            // Server sends its final data while client is shutting down its write half.
+            server.write_all(b"pong-in-flight").await.unwrap();
+            server.flush().await.unwrap();
+            let _ = reply_sent_tx.send(());
+            let mut eof = [0u8; 1];
+            let _ = server.read(&mut eof).await;
+            let _ = server.shutdown().await;
+        });
+        let mut client = upgrade(client, "localhost", "/carrier").await.unwrap();
+        client.write_all(b"ping").await.unwrap();
+        client.flush().await.unwrap();
+        reply_sent_rx.await.unwrap();
+        // Calling shutdown() must not discard inbound frames still buffered/in-flight.
+        client.shutdown().await.unwrap();
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"pong-in-flight");
+        peer.await.unwrap();
+
+        let (client, mut server) = tokio::io::duplex(4096);
+        let check = tokio::spawn(async move {
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(server.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap();
+            assert!(head.contains("Host: [2001:db8::1]\r\n"), "{head}");
+        });
+        let _ = upgrade(client, "2001:db8::1", "/carrier").await;
+        check.await.unwrap();
     }
 }
