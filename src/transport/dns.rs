@@ -12,13 +12,13 @@ use tokio::net::{TcpSocket, lookup_host};
 use tokio::sync::{Mutex, watch};
 use tokio::time::{Instant, timeout};
 
-use crate::network::{NetworkSnapshot, bind_udp_socket};
+use crate::network::{EgressKey, NetworkSnapshot, bind_udp_socket};
 
 const BUDGET: Duration = Duration::from_secs(9);
 const TTL: Duration = Duration::from_secs(60);
 const MAX_ENTRIES: usize = 1024;
 type Answer = std::result::Result<Vec<IpAddr>, ()>;
-type Key = (String, String);
+type Key = (String, EgressKey);
 
 #[derive(Default)]
 struct State {
@@ -76,12 +76,15 @@ impl DirectDns {
         // have the same numeric generation. Never reuse answers across egresses.
         let key = (
             host.trim_end_matches('.').to_ascii_lowercase(),
-            format!("{network:?}"),
+            network.egress_key(),
         );
+        let now = Instant::now();
         let mut state = self.state.lock().await;
-        state.cache.retain(|_, (until, _)| *until > Instant::now());
-        if let Some((_, ips)) = state.cache.get(&key) {
-            return Ok(ips.clone());
+        if let Some((until, ips)) = state.cache.get(&key) {
+            if *until > now {
+                return Ok(ips.clone());
+            }
+            state.cache.remove(&key);
         }
         let mut rx = if let Some(tx) = state.pending.get(&key) {
             tx.subscribe()
@@ -101,12 +104,14 @@ impl DirectDns {
                     .ok_or(());
                 let mut state = resolver.state.lock().await;
                 if let Ok(ips) = &answer {
+                    let now = Instant::now();
                     if state.cache.len() >= MAX_ENTRIES {
-                        state.cache.clear();
+                        state.cache.retain(|_, (until, _)| *until > now);
+                        if state.cache.len() >= MAX_ENTRIES {
+                            state.cache.clear();
+                        }
                     }
-                    state
-                        .cache
-                        .insert(key.clone(), (Instant::now() + TTL, ips.clone()));
+                    state.cache.insert(key.clone(), (now + TTL, ips.clone()));
                 }
                 tx.send_replace(Some(answer));
                 state.pending.remove(&key);

@@ -4,7 +4,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(target_os = "macos")]
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio::net::{TcpSocket, UdpSocket};
@@ -18,14 +18,14 @@ const DEFAULT_ROUTE_RECHECK: Duration = Duration::from_secs(30);
 #[derive(Clone)]
 pub struct NetworkMonitor {
     pinned_ip: Option<IpAddr>,
-    state: Arc<Mutex<MonitorState>>,
+    state: Arc<StdMutex<MonitorState>>,
+    refresh_lock: Arc<Mutex<DefaultRouteCache>>,
 }
 
 struct MonitorState {
     selection: EgressSelection,
     generation: u64,
     checked_at: Instant,
-    default_route: DefaultRouteCache,
 }
 
 /// Looking up the default route may spawn processes, which is too costly for
@@ -65,6 +65,14 @@ struct EgressSelection {
     ipv6: Option<Ipv6Addr>,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct EgressKey {
+    interface_index: Option<u32>,
+    ipv4: Option<Ipv4Addr>,
+    ipv6: Option<Ipv6Addr>,
+    pinned_ip: Option<IpAddr>,
+}
+
 #[derive(Clone, Debug)]
 pub struct NetworkSnapshot {
     selection: EgressSelection,
@@ -98,14 +106,15 @@ impl NetworkMonitor {
     pub(crate) fn test_unbound() -> Self {
         Self {
             pinned_ip: None,
-            state: Arc::new(Mutex::new(MonitorState {
+            state: Arc::new(StdMutex::new(MonitorState {
                 selection: EgressSelection::empty(),
                 generation: 1,
                 checked_at: Instant::now() + Duration::from_secs(3600),
-                default_route: DefaultRouteCache::default(),
             })),
+            refresh_lock: Arc::new(Mutex::new(DefaultRouteCache::default())),
         }
     }
+
     pub fn new(pinned_ip: Option<IpAddr>) -> Self {
         let mut default_route = DefaultRouteCache::default();
         let detected = detect_egress(pinned_ip, &mut default_route);
@@ -124,59 +133,56 @@ impl NetworkMonitor {
         crate::perftrace::diagnostic("network.initial", &fields);
         Self {
             pinned_ip,
-            state: Arc::new(Mutex::new(MonitorState {
+            state: Arc::new(StdMutex::new(MonitorState {
                 selection,
                 generation: 1,
                 checked_at: Instant::now(),
-                default_route,
             })),
+            refresh_lock: Arc::new(Mutex::new(default_route)),
         }
     }
 
+    /// Returns the cached network snapshot immediately without blocking on
+    /// route or interface inspection. When the refresh interval has elapsed,
+    /// at most one background task updates the snapshot.
     pub async fn snapshot(&self) -> NetworkSnapshot {
-        let mut state = self.state.lock().await;
-        if state.checked_at.elapsed() >= REFRESH_INTERVAL {
+        let (snapshot, stale) = {
+            let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            (
+                NetworkSnapshot {
+                    selection: state.selection.clone(),
+                    pinned_ip: self.pinned_ip,
+                    generation: state.generation,
+                },
+                state.checked_at.elapsed() >= REFRESH_INTERVAL,
+            )
+        };
+        if stale && let Ok(mut default_route) = self.refresh_lock.clone().try_lock_owned() {
+            let state = self.state.clone();
             let pinned_ip = self.pinned_ip;
-            let mut default_route = std::mem::take(&mut state.default_route);
-            let detected = tokio::task::spawn_blocking(move || {
+            drop(tokio::task::spawn_blocking(move || {
                 let detected = detect_egress(pinned_ip, &mut default_route);
-                (detected, default_route)
-            })
-            .await
-            .map(|(detected, default_route)| {
-                state.default_route = default_route;
-                detected
-            });
-            state.checked_at = Instant::now();
-            match detected {
-                Ok(Ok(selection)) => {
-                    if state.update(selection) {
-                        crate::perftrace::diagnostic(
-                            "network.changed",
-                            &state
-                                .selection
-                                .diagnostic_fields(state.generation, self.pinned_ip),
-                        );
+                let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+                state.checked_at = Instant::now();
+                match detected {
+                    Ok(selection) => {
+                        if state.update(selection) {
+                            crate::perftrace::diagnostic(
+                                "network.changed",
+                                &state
+                                    .selection
+                                    .diagnostic_fields(state.generation, pinned_ip),
+                            );
+                        }
                     }
+                    Err(error) => crate::perftrace::diagnostic(
+                        "network.refresh",
+                        &[("status", "error".to_owned()), ("error", error.to_string())],
+                    ),
                 }
-                Ok(Err(error)) => crate::perftrace::diagnostic(
-                    "network.refresh",
-                    &[("status", "error".to_owned()), ("error", error.to_string())],
-                ),
-                Err(error) => crate::perftrace::diagnostic(
-                    "network.refresh",
-                    &[
-                        ("status", "join_error".to_owned()),
-                        ("error", error.to_string()),
-                    ],
-                ),
-            }
+            }));
         }
-        NetworkSnapshot {
-            selection: state.selection.clone(),
-            pinned_ip: self.pinned_ip,
-            generation: state.generation,
-        }
+        snapshot
     }
 }
 
@@ -260,6 +266,15 @@ impl EgressSelection {
 impl NetworkSnapshot {
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub(crate) fn egress_key(&self) -> EgressKey {
+        EgressKey {
+            interface_index: self.selection.interface_index,
+            ipv4: self.selection.ipv4,
+            ipv6: self.selection.ipv6,
+            pinned_ip: self.pinned_ip,
+        }
     }
 
     pub fn preferred_source(&self) -> io::Result<Option<IpAddr>> {
@@ -799,7 +814,6 @@ mod tests {
             selection: first.clone(),
             generation: 7,
             checked_at: Instant::now(),
-            default_route: DefaultRouteCache::default(),
         };
         state.update(first);
         assert_eq!(state.generation, 7);
