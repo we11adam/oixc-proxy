@@ -4,6 +4,19 @@
 
 Notable changes to `oixc-proxy` are recorded in this file. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.11.1] - 2026-11-26
+
+### Fixed
+
+- Preserve in-flight responses when AnyTLS or WebSocket CDN clients finish uploading. Improve AnyTLS dial concurrency, heartbeats, padding, and UDP response handling.
+- Bound nodelist HTTP concurrency, response write time, and raw DNS cache size. Measure HTTP proxy headers independently of the body and normalize IPv4-mapped IPv6 addresses for SOCKS5 UDP.
+- Bound Snell UDP close, prune idle connections periodically, and retire stale connections on network changes and shutdown.
+
+### Performance
+
+- Refresh physical egress snapshots in the background to reduce dial stalls. Reduce overhead in DNS caching, AnyTLS framing, and traffic accounting, and batch WebSocket frame writes.
+- Reuse AnyTLS TLS configurations to enable session resumption, and align SOCKS5 upload buffers with Snell v4 records.
+
 ## [0.11.0] - 2026-11-24
 
 ### Added
@@ -218,6 +231,7 @@ First Rust release.
 - DNS and TCP racing: a shared transport context, coalesced signed DNS queries, concurrent A/AAAA lookups and staggered connection attempts.
 - Dial time budgets, sampled performance tracing and connection reuse tuning.
 
+[0.11.1]: https://github.com/we11adam/oixc-proxy/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/we11adam/oixc-proxy/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/we11adam/oixc-proxy/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/we11adam/oixc-proxy/compare/v0.8.0...v0.9.0

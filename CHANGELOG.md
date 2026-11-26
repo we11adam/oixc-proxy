@@ -4,6 +4,19 @@
 
 本文件记录 `oixc-proxy` 各版本中值得注意的变更。版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.11.1] - 2026-11-26
+
+### 修复
+
+- 修复 AnyTLS 和 WebSocket CDN 的半关闭行为，避免客户端结束上传时截断仍在接收的响应。改善 AnyTLS 握手并发、心跳、填充和 UDP 回包处理。
+- 限制节点列表 HTTP 服务的并发、响应写入时间和 raw DNS 缓存容量。HTTP 代理独立计算请求头大小，SOCKS5 UDP 统一处理 IPv4 和映射的 IPv6 地址。
+- 为 Snell UDP 关闭设置超时，定期清理空闲连接，在网络切换和服务退出时回收过期连接。
+
+### 性能
+
+- 后台更新物理出口快照，减少拨号等待。降低 DNS 缓存、AnyTLS 帧处理及流量计数开销，并批量写入 WebSocket 帧。
+- 复用 AnyTLS 的 TLS 配置以支持会话恢复，并让 SOCKS5 上传缓冲对齐 Snell v4 记录大小。
+
 ## [0.11.0] - 2026-11-24
 
 ### 新功能
@@ -218,6 +231,7 @@
 - DNS 与 TCP 竞速：共享传输上下文、合并签名 DNS 查询、A/AAAA 并发查询、错开的连接尝试。
 - 拨号时间预算、采样的性能 tracing 和连接复用调优。
 
+[0.11.1]: https://github.com/we11adam/oixc-proxy/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/we11adam/oixc-proxy/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/we11adam/oixc-proxy/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/we11adam/oixc-proxy/compare/v0.8.0...v0.9.0
